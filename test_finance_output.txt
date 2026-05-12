@@ -1,0 +1,103 @@
+﻿python : Forbidden: 
+/api/finance/budgets/
+At line:1 char:1
++ python test_finance.py 2>&1 | 
+Out-File -FilePath 
+test_finance_output. ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : Not 
+   Specified: (Forbidden: /api/f  
+  inance/budgets/:String) [], R   
+ emoteException
+    + FullyQualifiedErrorId : Nat 
+   iveCommandError
+ 
+Forbidden: 
+/api/finance/expenses/5/approve/
+Forbidden: /api/finance/payroll/
+Forbidden: 
+/api/finance/operational-costs/
+Forbidden: /api/auth/users/
+
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+[94m 1. DEPARTMENT BUDGET MANAGEMENT[0m
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+   [92mΓ£à PASS[0m  Admin creates Inventory budget (Feb 2026, $50,000)
+   [92mΓ£à PASS[0m  store_user CANNOT create budget (403)
+   [92mΓ£à PASS[0m  store_user CAN read budget list
+   [92mΓ£à PASS[0m  Admin creates Quality budget (Feb 2026, $20,000)
+   [92mΓ£à PASS[0m  Admin reads budget detail
+   [92mΓ£à PASS[0m    ΓåÆ spent = $0 initially
+   [92mΓ£à PASS[0m    ΓåÆ remaining = $50,000
+   [92mΓ£à PASS[0m    ΓåÆ utilization = 0%
+
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+[94m 2. EXPENSE REQUESTS & AUTO-APPROVAL LOGIC[0m
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+   [92mΓ£à PASS[0m  store_user submits $3,000 expense (within auto-approve limit)
+   [92mΓ£à PASS[0m    ΓåÆ Status = auto_approved Γ£¿
+   [92mΓ£à PASS[0m  store_user submits $8,000 expense (above auto-approve limit)
+   [92mΓ£à PASS[0m    ΓåÆ Status = pending (needs admin approval)
+   [92mΓ£à PASS[0m  store_user can list their own expenses
+   [92mΓ£à PASS[0m    ΓåÆ Only own expenses visible to non-admin
+   [92mΓ£à PASS[0m  Admin sees ALL expenses
+   [92mΓ£à PASS[0m  Admin can access pending_approvals endpoint
+   [92mΓ£à PASS[0m    ΓåÆ $8,000 pending expense is in list
+   [92mΓ£à PASS[0m  store_user CANNOT approve expense (403)
+   [92mΓ£à PASS[0m  Admin approves $8,000 expense
+   [92mΓ£à PASS[0m    ΓåÆ Status = approved
+   [92mΓ£à PASS[0m    ΓåÆ Admin note saved
+   [92mΓ£à PASS[0m    ΓåÆ Budget spent updated to $11,000 (was $0) = 11000.0
+   [92mΓ£à PASS[0m    ΓåÆ Remaining = $39,000
+   [92mΓ£à PASS[0m  Admin rejects $15,000 quality expense
+   [92mΓ£à PASS[0m    ΓåÆ Status = rejected
+
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+[94m 3. PAYROLL MANAGEMENT[0m
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+   [92mΓ£à PASS[0m  Admin creates payroll for store_user (Feb 2026)
+   [92mΓ£à PASS[0m    ΓåÆ Net salary auto-calculated = $43,750.00
+   [92mΓ£à PASS[0m    ΓåÆ Initial status = pending
+   [92mΓ£à PASS[0m  Admin processes payroll ΓåÆ 'processed'
+   [92mΓ£à PASS[0m    ΓåÆ Status = processed
+   [92mΓ£à PASS[0m  Admin marks payroll as paid
+   [92mΓ£à PASS[0m    ΓåÆ Status = paid
+   [92mΓ£à PASS[0m    ΓåÆ payment_date recorded
+   [92mΓ£à PASS[0m  store_user CANNOT create payroll (403)
+   [92mΓ£à PASS[0m  store_user can read their own payroll
+   [92mΓ£à PASS[0m    ΓåÆ Only own payroll visible to non-admin
+   [92mΓ£à PASS[0m  Admin gets payroll summary
+   [92mΓ£à PASS[0m    ΓåÆ Records counted = 1
+
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+[94m 4. OPERATIONAL COSTS[0m
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+   [92mΓ£à PASS[0m  Admin records fixed operational cost ($8,500 electricity)
+   [92mΓ£à PASS[0m  Admin records variable cost ($2,200 water)
+   [92mΓ£à PASS[0m  store_user CANNOT record costs (403)
+   [92mΓ£à PASS[0m  store_user CAN read costs
+   [92mΓ£à PASS[0m  Filter costs by department=production
+
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+[94m 5. FINANCIAL DASHBOARD KPIs[0m
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+   [92mΓ£à PASS[0m  Admin accesses dashboard KPI endpoint
+   [92mΓ£à PASS[0m    ΓåÆ total_budget present
+   [92mΓ£à PASS[0m    ΓåÆ total_spent present
+   [92mΓ£à PASS[0m    ΓåÆ pending_approvals present
+   [92mΓ£à PASS[0m    ΓåÆ total_payroll_paid present
+   [92mΓ£à PASS[0m    ΓåÆ total_budget = $70,000.00
+         pending_approvals = 0
+         total_payroll_paid = $43,750.00
+
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+[94m 6. USERS LIST ENDPOINT[0m
+[94mΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ[0m
+   [92mΓ£à PASS[0m  Admin can list all users
+   [92mΓ£à PASS[0m    ΓåÆ 7 users returned
+   [92mΓ£à PASS[0m  store_user CANNOT list all users (403)
+
+ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+  RESULT: 52/52 tests passed  [92m≡ƒÄë ALL TESTS PASSED![0m
+ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+

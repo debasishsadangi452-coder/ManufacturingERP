@@ -1,0 +1,10 @@
+{
+  "pass": 108,
+  "fail": 1,
+  "failures": [
+    {
+      "test": "finance_user CAN create budget",
+      "detail": "b'{\"non_field_errors\":[\"The fields department, period_label must make a unique set.\"]}'"
+    }
+  ]
+}
