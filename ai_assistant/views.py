@@ -103,6 +103,44 @@ class InsightsView(APIView):
             }, status=status.HTTP_200_OK)
 
 
+def extract_po_from_image(client, image_data: str, config: dict) -> str | None:
+    """
+    Call a vision-capable model to pull purchase order details out of an image.
+    Returns plain text describing what was found, or None on failure.
+    """
+    vision_model = config.get('VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')
+
+    if not image_data.startswith('data:'):
+        image_data = f'data:image/jpeg;base64,{image_data}'
+
+    prompt = (
+        "This image is a client purchase order document. "
+        "Extract the following details exactly as shown:\n"
+        "1. Customer / company name\n"
+        "2. Each product ordered — name and quantity\n"
+        "3. Requested delivery date (if shown)\n"
+        "4. Any special notes or instructions\n\n"
+        "Reply in plain text with clear labels. If a field is not visible, say 'Not shown'."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=vision_model,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data}},
+                ],
+            }],
+            max_tokens=600,
+        )
+        return response.choices[0].message.content
+    except Exception as exc:
+        logger.error(f"Vision extraction failed ({vision_model}): {exc}")
+        return None
+
+
 class ChatView(APIView):
     """
     Stateful AI chat endpoint. Accepts full conversation history so that
@@ -114,13 +152,33 @@ class ChatView(APIView):
         user_message = request.data.get('message', '').strip()
         # history: list of {"role": "user"|"assistant", "content": str}
         history = request.data.get('history', [])
+        image_data = request.data.get('image')  # optional base64 data-URL
 
-        if not user_message:
-            return Response({"error": "Message is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not user_message and not image_data:
+            return Response({"error": "Message or image is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         config = getattr(settings, 'AI_CONFIG', {})
         client = Groq(api_key=config.get('GROQ_API_KEY'))
         model = config.get('MODEL', "llama-3.1-8b-instant")
+
+        # If the user uploaded an image, extract PO details first using a vision model,
+        # then inject the result into the user message so the main tool-calling model
+        # can present it for confirmation and create the sales order.
+        if image_data:
+            extracted = extract_po_from_image(client, image_data, config)
+            if extracted is None:
+                return Response(
+                    {"error": "Could not read the image. Please try again with a clearer photo."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            user_message = (
+                f"The user uploaded a photo of a client purchase order. "
+                f"Here is the information extracted from the image:\n\n{extracted}\n\n"
+                f"Present these details clearly to the user and ask for confirmation before "
+                f"creating the sales order. First look up the customer by name (use list_customers), "
+                f"and look up each item by name (use list_items). "
+                f"If the customer does not exist, offer to create them."
+            )
         logger.info(f"AI Chat using model: {model}")
 
         system_prompt = (

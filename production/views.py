@@ -16,6 +16,8 @@ from .serializers import (
     ProductionOrderSerializer,
     ProductionLineSerializer,
 )
+from inventory.models import Stock
+from inventory.services import increase_stock, decrease_stock
 from core.utils import log_activity
 
 class ProductionLineViewSet(viewsets.ModelViewSet):
@@ -82,8 +84,6 @@ class ProjectionDashboardAPIView(APIView):
             },
             status=status.HTTP_200_OK,
         )
-
-from inventory.services import increase_stock, decrease_stock
 
 
 # -------------------------------------------------
@@ -220,16 +220,41 @@ class ProductionOrderViewSet(viewsets.ModelViewSet):
                     errors = []
                     for ing in ingredients:
                         required_qty = ing.quantity * order.quantity
-                        try:
-                            decrease_stock(
-                                ing.item,
-                                warehouse,
-                                required_qty,
-                                user=request.user,
-                                reference=f"Production #{order.id}"
+
+                        # Check total stock across ALL warehouses (raw materials may
+                        # be received into a different warehouse than the finished-goods
+                        # output warehouse stored on the production order).
+                        available_stocks = list(
+                            Stock.objects.filter(item=ing.item, quantity__gt=0)
+                            .order_by('-quantity')
+                        )
+                        total_available = sum(s.quantity for s in available_stocks)
+
+                        if total_available < required_qty:
+                            errors.append(
+                                f"Insufficient stock for {ing.item.name}: "
+                                f"Required {required_qty}, Available {total_available}"
                             )
-                        except (ValidationError, ValueError) as e:
-                            errors.append(str(e))
+                            continue
+
+                        # Deduct from warehouses in descending stock order
+                        remaining = required_qty
+                        for stock_entry in available_stocks:
+                            if remaining <= 0:
+                                break
+                            deduct = min(stock_entry.quantity, remaining)
+                            try:
+                                decrease_stock(
+                                    ing.item,
+                                    stock_entry.warehouse,
+                                    deduct,
+                                    user=request.user,
+                                    reference=f"Production #{order.id}"
+                                )
+                                remaining -= deduct
+                            except (ValidationError, ValueError) as e:
+                                errors.append(str(e))
+                                break
 
                     if errors:
                         raise ValidationError(errors)

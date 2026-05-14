@@ -276,6 +276,9 @@ STATIC_URL = "static/"
 # AI Configuration
 AI_CONFIG = {
     "GROQ_API_KEY": os.getenv("GROQ_API_KEY"),
-    "MODEL": "llama-3.1-8b-instant",
+    "MODEL": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+    # Vision-capable model used only for image → PO extraction.
+    # Llama 4 Scout supports image input on Groq.
+    "VISION_MODEL": os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
 }
 
