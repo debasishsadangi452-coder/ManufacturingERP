@@ -194,9 +194,7 @@ if DATABASE_URL:
             ssl_require=True if any(h in DATABASE_URL for h in ("railway.app", "rlwy.net", "amazonaws.com")) else False,
         )
     }
-    DATABASES["default"]["OPTIONS"] = {
-        "options": "-c search_path=public"
-    }
+    DATABASES["default"].setdefault("OPTIONS", {})["options"] = "-c search_path=public"
 else:
     DATABASES = {
         "default": {
