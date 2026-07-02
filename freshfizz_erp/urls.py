@@ -1,7 +1,8 @@
 from django.contrib import admin
 from django.urls import path, include
 from django.http import JsonResponse
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.views import TokenRefreshView
+from accounts.views import EmailOrUsernameTokenObtainPairView
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 def health(request):
@@ -13,7 +14,7 @@ urlpatterns = [
 
     # 🔐 Auth
     path('api/auth/', include('accounts.urls')),
-    path('api/token/', TokenObtainPairView.as_view(), name='token'),
+    path('api/token/', EmailOrUsernameTokenObtainPairView.as_view(), name='token'),
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
 
     # 📦 ERP Modules

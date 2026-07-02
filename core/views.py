@@ -1,3 +1,4 @@
+from django.db.utils import NotSupportedError
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -57,9 +58,16 @@ def poll_changes(request):
         change_qs = DataChangeEvent.objects.filter(id__gt=since_change).order_by('id')[:50]
         notif_qs  = Notification.objects.filter(id__gt=since_notif).order_by('id')[:20]
     else:
-        change_qs = DataChangeEvent.objects.filter(
-            id__gt=since_change, visible_to__contains=[user.role]
-        ).order_by('id')[:50]
+        try:
+            change_qs = list(DataChangeEvent.objects.filter(
+                id__gt=since_change, visible_to__contains=[user.role]
+            ).order_by('id')[:50])
+        except NotSupportedError:
+            # sqlite (local dev) can't do JSONField contains — filter in Python.
+            change_qs = [
+                e for e in DataChangeEvent.objects.filter(id__gt=since_change).order_by('id')[:200]
+                if user.role in (e.visible_to or [])
+            ][:50]
         notif_qs  = Notification.objects.filter(
             id__gt=since_notif, recipient_role=user.role
         ).order_by('id')[:20]
