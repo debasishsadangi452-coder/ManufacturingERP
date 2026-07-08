@@ -392,13 +392,18 @@ class ChatView(APIView):
                             if isinstance(res_data, dict) and res_data.get("template"):
                                 if function_name in ("procure_item", "receive_procurement", "add_vendor_price"):
                                     data_changed = True
-                                return Response({
+                                payload = {
                                     "response": res_data["template"],
                                     "refresh": data_changed,
                                     "actions": all_actions,
                                     "agent": agent_slug,
                                     "agent_name": agent["name"],
-                                }, status=status.HTTP_200_OK)
+                                }
+                                # Missing vendor/price → send form metadata so the
+                                # UI renders an inline fill-in form.
+                                if res_data.get("form"):
+                                    payload["form"] = res_data["form"]
+                                return Response(payload, status=status.HTTP_200_OK)
                         except Exception as tool_err:
                             logger.error(f"[AI Tool] {function_name} crashed: {tool_err}")
                             function_response = json.dumps({
@@ -449,3 +454,34 @@ class DigitalTwinView(APIView):
         except Exception as e:
             logger.exception("Digital twin snapshot failed")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class QuickProcureView(APIView):
+    """Deterministic (no-LLM) submit for the inline 'add vendor & coupon
+    price' form: saves the vendor price, then places the purchase order and
+    returns the fixed procurement template."""
+    permission_classes = [IsAuthenticated, HasPremiumAIPlan]
+
+    def post(self, request):
+        from .agent_tools import add_vendor_price, procure_item
+        vendor_name = (request.data.get("vendor_name") or "").strip()
+        item = (request.data.get("item") or "").strip()
+        unit_price = request.data.get("unit_price")
+        quantity = request.data.get("quantity")
+        lead_time_days = request.data.get("lead_time_days") or 7
+
+        if not (vendor_name and item and unit_price and quantity):
+            return Response(
+                {"error": "vendor_name, item, unit_price and quantity are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        add_res = json.loads(add_vendor_price(request.user, vendor_name, item, unit_price, lead_time_days))
+        # If saving the price failed, surface that template
+        if "already" not in (add_res.get("template", "")) and "SAVED" not in add_res.get("template", ""):
+            return Response({"response": add_res.get("template", "Could not save vendor price.")},
+                            status=status.HTTP_200_OK)
+
+        po_res = json.loads(procure_item(request.user, item, quantity))
+        return Response({"response": po_res.get("template", "Order could not be placed."), "refresh": True},
+                        status=status.HTTP_200_OK)

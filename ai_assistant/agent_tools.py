@@ -622,15 +622,22 @@ def procure_item(user, item_name, quantity):
     )
 
     if not price:
-        return json.dumps({"template": (
-            f"PROCUREMENT · Missing vendor / coupon price\n"
-            f"Item: {item.name}\n"
-            f"Quantity: {qty:g} {item.unit}\n"
-            f"No vendor or coupon price is on file for this item, so it cannot be ordered yet.\n\n"
-            f"Please add them manually (say, e.g.):\n"
-            f'  "Add vendor <name> with coupon price <amount> for {item.name}"\n'
-            f"Then order it again."
-        )})
+        return json.dumps({
+            "template": (
+                f"PROCUREMENT · Missing vendor / coupon price\n"
+                f"Item: {item.name}\n"
+                f"Quantity: {qty:g} {item.unit}\n"
+                f"No vendor or coupon price is on file for this item.\n"
+                f"Fill in the vendor and coupon price below to order it."
+            ),
+            # Drives an inline fill-in form in the chat (submitted without the LLM)
+            "form": {
+                "kind": "vendor_price",
+                "item": item.name,
+                "unit": item.unit,
+                "quantity": qty,
+            },
+        })
 
     vendor = price.vendor
     unit_price = Decimal(str(price.unit_price))
