@@ -159,6 +159,8 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             items_received.append(f"{poi.quantity} x {poi.item.name}")
         po.status = "received"
         po.save()
+        from finance.services import record_procurement_cost
+        record_procurement_cost(po, user=self.request.user)
         log_activity(
             self.request.user, "Procurement", "Goods Receipt",
             f"Received goods for PO #{po.id} into '{receipt.warehouse.name}': {', '.join(items_received)}"

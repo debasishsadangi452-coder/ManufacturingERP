@@ -461,9 +461,12 @@ def create_goods_receipt(user, po_id, warehouse_id):
             received.append(f"{poi.quantity} x {poi.item.name}")
         po.status = 'received'
         po.save()
+        from finance.services import record_procurement_cost
+        cost = record_procurement_cost(po, user=user)
         return json.dumps({
             "success": True, "receipt_id": receipt.id, "po_id": po.id,
             "stock_booked_into": warehouse.name, "items_received": received,
+            "finance_cost_recorded": float(po.total_amount or 0) if cost else "already recorded",
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
