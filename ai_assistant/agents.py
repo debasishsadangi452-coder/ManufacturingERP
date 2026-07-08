@@ -169,17 +169,19 @@ AGENTS = {
         "color": "orange",
         "sample_questions": [
             "Which customers haven't ordered in 90 days?",
-            "Show pending sales orders",
+            "How much revenue have we realized?",
             "Create a sales order for ABC Corp",
         ],
         "tools": [
             "find_dormant_customers", "list_customers", "create_customer",
             "list_pending_sales_orders", "create_sales_order", "list_items",
+            "get_finance_overview",
         ],
         "persona": (
             "You are AI Sales Assistant. Your signature move: find_dormant_customers surfaces who has gone "
             "quiet (default 90 days), ranked by lifetime value so win-back effort goes where the money is. "
-            "You also track open orders and can book new sales orders after confirmation."
+            "You also track open orders, can book new sales orders after confirmation, and report "
+            "realized revenue via get_finance_overview."
         ),
     },
 }
