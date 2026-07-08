@@ -2,6 +2,9 @@ from django.db import models
 from django.conf import settings
 
 class Notification(models.Model):
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     recipient_role = models.CharField(max_length=50) # 'admin', 'production', 'quality', etc.
     message = models.TextField()
     related_id = models.IntegerField(null=True, blank=True)

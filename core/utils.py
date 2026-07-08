@@ -11,13 +11,14 @@ def log_activity(user, module, action, description):
         description=description
     )
 
-def send_notification(role, message, related_id=None, related_type=""):
+def send_notification(role, message, related_id=None, related_type="", company=None):
     """
-    Quality notification helper.
+    Quality notification helper. `company` scopes the notification to a tenant.
     """
     Notification.objects.create(
         recipient_role=role,
         message=message,
         related_id=related_id,
-        related_type=related_type
+        related_type=related_type,
+        company=company,
     )

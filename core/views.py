@@ -14,9 +14,10 @@ class NotificationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
-            return Notification.objects.all().order_by('-created_at')
-        return Notification.objects.filter(recipient_role=user.role).order_by('-created_at')
+        qs = Notification.objects.filter(company=user.company)
+        if user.role != 'admin':
+            qs = qs.filter(recipient_role=user.role)
+        return qs.order_by('-created_at')
 
     @action(detail=True, methods=['post'])
     def mark_as_read(self, request, pk=None):
@@ -56,7 +57,7 @@ def poll_changes(request):
 
     if user.role == 'admin':
         change_qs = DataChangeEvent.objects.filter(id__gt=since_change).order_by('id')[:50]
-        notif_qs  = Notification.objects.filter(id__gt=since_notif).order_by('id')[:20]
+        notif_qs  = Notification.objects.filter(id__gt=since_notif, company=user.company).order_by('id')[:20]
     else:
         try:
             change_qs = list(DataChangeEvent.objects.filter(
@@ -69,7 +70,7 @@ def poll_changes(request):
                 if user.role in (e.visible_to or [])
             ][:50]
         notif_qs  = Notification.objects.filter(
-            id__gt=since_notif, recipient_role=user.role
+            id__gt=since_notif, recipient_role=user.role, company=user.company
         ).order_by('id')[:20]
 
     changes = [

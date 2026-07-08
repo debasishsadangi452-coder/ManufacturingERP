@@ -58,7 +58,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                         "admin",
                         f"CRITICAL: SO#{order.id} needs {item.name}, but NO RECIPE is defined!",
                         related_id=order.id,
-                        related_type="sales_order"
+                        related_type="sales_order",
+                        company=order.customer.company
                     )
                     continue
 
@@ -67,7 +68,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     "production",
                     f"FULFILLMENT REQ: Produce {shortage} {item.unit} of {item.name} for SO#{order.id}",
                     related_id=order.id,
-                    related_type="sales_order"
+                    related_type="sales_order",
+                    company=order.customer.company
                 )
                 
                 # Notify Store (Inventory) to gather raw materials for this production
@@ -75,7 +77,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     "store",
                     f"GATHERING REQ: Prepare raw materials for production of {item.name} (SO#{order.id})",
                     related_id=order.id,
-                    related_type="sales_order"
+                    related_type="sales_order",
+                    company=order.customer.company
                 )
 
     @action(detail=True, methods=['post'])
@@ -126,7 +129,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     "sales",
                     f"STOCK ALLOCATED: SO#{order.id} for {item.name} is covered by existing stock.",
                     related_id=order.id,
-                    related_type="sales_order"
+                    related_type="sales_order",
+                    company=order.customer.company
                 )
                 continue
 
@@ -186,7 +190,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 "production",
                 f"NEW BATCH: Produce {remaining_to_produce} {item.unit} of {item.name} for SO#{order.id} (PO#{prod_order.id}). Materials reserved.",
                 related_id=prod_order.id,
-                related_type="production_order"
+                related_type="production_order",
+                company=order.customer.company
             )
 
         if errors and not production_orders_created and not any(oi.quantity <= (min(Stock.objects.filter(item=oi.item).aggregate(Sum('quantity'))['quantity__sum'] or 0, ProductionOrder.objects.filter(recipe__product=oi.item, status='completed', qualitycheck__status='approved').aggregate(Sum('quantity'))['quantity__sum'] or 0)) for oi in order.salesorderitem_set.all()):
@@ -209,7 +214,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             "sales",
             f"SO#{order.id} is confirmed. {'Existing stock allocated.' if not production_orders_created else 'Production has been notified and raw materials are reserved.'}",
             related_id=order.id,
-            related_type="sales_order"
+            related_type="sales_order",
+            company=order.customer.company
         )
 
         log_activity(request.user, "Sales", "Mark Ready for Production", f"SO #{order.id} marked ready. POs created: {production_orders_created}. Warnings: {errors or 'None'}")
@@ -341,7 +347,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             "store",
             f"SO#{order.id} FULFILLED. {', '.join([f'{oi.quantity} {oi.item.unit} of {oi.item.name}' for oi in order.salesorderitem_set.all()])} deducted from inventory.",
             related_id=order.id,
-            related_type="sales_order"
+            related_type="sales_order",
+            company=order.customer.company
         )
 
         log_activity(request.user, "Sales", "Fulfill Sales Order", f"SO #{order.id} fulfilled and delivered. Items: {', '.join([f'{oi.quantity} x {oi.item.name}' for oi in order.salesorderitem_set.all()])}")
@@ -432,7 +439,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     "production",
                     f"PARTIAL SHIP: SO#{order.id} still needs {remaining} {order_item.item.unit} of {order_item.item.name}. Please fulfil remaining batch.",
                     related_id=order.id,
-                    related_type="sales_order"
+                    related_type="sales_order",
+                    company=order.customer.company
                 )
 
         # Update order status
@@ -454,7 +462,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             "store",
             f"Partial shipment: SO#{order.id} — Shipped: {', '.join(shipped_summary)}. Remaining: {', '.join(remaining_summary) or 'None'}.",
             related_id=order.id,
-            related_type="sales_order"
+            related_type="sales_order",
+            company=order.customer.company
         )
 
         return Response({
