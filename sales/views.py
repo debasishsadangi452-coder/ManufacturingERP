@@ -22,7 +22,7 @@ class CustomerViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
 class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "customer__company"
-    queryset = SalesOrder.objects.all()
+    queryset = SalesOrder.objects.all().order_by('-created_at')
     serializer_class = SalesOrderSerializer
     permission_classes = [IsSales | IsAdmin | IsStore]
 
