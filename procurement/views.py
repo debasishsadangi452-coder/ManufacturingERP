@@ -12,15 +12,17 @@ from .serializers import (
 from inventory.services import increase_stock
 from accounts.permission import IsStore, IsAdmin
 from core.utils import log_activity
+from core.tenancy import CompanyScopedMixin
 
 
-class VendorViewSet(viewsets.ModelViewSet):
+class VendorViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Vendor.objects.all()
     serializer_class = VendorSerializer
     permission_classes = [IsStore | IsAdmin]
 
     def perform_create(self, serializer):
-        vendor = serializer.save()
+        vendor = serializer.save(company=self.request.user.company)
         log_activity(self.request.user, "Procurement", "Create Vendor", f"Created vendor '{vendor.name}'")
 
     def perform_destroy(self, instance):
@@ -35,7 +37,8 @@ class VendorViewSet(viewsets.ModelViewSet):
         return Response(VendorPriceListSerializer(qs, many=True).data)
 
 
-class VendorPriceListViewSet(viewsets.ModelViewSet):
+class VendorPriceListViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "vendor__company"
     """
     store_user manages per-vendor per-item unit prices.
     GET  /api/procurement/vendor-prices/?vendor=<id>  → prices for a vendor
@@ -63,7 +66,8 @@ class VendorPriceListViewSet(viewsets.ModelViewSet):
         )
 
 
-class PurchaseOrderViewSet(viewsets.ModelViewSet):
+class PurchaseOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "vendor__company"
     queryset = PurchaseOrder.objects.prefetch_related("items__item").select_related("vendor").all()
     serializer_class = PurchaseOrderSerializer
     permission_classes = [IsStore | IsAdmin]
@@ -116,7 +120,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             return Response({"status": "pending", "message": "Order sent to admin for approval."})
 
 
-class PurchaseOrderItemViewSet(viewsets.ModelViewSet):
+class PurchaseOrderItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "purchase_order__vendor__company"
     queryset = PurchaseOrderItem.objects.select_related("item", "purchase_order").all()
     serializer_class = PurchaseOrderItemSerializer
     permission_classes = [IsStore | IsAdmin]
@@ -131,7 +136,8 @@ class PurchaseOrderItemViewSet(viewsets.ModelViewSet):
         )
 
 
-class GoodsReceiptViewSet(viewsets.ModelViewSet):
+class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "purchase_order__vendor__company"
     queryset = GoodsReceipt.objects.all()
     serializer_class = GoodsReceiptSerializer
     permission_classes = [IsStore | IsAdmin]

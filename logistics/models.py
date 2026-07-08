@@ -7,6 +7,9 @@ class Driver(models.Model):
         ("TRANSPORT", "Transport Vehicle"),
     ]
 
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     name = models.CharField(max_length=200)
     license_number = models.CharField(max_length=100, unique=True)
     license_type = models.CharField(max_length=20, choices=LICENSE_CHOICES, default="HMV")
@@ -24,6 +27,9 @@ class Vehicle(models.Model):
         ("maintenance", "Maintenance"),
     ]
 
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     name = models.CharField(max_length=200)
     vehicle_type = models.CharField(max_length=100)  # e.g. Refrigerated, Standard
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="available")
@@ -44,6 +50,9 @@ class DeliveryRoute(models.Model):
         ("completed", "Completed"),
     ]
 
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     name = models.CharField(max_length=200)
     stops = models.IntegerField(default=0)
     distance = models.CharField(max_length=50)
@@ -70,6 +79,9 @@ class Shipment(models.Model):
         ("urgent", "Urgent"),
     ]
 
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     order_number = models.CharField(max_length=100, unique=True, blank=True)
     customer = models.CharField(max_length=200)
     destination = models.CharField(max_length=300)

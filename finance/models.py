@@ -22,6 +22,9 @@ class DepartmentBudget(models.Model):
         ("yearly", "Yearly"),
     ]
 
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     department = models.CharField(max_length=50, choices=DEPARTMENT_CHOICES)
     period = models.CharField(max_length=20, choices=PERIOD_CHOICES, default="monthly")
     period_label = models.CharField(max_length=50, help_text="e.g. 'Jan 2026', 'Q1 2026'")
@@ -41,7 +44,7 @@ class DepartmentBudget(models.Model):
     is_active = models.BooleanField(default=True)
 
     class Meta:
-        unique_together = ("department", "period_label")
+        unique_together = ("company", "department", "period_label")
         ordering = ["-created_at"]
 
     def __str__(self):
@@ -88,6 +91,9 @@ class ExpenseRequest(models.Model):
         ("cancelled", "Cancelled"),
     ]
 
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     title = models.CharField(max_length=300)
     description = models.TextField(blank=True)
     category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)
@@ -136,6 +142,9 @@ class OperationalCost(models.Model):
     ]
     DEPARTMENT_CHOICES = DepartmentBudget.DEPARTMENT_CHOICES
 
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     title = models.CharField(max_length=300)
     cost_type = models.CharField(max_length=20, choices=COST_TYPE_CHOICES)
     department = models.CharField(max_length=50, choices=DEPARTMENT_CHOICES)
@@ -209,7 +218,10 @@ class PayrollRecord(models.Model):
 
 class FinancialSummary(models.Model):
     """Monthly financial snapshot for reporting (admin creates/updates)."""
-    period_label = models.CharField(max_length=50, unique=True)
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    period_label = models.CharField(max_length=50)
     total_revenue = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0"))
     total_expenses = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0"))
     total_payroll = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0"))

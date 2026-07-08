@@ -6,9 +6,11 @@ from accounts.permission import IsQuality, IsAdmin
 from .models import QualityCheck
 from .serializers import QualityCheckSerializer
 from core.utils import log_activity
+from core.tenancy import CompanyScopedMixin
 
 
-class QualityCheckViewSet(viewsets.ModelViewSet):
+class QualityCheckViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "production_order__recipe__product__company"
     queryset = QualityCheck.objects.all()
     serializer_class = QualityCheckSerializer
     permission_classes = [IsQuality | IsAdmin]

@@ -11,14 +11,17 @@ from inventory.services import decrease_stock
 from inventory.models import Stock, Item, Warehouse
 from production.models import ProductionOrder, Recipe, RecipeIngredient
 from core.utils import send_notification, log_activity
+from core.tenancy import CompanyScopedMixin
 
 
-class CustomerViewSet(viewsets.ModelViewSet):
+class CustomerViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Customer.objects.all()
     serializer_class = CustomerSerializer
     permission_classes = [IsSales | IsAdmin]
 
-class SalesOrderViewSet(viewsets.ModelViewSet):
+class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "customer__company"
     queryset = SalesOrder.objects.all()
     serializer_class = SalesOrderSerializer
     permission_classes = [IsSales | IsAdmin | IsStore]
@@ -464,12 +467,14 @@ class SalesOrderViewSet(viewsets.ModelViewSet):
             )
         })
 
-class SalesOrderItemViewSet(viewsets.ModelViewSet):
+class SalesOrderItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "sales_order__customer__company"
     queryset = SalesOrderItem.objects.all()
     serializer_class = SalesOrderItemSerializer
     permission_classes = [IsSales | IsAdmin]
 
-class ShipmentViewSet(viewsets.ModelViewSet):
+class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "sales_order__customer__company"
     queryset = Shipment.objects.all()
     serializer_class = ShipmentSerializer
     permission_classes = [IsSales | IsAdmin]

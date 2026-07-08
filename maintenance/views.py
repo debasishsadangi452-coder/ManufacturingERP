@@ -6,8 +6,10 @@ from .serializers import EquipmentSerializer, MaintenanceTaskSerializer
 from accounts.permission import IsAdmin, IsMaintenanceAllowed
 from core.models import Notification
 from core.utils import log_activity
+from core.tenancy import CompanyScopedMixin
 
-class EquipmentViewSet(viewsets.ModelViewSet):
+class EquipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "line__company"
     queryset = Equipment.objects.all()
     serializer_class = EquipmentSerializer
     
@@ -16,7 +18,8 @@ class EquipmentViewSet(viewsets.ModelViewSet):
             return [IsAdmin()]
         return [IsMaintenanceAllowed()]
 
-class MaintenanceTaskViewSet(viewsets.ModelViewSet):
+class MaintenanceTaskViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "equipment__line__company"
     queryset = MaintenanceTask.objects.all()
     serializer_class = MaintenanceTaskSerializer
     

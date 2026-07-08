@@ -17,6 +17,7 @@ from .models import (
     Skill, EmployeeSkill, TrainingProgram,
     SafetyIncident, PayrollRecord, WorkforceNotification,
 )
+from core.tenancy import CompanyScopedMixin
 from .serializers import (
     DepartmentSerializer, JobRoleSerializer,
     EmployeeSerializer, EmployeeListSerializer, EmployeeDocumentSerializer,
@@ -31,7 +32,8 @@ from .serializers import (
 HR_OR_ADMIN = IsHR | IsAdmin
 
 
-class DepartmentViewSet(viewsets.ModelViewSet):
+class DepartmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Department.objects.all()
     serializer_class = DepartmentSerializer
     permission_classes = [HR_OR_ADMIN]
@@ -39,14 +41,16 @@ class DepartmentViewSet(viewsets.ModelViewSet):
     search_fields = ['name', 'code']
 
 
-class JobRoleViewSet(viewsets.ModelViewSet):
+class JobRoleViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "department__company"
     queryset = JobRole.objects.select_related('department').all()
     serializer_class = JobRoleSerializer
     permission_classes = [HR_OR_ADMIN]
     filterset_fields = ['department', 'erp_role']
 
 
-class EmployeeViewSet(viewsets.ModelViewSet):
+class EmployeeViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Employee.objects.select_related(
         'department', 'job_role', 'manager', 'user'
     ).all()
@@ -157,20 +161,23 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         return Response(ShiftAssignmentSerializer(assignment).data)
 
 
-class EmployeeDocumentViewSet(viewsets.ModelViewSet):
+class EmployeeDocumentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "employee__company"
     queryset = EmployeeDocument.objects.all()
     serializer_class = EmployeeDocumentSerializer
     permission_classes = [HR_OR_ADMIN]
     filterset_fields = ['employee', 'doc_type']
 
 
-class ShiftViewSet(viewsets.ModelViewSet):
+class ShiftViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Shift.objects.select_related('supervisor').all()
     serializer_class = ShiftSerializer
     permission_classes = [HR_OR_ADMIN]
 
 
-class ShiftAssignmentViewSet(viewsets.ModelViewSet):
+class ShiftAssignmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "employee__company"
     queryset = ShiftAssignment.objects.select_related('employee', 'shift').all()
     serializer_class = ShiftAssignmentSerializer
     permission_classes = [HR_OR_ADMIN]
@@ -187,7 +194,8 @@ class ShiftAssignmentViewSet(viewsets.ModelViewSet):
         return Response(ShiftAssignmentSerializer(assignments, many=True).data)
 
 
-class AttendanceViewSet(viewsets.ModelViewSet):
+class AttendanceViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "employee__company"
     queryset = AttendanceRecord.objects.select_related('employee').all()
     serializer_class = AttendanceRecordSerializer
     permission_classes = [HR_OR_ADMIN]
@@ -250,14 +258,16 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
-class LeaveBalanceViewSet(viewsets.ModelViewSet):
+class LeaveBalanceViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "employee__company"
     queryset = LeaveBalance.objects.select_related('employee', 'leave_type').all()
     serializer_class = LeaveBalanceSerializer
     permission_classes = [HR_OR_ADMIN]
     filterset_fields = ['employee', 'leave_type', 'year']
 
 
-class LeaveRequestViewSet(viewsets.ModelViewSet):
+class LeaveRequestViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "employee__company"
     queryset = LeaveRequest.objects.select_related('employee', 'leave_type', 'approved_by').all()
     serializer_class = LeaveRequestSerializer
     permission_classes = [HR_OR_ADMIN]
@@ -337,7 +347,8 @@ class SkillViewSet(viewsets.ModelViewSet):
     permission_classes = [HR_OR_ADMIN]
 
 
-class EmployeeSkillViewSet(viewsets.ModelViewSet):
+class EmployeeSkillViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "employee__company"
     queryset = EmployeeSkill.objects.select_related('employee', 'skill').all()
     serializer_class = EmployeeSkillSerializer
     permission_classes = [HR_OR_ADMIN]
@@ -398,7 +409,8 @@ class SafetyIncidentViewSet(viewsets.ModelViewSet):
         return Response(SafetyIncidentSerializer(incident).data)
 
 
-class PayrollRecordViewSet(viewsets.ModelViewSet):
+class PayrollRecordViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "employee__company"
     queryset = PayrollRecord.objects.select_related('employee').all()
     serializer_class = PayrollRecordSerializer
     permission_classes = [HR_OR_ADMIN]
@@ -476,7 +488,7 @@ class WorkforceDashboardView(APIView):
 
     def get(self, request):
         today = date.today()
-        employees = Employee.objects.all()
+        employees = Employee.objects.filter(company=request.user.company)
         active = employees.filter(status='active').count()
         on_leave = employees.filter(status='on-leave').count()
         in_training = employees.filter(status='training').count()
@@ -485,7 +497,7 @@ class WorkforceDashboardView(APIView):
 
         # Attendance rate (last 30 days)
         last_30 = today - timedelta(days=30)
-        att_records = AttendanceRecord.objects.filter(date__gte=last_30)
+        att_records = AttendanceRecord.objects.filter(date__gte=last_30, employee__company=request.user.company)
         total_records = att_records.count()
         present_records = att_records.filter(status__in=['present', 'late']).count()
         att_rate = round((present_records / max(total_records, 1)) * 100, 1)

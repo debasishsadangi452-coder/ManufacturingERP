@@ -6,9 +6,17 @@ class Item(models.Model):
         ("finished_good", "Finished Good"),
     ]
 
-    name = models.CharField(max_length=200, unique=True)
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    name = models.CharField(max_length=200)
     category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)
     unit = models.CharField(max_length=50, default="unit")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["company", "name"], name="uniq_item_name_per_company"),
+        ]
 
     @property
     def is_finished_good(self):
@@ -19,6 +27,9 @@ class Item(models.Model):
 
 
 class Warehouse(models.Model):
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     name = models.CharField(max_length=200)
     location = models.CharField(max_length=200)
 

@@ -4,6 +4,9 @@ from decimal import Decimal
 
 
 class Vendor(models.Model):
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     name = models.CharField(max_length=200)
     category = models.CharField(max_length=100, default="raw_material")
     email = models.EmailField(blank=True)

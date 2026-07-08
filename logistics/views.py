@@ -5,23 +5,26 @@ from .models import Driver, Vehicle, DeliveryRoute, Shipment
 from .serializers import DriverSerializer, VehicleSerializer, DeliveryRouteSerializer, ShipmentSerializer
 from accounts.permission import IsAdmin, IsSales, IsStore
 from core.utils import log_activity
+from core.tenancy import CompanyScopedMixin
 
-class DriverViewSet(viewsets.ModelViewSet):
+class DriverViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Driver.objects.all()
     serializer_class = DriverSerializer
     permission_classes = [IsSales | IsStore | IsAdmin]
 
     def perform_create(self, serializer):
-        driver = serializer.save()
+        driver = serializer.save(company=self.request.user.company)
         log_activity(self.request.user, "Logistics", "Add Driver", f"Added driver '{driver.name}' (License: {driver.license_number})")
 
-class VehicleViewSet(viewsets.ModelViewSet):
+class VehicleViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Vehicle.objects.all()
     serializer_class = VehicleSerializer
     permission_classes = [IsSales | IsStore | IsAdmin]
 
     def perform_create(self, serializer):
-        vehicle = serializer.save()
+        vehicle = serializer.save(company=self.request.user.company)
         log_activity(self.request.user, "Logistics", "Add Vehicle", f"Added vehicle '{vehicle.name}' ({vehicle.vehicle_type})")
 
     @action(detail=True, methods=['post'], url_path='dispatch')
@@ -35,13 +38,14 @@ class VehicleViewSet(viewsets.ModelViewSet):
         log_activity(request.user, "Logistics", "Dispatch Vehicle", f"Dispatched vehicle '{vehicle.name}'")
         return Response({'status': 'Vehicle dispatched'})
 
-class DeliveryRouteViewSet(viewsets.ModelViewSet):
+class DeliveryRouteViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = DeliveryRoute.objects.all()
     serializer_class = DeliveryRouteSerializer
     permission_classes = [IsSales | IsStore | IsAdmin]
 
     def perform_create(self, serializer):
-        route = serializer.save()
+        route = serializer.save(company=self.request.user.company)
         log_activity(self.request.user, "Logistics", "Create Route", f"Created delivery route '{route.name}' with {route.stops} stops")
 
     @action(detail=True, methods=['post'], url_path='start')
@@ -55,13 +59,14 @@ class DeliveryRouteViewSet(viewsets.ModelViewSet):
         log_activity(request.user, "Logistics", "Start Route", f"Started delivery route '{route.name}'")
         return Response({'status': 'Route started'})
 
-class ShipmentViewSet(viewsets.ModelViewSet):
+class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Shipment.objects.all().order_by('-created_at')
     serializer_class = ShipmentSerializer
     permission_classes = [IsSales | IsStore | IsAdmin]
 
     def perform_create(self, serializer):
-        shipment = serializer.save()
+        shipment = serializer.save(company=self.request.user.company)
         log_activity(self.request.user, "Logistics", "Create Shipment", f"Created shipment '{shipment.order_number}' to '{shipment.destination}'")
 
     @action(detail=True, methods=['post'], url_path='update_status')

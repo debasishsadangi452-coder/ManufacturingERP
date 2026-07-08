@@ -1,3 +1,5 @@
+import logging
+
 from django.db import transaction
 from datetime import timedelta
 
@@ -19,8 +21,10 @@ from .serializers import (
 from inventory.models import Stock
 from inventory.services import increase_stock, decrease_stock
 from core.utils import log_activity
+from core.tenancy import CompanyScopedMixin
 
-class ProductionLineViewSet(viewsets.ModelViewSet):
+class ProductionLineViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = ProductionLine.objects.all()
     serializer_class = ProductionLineSerializer
     permission_classes = [IsProduction | IsAdmin]
@@ -90,7 +94,8 @@ class ProjectionDashboardAPIView(APIView):
 # 🧾 Recipe ViewSet
 # -------------------------------------------------
 
-class RecipeViewSet(viewsets.ModelViewSet):
+class RecipeViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "product__company"
     queryset = Recipe.objects.select_related('product').all()
     serializer_class = RecipeSerializer
     permission_classes = [IsProduction | IsAdmin]
@@ -108,7 +113,8 @@ class RecipeViewSet(viewsets.ModelViewSet):
 # 🧪 Recipe Ingredient ViewSet
 # -------------------------------------------------
 
-class RecipeIngredientViewSet(viewsets.ModelViewSet):
+class RecipeIngredientViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "recipe__product__company"
     queryset = RecipeIngredient.objects.all()
     serializer_class = RecipeIngredientSerializer
     permission_classes = [IsProduction | IsAdmin]
@@ -122,7 +128,8 @@ class RecipeIngredientViewSet(viewsets.ModelViewSet):
 # 🏭 Production Order ViewSet
 # -------------------------------------------------
 
-class ProductionOrderViewSet(viewsets.ModelViewSet):
+class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "recipe__product__company"
     queryset = ProductionOrder.objects.select_related('recipe__product', 'line', 'warehouse').all()
     serializer_class = ProductionOrderSerializer
     permission_classes = [IsProduction | IsAdmin]
@@ -289,6 +296,9 @@ class ProductionOrderViewSet(viewsets.ModelViewSet):
             )
 
         except Exception:
+            logging.getLogger(__name__).exception(
+                "Production order completion failed (order #%s)", order.id
+            )
             return Response(
                 {"error": "Production failed due to internal error."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

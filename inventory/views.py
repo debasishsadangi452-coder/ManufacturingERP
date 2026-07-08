@@ -15,9 +15,11 @@ from rest_framework import status
 from .services import adjust_stock
 from .models import Item, Warehouse
 from core.utils import log_activity
+from core.tenancy import CompanyScopedMixin
 
 
-class ItemViewSet(viewsets.ModelViewSet):
+class ItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Item.objects.all()
     serializer_class = ItemSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
@@ -26,7 +28,7 @@ class ItemViewSet(viewsets.ModelViewSet):
         warehouse_id = serializer.validated_data.get('warehouse_id')
         initial_qty = serializer.validated_data.get('initial_quantity', 0)
         
-        item = serializer.save()
+        item = serializer.save(company=self.request.user.company)
         
         if warehouse_id:
             warehouse = Warehouse.objects.get(id=warehouse_id)
@@ -42,13 +44,14 @@ class ItemViewSet(viewsets.ModelViewSet):
         instance.delete()
 
 
-class WarehouseViewSet(viewsets.ModelViewSet):
+class WarehouseViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = Warehouse.objects.all()
     serializer_class = WarehouseSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
 
     def perform_create(self, serializer):
-        wh = serializer.save()
+        wh = serializer.save(company=self.request.user.company)
         log_activity(self.request.user, "Inventory", "Create Warehouse", f"Created warehouse '{wh.name}'")
 
     @action(detail=True, methods=["post"])
@@ -74,13 +77,15 @@ class WarehouseViewSet(viewsets.ModelViewSet):
         return Response({"status": f"Warehouse {source_wh.name} deleted and stock transferred to {dest_wh.name}"})
 
 
-class BatchViewSet(viewsets.ModelViewSet):
+class BatchViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "item__company"
     queryset = Batch.objects.all()
     serializer_class = BatchSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
 
 
-class StockViewSet(viewsets.ModelViewSet):
+class StockViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "item__company"
     queryset = Stock.objects.all()
     serializer_class = StockSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
@@ -131,13 +136,14 @@ class StockViewSet(viewsets.ModelViewSet):
         log_activity(request.user, "Inventory", "Stock Transfer", f"Transferred {qty} units of '{item.name}' from '{source.name}' to '{dest.name}'")
         return Response({"status": "Transfer successful"})
 
-class InventoryRequestViewSet(viewsets.ModelViewSet):
+class InventoryRequestViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "item__company"
     serializer_class = InventoryRequestSerializer
     permission_classes = [IsStore | IsAdmin | IsProduction]
 
     def get_queryset(self):
         user = self.request.user
-        qs = InventoryRequest.objects.all().order_by('-created_at')
+        qs = InventoryRequest.objects.filter(item__company=user.company).order_by('-created_at')
         # Production users only see requests tied to their own production orders
         if getattr(user, 'role', None) == 'production':
             qs = qs.filter(production_order__isnull=False)
@@ -245,12 +251,13 @@ class InventoryRequestViewSet(viewsets.ModelViewSet):
         )
 
 
-class StockMovementViewSet(viewsets.ReadOnlyModelViewSet):
+class StockMovementViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    company_field = "item__company"
     serializer_class = StockMovementSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
 
     def get_queryset(self):
-        qs = StockMovement.objects.select_related('item', 'warehouse', 'created_by').order_by('-created_at')
+        qs = StockMovement.objects.filter(item__company=self.request.user.company).select_related('item', 'warehouse', 'created_by').order_by('-created_at')
         item_id = self.request.query_params.get('item')
         if item_id:
             qs = qs.filter(item_id=item_id)

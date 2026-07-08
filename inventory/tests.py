@@ -1,11 +1,11 @@
-from django.test import TestCase
+from rest_framework.test import APITestCase
 
 from accounts.models import User
 from inventory.models import InventoryRequest, Item, Warehouse
 from procurement.models import PurchaseOrder, Vendor, VendorPriceList
 
 
-class InventoryProcurementFlowTests(TestCase):
+class InventoryProcurementFlowTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
             username="store_user",
@@ -32,7 +32,7 @@ class InventoryProcurementFlowTests(TestCase):
             status="pending",
         )
 
-        self.client.force_login(self.user)
+        self.client.force_authenticate(user=self.user)
         response = self.client.post(f"/api/inventory/requests/{request.id}/procure/")
 
         self.assertEqual(response.status_code, 200)
@@ -51,7 +51,7 @@ class InventoryProcurementFlowTests(TestCase):
             status="pending",
         )
 
-        self.client.force_login(self.user)
+        self.client.force_authenticate(user=self.user)
         response = self.client.post(f"/api/inventory/requests/{request.id}/procure/")
 
         self.assertEqual(response.status_code, 400)

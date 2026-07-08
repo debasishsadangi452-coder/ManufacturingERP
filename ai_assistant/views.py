@@ -5,22 +5,26 @@ from groq import Groq
 import logging
 import json
 from .tools import TOOLS_DEFINITION, TOOL_MAP
+from .agents import get_agent, get_agent_tools, build_system_prompt, agents_public_list, DEFAULT_AGENT
+from .agent_tools import get_digital_twin_snapshot
+from .permissions import HasPremiumAIPlan
+from .quota import get_company_subscription, quota_exceeded, consume_ai_message
 from django.conf import settings
 from rest_framework.permissions import IsAuthenticated
 
 logger = logging.getLogger(__name__)
 
-def get_erp_state_summary():
-    """Helper to gather critical data points for AI analysis."""
+def get_erp_state_summary(company=None):
+    """Helper to gather critical data points for AI analysis (per company)."""
     from inventory.models import Stock
     from procurement.models import PurchaseOrder
     from production.models import ProductionOrder
     from maintenance.models import Equipment
     
-    low_stock = Stock.objects.filter(quantity__lt=100)
-    pending_po = PurchaseOrder.objects.filter(status='pending').count()
-    running_prod = ProductionOrder.objects.filter(status='running').count()
-    unhealthy_equip = Equipment.objects.filter(health__lt=70).count()
+    low_stock = Stock.objects.filter(quantity__lt=100, item__company=company)
+    pending_po = PurchaseOrder.objects.filter(status='pending', vendor__company=company).count()
+    running_prod = ProductionOrder.objects.filter(status='running', recipe__product__company=company).count()
+    unhealthy_equip = Equipment.objects.filter(health__lt=70, line__company=company).count()
     
     summary = {
         "low_stock_items": [s.item.name for s in low_stock[:5]],
@@ -31,76 +35,78 @@ def get_erp_state_summary():
     return summary
 
 class InsightsView(APIView):
-    permission_classes = [IsAuthenticated]
-    
+    permission_classes = [IsAuthenticated, HasPremiumAIPlan]
+
     def get(self, request):
-        state = get_erp_state_summary()
+        # Insights are informational and regenerated on a timer by the frontend;
+        # cache per company so idle dashboards don't burn LLM tokens every poll.
+        from django.core.cache import cache
+        cache_key = f"ai_insights_v1_{getattr(request.user, 'company_id', 'none')}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached, status=status.HTTP_200_OK)
 
-        config = getattr(settings, 'AI_CONFIG', {})
-        api_key = config.get('GROQ_API_KEY')
-        if not api_key:
-            return Response({
-                "insights": [{"title": "AI Not Configured", "prediction": "Add GROQ_API_KEY to your .env to enable AI insights.", "impact": "medium", "confidence": 99}],
-                "raw_state": state
-            }, status=status.HTTP_200_OK)
+        state = get_erp_state_summary(company=request.user.company)
 
-        client = Groq(api_key=api_key)
+        # Rule-based insights: derived directly from live ERP data, no LLM
+        # call. The LLM token budget is reserved exclusively for the AI chat.
+        insights = []
+        low = state.get("low_stock_items") or []
+        if low:
+            names = ", ".join(low[:3])
+            insights.append({
+                "title": "Inventory Below Minimum",
+                "prediction": (
+                    f"{len(low)} item(s) are critically low ({names}). "
+                    "Production runs that depend on them may be blocked - raise purchase orders now."
+                ),
+                "impact": "critical",
+                "confidence": 97,
+            })
+        unhealthy = state.get("equipment_requiring_maintenance", 0)
+        if unhealthy:
+            insights.append({
+                "title": "Equipment Failure Risk",
+                "prediction": (
+                    f"{unhealthy} machine(s) report health below 70%. "
+                    "Schedule predictive maintenance to avoid unplanned line downtime."
+                ),
+                "impact": "high",
+                "confidence": 92,
+            })
+        pending_po = state.get("pending_purchase_orders", 0)
+        if pending_po:
+            insights.append({
+                "title": "Purchase Orders Awaiting Approval",
+                "prediction": (
+                    f"{pending_po} purchase order(s) are pending approval. "
+                    "Delays here extend supplier lead times and risk stock-outs."
+                ),
+                "impact": "medium",
+                "confidence": 90,
+            })
+        running = state.get("active_production_batches", 0)
+        if running:
+            insights.append({
+                "title": "Production Lines Active",
+                "prediction": (
+                    f"{running} production batch(es) currently running. "
+                    "Ensure raw material reservations cover the full run quantities."
+                ),
+                "impact": "medium",
+                "confidence": 88,
+            })
+        if not insights:
+            insights.append({
+                "title": "All Systems Nominal",
+                "prediction": "No critical risks detected across inventory, production, procurement or maintenance.",
+                "impact": "medium",
+                "confidence": 95,
+            })
 
-        prompt = f"""
-        Given the following state of a Manufacturing ERP, provide 3 short, actionable AI insights or predictions.
-        Focus on automation and risk mitigation.
-        
-        ERP STATE:
-        {json.dumps(state)}
-        
-        FORMAT: Return a JSON list of objects with fields 'title', 'prediction', 'impact' (critical/high/medium), and 'confidence' (70-99).
-        """
-        
-        model = config.get('MODEL', "llama-3.1-8b-instant")
-        logger.info(f"AI Insights using model: {model}")
-        try:
-            # We try JSON mode if the model might support it, but we prepare for failure
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                )
-            except Exception as json_mode_err:
-                logger.warning(f"JSON mode failed for {model}: {json_mode_err}. Retrying without JSON mode.")
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            
-            content = response.choices[0].message.content
-            
-            # Robust JSON parsing: AI sometimes wraps in ```json ... ```
-            import re
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                content = json_match.group(0)
-                
-            insights = json.loads(content).get('insights', [])
-            
-            return Response({
-                "insights": insights,
-                "raw_state": state
-            }, status=status.HTTP_200_OK)
-        except Exception as e:
-            logger.error(f"AI Insights total failure: {e}")
-            # Fallback dummy insights so the UI doesn't break with a 500
-            return Response({
-                "insights": [
-                    {
-                        "title": "Data Syncing",
-                        "prediction": "AI insights are currently updating. Please check back in a few moments.",
-                        "impact": "medium",
-                        "confidence": 99
-                    }
-                ],
-                "raw_state": state
-            }, status=status.HTTP_200_OK)
+        payload = {"insights": insights[:3], "raw_state": state}
+        cache.set(cache_key, payload, timeout=300)  # 5 min per company
+        return Response(payload, status=status.HTTP_200_OK)
 
 
 def extract_po_from_image(client, image_data: str, config: dict) -> str | None:
@@ -146,20 +152,51 @@ class ChatView(APIView):
     Stateful AI chat endpoint. Accepts full conversation history so that
     multi-turn confirmation flows work correctly.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasPremiumAIPlan]
 
     def post(self, request):
         user_message = request.data.get('message', '').strip()
         # history: list of {"role": "user"|"assistant", "content": str}
         history = request.data.get('history', [])
         image_data = request.data.get('image')  # optional base64 data-URL
+        # Which AI teammate is answering (plant-manager, procurement, finance, ...)
+        agent_slug = request.data.get('agent') or DEFAULT_AGENT
+        agent = get_agent(agent_slug)
+        agent_tools_definition, agent_tool_map = get_agent_tools(agent_slug)
 
         if not user_message and not image_data:
             return Response({"error": "Message or image is required"}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Monthly AI message quota (Premium AI plan)
+        subscription = get_company_subscription(request.user)
+        if quota_exceeded(subscription):
+            return Response({
+                "error": "AI quota exceeded",
+                "detail": (
+                    f"Your company has used all {subscription.ai_monthly_message_limit} "
+                    "AI messages for this billing period. The quota resets when the "
+                    "period renews."
+                ),
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
         config = getattr(settings, 'AI_CONFIG', {})
-        client = Groq(api_key=config.get('GROQ_API_KEY'))
+        api_key = config.get('GROQ_API_KEY')
+        if not api_key:
+            return Response({
+                "response": (
+                    f"⚙️ {agent['name']} is not connected to an AI model yet. "
+                    "Add GROQ_API_KEY to the backend .env file and restart the server to enable the AI Team."
+                ),
+                "refresh": False,
+                "actions": [],
+                "agent": agent_slug,
+                "agent_name": agent["name"],
+            }, status=status.HTTP_200_OK)
+        client = Groq(api_key=api_key)
         model = config.get('MODEL', "llama-3.1-8b-instant")
+
+        # Count the message once we know a real AI call will be made
+        consume_ai_message(subscription)
 
         # If the user uploaded an image, extract PO details first using a vision model,
         # then inject the result into the user message so the main tool-calling model
@@ -181,36 +218,8 @@ class ChatView(APIView):
             )
         logger.info(f"AI Chat using model: {model}")
 
-        system_prompt = (
-            "You are the AI brain of a brewery operations platform called Brewmaster. You have full access to every department of the business — inventory, production, procurement, quality, sales, workforce, logistics, finance, and maintenance.\n\n"
-            "Your job is simple: the user tells you what they want done in plain English, and you figure out the right API calls to make it happen.\n\n"
-            "HOW YOU WORK\n"
-            "- Read the user's request and understand the business intent behind it\n"
-            "- Decide which department(s) are involved and which API actions are needed\n"
-            "- Perform tasks STEP BY STEP. Do not try to execute complex multi-stage tasks in a single turn. Chain them logically.\n"
-            "- Execute those API calls in the right order, handling dependencies (e.g. create an order before adding items to it)\n"
-            "- Summarize what you did and what the result was in plain language\n"
-            "- If something fails, tell the user clearly what went wrong and what they can try next\n\n"
-            "WHAT YOU KNOW ABOUT THE BUSINESS\n"
-            "This is a brewery. Users include managers, floor supervisors, HR staff, finance teams, and warehouse workers. They are not technical. They speak in business terms, not API terms. \"Reorder hops\" means procurement. \"Where is my delivery?\" means logistics. \"Who is working tonight?\" means workforce. Map business language to the right actions.\n\n"
-            "HOW TO HANDLE API CALLS\n"
-            "- NATIVE TOOL CALLING ONLY: You MUST use the provided tool-calling interface for all actions. Never type tags like '<function=...>' or '{{tool:...}}' in your response.\n"
-            "- NO HALLUCINATIONS: ONLY use the tools provided in your tools definition. If a tool doesn't exist, tell the user you can't do it.\n"
-            "- NO MIXED CONTENT: Never mix conversational text and tool calls in the same turn.\n"
-            "- TOKEN EFFICIENCY: Keep reasoning brief. Summarize large data.\n"
-            "- Always prefer doing over asking — if you have enough information, act\n"
-            "- If a request is ambiguous, ask one clarifying question, not five\n"
-            "- If an API requires multiple things (arguments) and you don't have them all, give the user an option to fill them by options or by typing.\n"
-            "- Chain calls when needed (e.g. fetch warehouse ID first, then check stock)\n"
-            "- If a call returns an error, interpret it in human terms\n\n"
-            "WHAT YOU NEVER DO\n"
-            "- Never expose raw API responses or technical error codes to the user\n"
-            "- Never make destructive actions (delete, deactivate) without confirming first\n"
-            "- Never guess IDs — always look them up via the appropriate GET call first\n"
-            "- Never tell the user \"I cannot do that\" if the API supports it — figure it out\n\n"
-            "YOUR PERSONALITY\n"
-            "You are calm, direct, and efficient. You speak like a trusted operations manager, not a chatbot. No filler phrases. No excessive confirmations. Just get things done and report back clearly."
-        )
+        # Persona + operating rules for the selected AI teammate
+        system_prompt = build_system_prompt(agent_slug)
 
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -249,7 +258,7 @@ class ChatView(APIView):
                     response = client.chat.completions.create(
                         model=model,
                         messages=messages,
-                        tools=TOOLS_DEFINITION,
+                        tools=agent_tools_definition,
                         tool_choice="auto",
                         max_tokens=512,
                     )
@@ -280,7 +289,9 @@ class ChatView(APIView):
                     return Response({
                         "response": final_text.strip(),
                         "refresh": data_changed,
-                        "actions": all_actions
+                        "actions": all_actions,
+                        "agent": agent_slug,
+                        "agent_name": agent["name"],
                     }, status=status.HTTP_200_OK)
 
                 # Append assistant's tool-calling turn and process each call
@@ -288,7 +299,7 @@ class ChatView(APIView):
 
                 for tool_call in tool_calls:
                     function_name = tool_call.function.name
-                    function_to_call = TOOL_MAP.get(function_name)
+                    function_to_call = agent_tool_map.get(function_name)
 
                     try:
                         function_args = json.loads(tool_call.function.arguments or '{}')
@@ -333,7 +344,9 @@ class ChatView(APIView):
                             return Response({
                                 "response": ai_text,
                                 "refresh": False,
-                                "actions": final_actions
+                                "actions": final_actions,
+                                "agent": agent_slug,
+                                "agent_name": agent["name"],
                             }, status=status.HTTP_200_OK)
                     # ------------------------------------------------------------
                     
@@ -398,3 +411,24 @@ class ChatView(APIView):
                 "error": "AI Assistant error",
                 "details": str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class AgentListView(APIView):
+    """The AI Team roster: names, outcomes and sample questions per agent."""
+    permission_classes = [IsAuthenticated, HasPremiumAIPlan]
+
+    def get(self, request):
+        return Response({"agents": agents_public_list()}, status=status.HTTP_200_OK)
+
+
+class DigitalTwinView(APIView):
+    """One-screen factory snapshot: sales, profit, production, inventory,
+    machine health, procurement and attendance."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            return Response(get_digital_twin_snapshot(request.user), status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception("Digital twin snapshot failed")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

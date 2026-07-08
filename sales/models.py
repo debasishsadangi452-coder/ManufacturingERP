@@ -7,6 +7,9 @@ from inventory.models import Item, Warehouse
 # -------------------------------------------------
 
 class Customer(models.Model):
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     name = models.CharField(max_length=200)
     email = models.EmailField(blank=True)
     phone = models.CharField(max_length=20, blank=True)

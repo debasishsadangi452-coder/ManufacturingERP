@@ -1,6 +1,24 @@
 from django.db import migrations
 
 
+def drop_stale_columns(apps, schema_editor):
+    # The stale columns only ever existed on the Railway Postgres DB, and
+    # "DROP COLUMN IF EXISTS" is Postgres-only syntax — running it on SQLite
+    # (local dev / test databases) crashes with a syntax error.
+    if schema_editor.connection.vendor != "postgresql":
+        return
+    schema_editor.execute(
+        """
+        ALTER TABLE production_recipe
+            DROP COLUMN IF EXISTS effective_from,
+            DROP COLUMN IF EXISTS effective_to,
+            DROP COLUMN IF EXISTS is_active,
+            DROP COLUMN IF EXISTS notes,
+            DROP COLUMN IF EXISTS version;
+        """
+    )
+
+
 class Migration(migrations.Migration):
     """
     The Railway DB was created with extra columns on production_recipe
@@ -14,15 +32,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunSQL(
-            sql="""
-                ALTER TABLE production_recipe
-                    DROP COLUMN IF EXISTS effective_from,
-                    DROP COLUMN IF EXISTS effective_to,
-                    DROP COLUMN IF EXISTS is_active,
-                    DROP COLUMN IF EXISTS notes,
-                    DROP COLUMN IF EXISTS version;
-            """,
-            reverse_sql=migrations.RunSQL.noop,
-        ),
+        migrations.RunPython(drop_stale_columns, migrations.RunPython.noop),
     ]

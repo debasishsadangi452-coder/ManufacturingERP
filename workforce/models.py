@@ -5,8 +5,18 @@ from datetime import time
 
 
 class Department(models.Model):
-    name = models.CharField(max_length=100, unique=True)
-    code = models.CharField(max_length=20, unique=True)
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    name = models.CharField(max_length=100)
+    code = models.CharField(max_length=20)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['company', 'name'], name='uniq_dept_name_per_company'),
+            models.UniqueConstraint(fields=['company', 'code'], name='uniq_dept_code_per_company'),
+        ]
+
     description = models.TextField(blank=True)
     manager = models.ForeignKey(
         'Employee', on_delete=models.SET_NULL, null=True, blank=True,
@@ -64,6 +74,9 @@ class Employee(models.Model):
     ]
 
     # Auto ID
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     employee_id = models.CharField(max_length=20, unique=True, blank=True)
 
     # Personal Info
@@ -152,6 +165,9 @@ class Shift(models.Model):
         ('completed', 'Completed'),
     ]
 
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     name = models.CharField(max_length=100)
     shift_type = models.CharField(
         max_length=20,

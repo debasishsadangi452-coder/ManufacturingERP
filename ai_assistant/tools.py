@@ -16,7 +16,7 @@ def get_inventory_summary(user, item_name=None, warehouse_id=None):
     if user.role not in ['admin', 'store', 'production']:
         return json.dumps({"error": "Unauthorized access to inventory data."})
     
-    stocks = Stock.objects.all().select_related('item', 'warehouse')
+    stocks = Stock.objects.filter(item__company=user.company).select_related('item', 'warehouse')
     if item_name:
         stocks = stocks.filter(item__name__icontains=item_name)
     if warehouse_id:
@@ -39,8 +39,8 @@ def adjust_stock(user, item_id, warehouse_id, quantity, reason="AI Adjustment"):
         return json.dumps({"error": "Unauthorized to adjust stock."})
     
     try:
-        item = Item.objects.get(id=item_id)
-        warehouse = Warehouse.objects.get(id=warehouse_id)
+        item = Item.objects.get(id=item_id, company=user.company)
+        warehouse = Warehouse.objects.get(id=warehouse_id, company=user.company)
         stock, created = Stock.objects.get_or_create(item=item, warehouse=warehouse)
         stock.quantity += quantity
         stock.save()
@@ -53,7 +53,7 @@ def list_pending_sales_orders(user):
     if user.role not in ['admin', 'sales']:
         return json.dumps({"error": "Unauthorized access to sales data."})
     
-    orders = SalesOrder.objects.filter(status='pending')
+    orders = SalesOrder.objects.filter(status='pending', customer__company=user.company)
     results = [{"id": o.id, "customer": o.customer.name, "total": str(o.total_amount)} for o in orders]
     return json.dumps(results)
 
@@ -66,11 +66,11 @@ def create_purchase_order(user, vendor_id, items):
         return json.dumps({"error": "Unauthorized to create purchase orders."})
     
     try:
-        vendor = Vendor.objects.get(id=vendor_id)
+        vendor = Vendor.objects.get(id=vendor_id, company=user.company)
         po = PurchaseOrder.objects.create(vendor=vendor, status='draft')
         
         for entry in items:
-            item = Item.objects.get(id=entry['item_id'])
+            item = Item.objects.get(id=entry['item_id'], company=user.company)
             # Try to get unit price from vendor price list
             price_entry = VendorPriceList.objects.filter(vendor=vendor, item=item).first()
             unit_price = price_entry.unit_price if price_entry else 0
@@ -92,7 +92,7 @@ def check_production_status(user):
     if user.role not in ['admin', 'production']:
         return json.dumps({"error": "Unauthorized access to production data."})
     
-    orders = ProductionOrder.objects.filter(status='running')
+    orders = ProductionOrder.objects.filter(status='running', recipe__product__company=user.company)
     results = [{"id": o.id, "product": o.recipe.product.name, "quantity": o.quantity} for o in orders]
     return json.dumps(results)
 
@@ -101,7 +101,7 @@ def get_equipment_health(user):
     if user.role not in ['admin', 'production']:
         return json.dumps({"error": "Unauthorized access to equipment data."})
     
-    equip = Equipment.objects.all()
+    equip = Equipment.objects.filter(line__company=user.company)
     results = [{"id": e.id, "name": e.name, "status": e.status, "health": e.health} for e in equip]
     return json.dumps(results)
 
@@ -111,7 +111,7 @@ def schedule_maintenance(user, equipment_id, task_type, priority, description):
         return json.dumps({"error": "Unauthorized to schedule maintenance."})
     
     try:
-        equip = Equipment.objects.get(id=equipment_id)
+        equip = Equipment.objects.get(id=equipment_id, line__company=user.company)
         task = MaintenanceTask.objects.create(
             equipment=equip,
             task_type=task_type,
@@ -129,7 +129,7 @@ def list_vendors(user):
     if user.role not in ['admin', 'store']:
         return json.dumps({"error": "Unauthorized access to vendor data."})
     
-    vendors = Vendor.objects.all()
+    vendors = Vendor.objects.filter(company=user.company)
     results = [{"id": v.id, "name": v.name} for v in vendors]
     return json.dumps(results)
 
@@ -141,8 +141,8 @@ def get_finance_overview(user):
     from sales.models import SalesOrder
     from finance.models import ExpenseRequest
     
-    income = SalesOrder.objects.filter(status__in=['confirmed', 'shipped', 'delivered']).aggregate(Sum('total_amount'))['total_amount__sum'] or 0
-    expense = ExpenseRequest.objects.filter(status__in=['approved', 'auto_approved']).aggregate(Sum('amount'))['amount__sum'] or 0
+    income = SalesOrder.objects.filter(status__in=['confirmed', 'shipped', 'delivered'], customer__company=user.company).aggregate(Sum('total_amount'))['total_amount__sum'] or 0
+    expense = ExpenseRequest.objects.filter(status__in=['approved', 'auto_approved'], company=user.company).aggregate(Sum('amount'))['amount__sum'] or 0
     
     return json.dumps({
         "total_revenue": str(income),
@@ -157,7 +157,7 @@ def list_production_recipes(user):
     
     try:
         from production.models import Recipe
-        recipes = Recipe.objects.all()
+        recipes = Recipe.objects.filter(product__company=user.company)
         results = [{"id": r.id, "product": r.product.name} for r in recipes]
         return json.dumps(results)
     except ImportError:
@@ -168,13 +168,13 @@ def list_warehouses(user):
     if user.role not in ['admin', 'store', 'production']:
         return json.dumps({"error": "Unauthorized access to warehouse data."})
     
-    warehouses = Warehouse.objects.all()
+    warehouses = Warehouse.objects.filter(company=user.company)
     results = [{"id": w.id, "name": w.name, "location": w.location} for w in warehouses]
     return json.dumps(results)
 
 def list_items(user):
     """Lists all items in the system."""
-    items = Item.objects.all()
+    items = Item.objects.filter(company=user.company)
     results = [{"id": i.id, "name": i.name, "category": i.category} for i in items]
     return json.dumps(results)
 
@@ -183,7 +183,7 @@ def create_warehouse(user, name, location):
     if user.role != 'admin':
         return json.dumps({"error": "Only admins can create warehouses."})
     try:
-        warehouse = Warehouse.objects.create(name=name, location=location)
+        warehouse = Warehouse.objects.create(name=name, location=location, company=user.company)
         return json.dumps({"success": True, "warehouse_id": warehouse.id, "name": warehouse.name})
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -193,7 +193,7 @@ def delete_warehouse(user, warehouse_id):
     if user.role != 'admin':
         return json.dumps({"error": "Only admins can delete warehouses."})
     try:
-        warehouse = Warehouse.objects.get(id=warehouse_id)
+        warehouse = Warehouse.objects.get(id=warehouse_id, company=user.company)
         # Check if there is stock
         has_stock = Stock.objects.filter(warehouse=warehouse, quantity__gt=0).exists()
         if has_stock:
@@ -209,10 +209,10 @@ def create_item(user, name, category, unit="unit", warehouse_id=None, initial_qu
     if user.role != 'admin':
         return json.dumps({"error": "Only admins can create items."})
     try:
-        item = Item.objects.create(name=name, category=category, unit=unit)
+        item = Item.objects.create(name=name, category=category, unit=unit, company=user.company)
         
         if warehouse_id:
-            warehouse = Warehouse.objects.get(id=warehouse_id)
+            warehouse = Warehouse.objects.get(id=warehouse_id, company=user.company)
             Stock.objects.create(item=item, warehouse=warehouse, quantity=initial_quantity)
             
         return json.dumps({
@@ -231,7 +231,7 @@ def delete_item(user, item_id):
     if user.role != 'admin':
         return json.dumps({"error": "Only admins can delete items."})
     try:
-        item = Item.objects.get(id=item_id)
+        item = Item.objects.get(id=item_id, company=user.company)
         item.delete()
         return json.dumps({"success": True, "message": f"Item {item_id} deleted."})
     except Exception as e:
@@ -242,7 +242,7 @@ def create_vendor(user, name):
     if user.role not in ['admin', 'store']:
         return json.dumps({"error": "Unauthorized to create vendors."})
     try:
-        vendor = Vendor.objects.create(name=name)
+        vendor = Vendor.objects.create(name=name, company=user.company)
         return json.dumps({"success": True, "vendor_id": vendor.id, "name": vendor.name})
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -252,52 +252,86 @@ def delete_vendor(user, vendor_id):
     if user.role not in ['admin', 'store']:
         return json.dumps({"error": "Unauthorized to delete vendors."})
     try:
-        vendor = Vendor.objects.get(id=vendor_id)
+        vendor = Vendor.objects.get(id=vendor_id, company=user.company)
         vendor.delete()
         return json.dumps({"success": True, "message": f"Vendor {vendor_id} deleted."})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-def create_production_order(user, recipe_id, quantity, warehouse_id):
-    """Creates a new production order."""
+def list_production_lines(user):
+    """Lists production lines with status/capacity so the user can pick one."""
+    lines = ProductionLine.objects.filter(company=user.company)
+    return json.dumps([
+        {"id": l.id, "name": l.name, "location": l.location, "status": l.status,
+         "capacity_per_hour": l.capacity, "is_active": l.is_active}
+        for l in lines
+    ])
+
+def create_production_order(user, recipe_id, quantity, warehouse_id, line_id=None):
+    """Creates a new production order on a specific production line."""
     if user.role not in ['admin', 'production']:
         return json.dumps({"error": "Unauthorized to create production orders."})
     
     try:
+        lines_qs = ProductionLine.objects.filter(company=user.company, is_active=True)
+        if line_id in (None, "", 0):
+            return json.dumps({
+                "error": "line_id is required. Show the user this list of production lines and ask which one to run the batch on before creating the order.",
+                "available_lines": [
+                    {"id": l.id, "name": l.name, "status": l.status} for l in lines_qs
+                ],
+            })
+        if isinstance(line_id, str) and not str(line_id).isdigit():
+            line = lines_qs.filter(name__icontains=line_id).first()
+            if not line:
+                raise ValueError(f"Production line '{line_id}' not found.")
+        else:
+            line = lines_qs.filter(id=int(line_id)).first()
+            if not line:
+                raise ValueError(f"Production line #{line_id} not found.")
+        if line.status == 'maintenance':
+            return json.dumps({
+                "error": f"Line '{line.name}' is under maintenance. Ask the user to pick another line.",
+                "available_lines": [
+                    {"id": l.id, "name": l.name, "status": l.status}
+                    for l in lines_qs.exclude(id=line.id)
+                ],
+            })
         if isinstance(recipe_id, str) and not str(recipe_id).isdigit():
-            recipe = Recipe.objects.filter(product__name__icontains=recipe_id).first()
+            recipe = Recipe.objects.filter(product__name__icontains=recipe_id, product__company=user.company).first()
             if not recipe:
                 raise ValueError(f"Recipe for product '{recipe_id}' not found.")
         else:
-            recipe = Recipe.objects.get(id=int(recipe_id))
+            recipe = Recipe.objects.get(id=int(recipe_id), product__company=user.company)
 
         if isinstance(warehouse_id, str) and not str(warehouse_id).isdigit():
-            warehouse = Warehouse.objects.filter(name__icontains=warehouse_id).first()
+            warehouse = Warehouse.objects.filter(name__icontains=warehouse_id, company=user.company).first()
             if not warehouse:
                 raise ValueError(f"Warehouse '{warehouse_id}' not found.")
         else:
-            warehouse = Warehouse.objects.get(id=int(warehouse_id))
+            warehouse = Warehouse.objects.get(id=int(warehouse_id), company=user.company)
 
         order = ProductionOrder.objects.create(
             recipe=recipe,
             quantity=float(quantity),
             warehouse=warehouse,
+            line=line,
             status='scheduled'
         )
-        return json.dumps({"success": True, "order_id": order.id, "product": recipe.product.name, "quantity": quantity})
+        return json.dumps({"success": True, "order_id": order.id, "product": recipe.product.name, "quantity": quantity, "line": line.name})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-def create_work_order(user, recipe_id, quantity, warehouse_id):
+def create_work_order(user, recipe_id, quantity, warehouse_id, line_id=None):
     """Alias for create_production_order to handle alternative naming."""
-    return create_production_order(user, recipe_id, quantity, warehouse_id)
+    return create_production_order(user, recipe_id, quantity, warehouse_id, line_id)
 
 def update_production_status(user, order_id, status):
     """Updates the status of a production order."""
     if user.role not in ['admin', 'production']:
         return json.dumps({"error": "Unauthorized to update production orders."})
     try:
-        order = ProductionOrder.objects.get(id=order_id)
+        order = ProductionOrder.objects.get(id=order_id, recipe__product__company=user.company)
         order.status = status
         order.save()
         return json.dumps({"success": True, "order_id": order.id, "new_status": status})
@@ -308,7 +342,7 @@ def list_production_orders(user):
     """Lists all production orders and their current status."""
     if user.role not in ['admin', 'production']:
         return json.dumps({"error": "Unauthorized access to production data."})
-    orders = ProductionOrder.objects.all().order_by('-created_at')
+    orders = ProductionOrder.objects.filter(recipe__product__company=user.company).order_by('-created_at')
     results = [
         {
             "id": o.id,
@@ -330,10 +364,10 @@ def create_recipe(user, product_id, ingredients):
     if user.role not in ['admin', 'production']:
         return json.dumps({"error": "Unauthorized to create recipes."})
     try:
-        product = Item.objects.get(id=product_id)
+        product = Item.objects.get(id=product_id, company=user.company)
         recipe = Recipe.objects.create(product=product)
         for ing in ingredients:
-            item = Item.objects.get(id=ing['item_id'])
+            item = Item.objects.get(id=ing['item_id'], company=user.company)
             RecipeIngredient.objects.create(recipe=recipe, item=item, quantity=ing['quantity'])
         return json.dumps({"success": True, "recipe_id": recipe.id, "product": product.name})
     except Exception as e:
@@ -343,7 +377,7 @@ def list_customers(user):
     """Lists all available customers."""
     if user.role not in ['admin', 'sales']:
         return json.dumps({"error": "Unauthorized access to customer data."})
-    customers = Customer.objects.all()
+    customers = Customer.objects.filter(company=user.company)
     results = [{"id": c.id, "name": c.name} for c in customers]
     return json.dumps(results)
 
@@ -352,7 +386,7 @@ def create_customer(user, name, email=""):
     if user.role not in ['admin', 'sales']:
         return json.dumps({"error": "Unauthorized to create customers."})
     try:
-        customer = Customer.objects.create(name=name, email=email)
+        customer = Customer.objects.create(name=name, email=email, company=user.company)
         return json.dumps({"success": True, "customer_id": customer.id, "name": customer.name})
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -362,7 +396,7 @@ def delete_customer(user, customer_id):
     if user.role not in ['admin', 'sales']:
         return json.dumps({"error": "Unauthorized to delete customers."})
     try:
-        customer = Customer.objects.get(id=customer_id)
+        customer = Customer.objects.get(id=customer_id, company=user.company)
         customer.delete()
         return json.dumps({"success": True, "message": f"Customer {customer_id} deleted."})
     except Exception as e:
@@ -376,10 +410,10 @@ def create_sales_order(user, customer_id, items):
     if user.role not in ['admin', 'sales']:
         return json.dumps({"error": "Unauthorized to create sales orders."})
     try:
-        customer = Customer.objects.get(id=customer_id)
+        customer = Customer.objects.get(id=customer_id, company=user.company)
         so = SalesOrder.objects.create(customer=customer, status='pending')
         for itm in items:
-            item = Item.objects.get(id=itm['item_id'])
+            item = Item.objects.get(id=itm['item_id'], company=user.company)
             SalesOrderItem.objects.create(sales_order=so, item=item, quantity=itm['quantity'])
         return json.dumps({"success": True, "so_id": so.id, "customer": customer.name})
     except Exception as e:
@@ -390,7 +424,12 @@ def update_purchase_order_status(user, po_id, status):
     if user.role not in ['admin', 'store']:
         return json.dumps({"error": "Unauthorized to update purchase orders."})
     try:
-        po = PurchaseOrder.objects.get(id=po_id)
+        po = PurchaseOrder.objects.get(id=po_id, vendor__company=user.company)
+        if status == 'received':
+            return json.dumps({
+                "error": "To receive a PO (and book the stock into inventory), use create_goods_receipt "
+                         "with a warehouse. Ask the user which warehouse the goods arrived at.",
+            })
         po.status = status
         po.save()
         return json.dumps({"success": True, "po_id": po.id, "new_status": status})
@@ -398,24 +437,42 @@ def update_purchase_order_status(user, po_id, status):
         return json.dumps({"error": str(e)})
 
 def create_goods_receipt(user, po_id, warehouse_id):
-    """Records a goods receipt for a purchase order."""
+    """Records a goods receipt for a purchase order and books the stock in."""
     if user.role not in ['admin', 'store']:
         return json.dumps({"error": "Unauthorized to record goods receipts."})
     try:
-        po = PurchaseOrder.objects.get(id=po_id)
-        warehouse = Warehouse.objects.get(id=warehouse_id)
+        from inventory.services import increase_stock
+        po = PurchaseOrder.objects.get(id=po_id, vendor__company=user.company)
+        if po.status not in ('approved', 'ordered'):
+            return json.dumps({
+                "error": f"PO #{po.id} is '{po.status}'. Only approved or ordered POs can be received."
+            })
+        if isinstance(warehouse_id, str) and not str(warehouse_id).isdigit():
+            warehouse = Warehouse.objects.filter(name__icontains=warehouse_id, company=user.company).first()
+            if not warehouse:
+                raise ValueError(f"Warehouse '{warehouse_id}' not found.")
+        else:
+            warehouse = Warehouse.objects.get(id=int(warehouse_id), company=user.company)
         receipt = GoodsReceipt.objects.create(purchase_order=po, warehouse=warehouse)
+        received = []
+        for poi in po.items.all():
+            increase_stock(poi.item, warehouse, poi.quantity, user=user,
+                           reference=f"GRN PO#{po.id} (AI)")
+            received.append(f"{poi.quantity} x {poi.item.name}")
         po.status = 'received'
         po.save()
-        return json.dumps({"success": True, "receipt_id": receipt.id, "po_id": po.id})
+        return json.dumps({
+            "success": True, "receipt_id": receipt.id, "po_id": po.id,
+            "stock_booked_into": warehouse.name, "items_received": received,
+        })
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 def create_expense_request(user, title, amount, category, budget_id=None):
     """Submits a new expense request."""
     try:
-        budget = DepartmentBudget.objects.get(id=budget_id) if budget_id else None
-        expense = ExpenseRequest.objects.create(
+        budget = DepartmentBudget.objects.get(id=budget_id, company=user.company) if budget_id else None
+        expense = ExpenseRequest.objects.create(company=user.company,
             title=title,
             amount=amount,
             category=category,
@@ -432,7 +489,7 @@ def approve_expense_request(user, expense_id, notes="AI Approved"):
     if user.role not in ['admin', 'finance']:
         return json.dumps({"error": "Unauthorized to approve expenses."})
     try:
-        expense = ExpenseRequest.objects.get(id=expense_id)
+        expense = ExpenseRequest.objects.get(id=expense_id, company=user.company)
         expense.status = 'approved'
         expense.reviewed_by = user
         expense.notes = notes
@@ -445,7 +502,7 @@ def list_quality_checks(user, production_order_id=None):
     """Lists quality control checks, optionally filtered by production order."""
     if user.role not in ['admin', 'quality', 'production']:
         return json.dumps({"error": "Unauthorized access to quality data."})
-    checks = QualityCheck.objects.all()
+    checks = QualityCheck.objects.filter(production_order__recipe__product__company=user.company)
     if production_order_id:
         checks = checks.filter(production_order_id=production_order_id)
     results = [
@@ -464,7 +521,7 @@ def record_quality_check(user, production_order_id, test_type, status, result=""
     if user.role not in ['admin', 'quality']:
         return json.dumps({"error": "Unauthorized to record quality checks."})
     try:
-        order = ProductionOrder.objects.get(id=production_order_id)
+        order = ProductionOrder.objects.get(id=production_order_id, recipe__product__company=user.company)
         check = QualityCheck.objects.create(
             production_order=order,
             test_type=test_type,
@@ -478,7 +535,7 @@ def record_quality_check(user, production_order_id, test_type, status, result=""
 
 def list_employees(user, department_id=None):
     """Lists employees, optionally filtered by department."""
-    employees = Employee.objects.all().select_related('department', 'job_role')
+    employees = Employee.objects.filter(company=user.company).select_related('department', 'job_role')
     if department_id:
         employees = employees.filter(department_id=department_id)
     results = [
@@ -496,7 +553,7 @@ def list_employees(user, department_id=None):
 def get_employee_details(user, employee_id):
     """Returns detailed information for a specific employee."""
     try:
-        e = Employee.objects.get(id=employee_id)
+        e = Employee.objects.get(id=employee_id, company=user.company)
         return json.dumps({
             "id": e.id,
             "employee_id": e.employee_id,
@@ -519,7 +576,7 @@ def submit_leave_request(user, employee_id, leave_type_code, start_date, end_dat
     if user.role not in ['admin', 'hr'] and not (hasattr(user, 'employee_profile') and user.employee_profile.id == employee_id):
          return json.dumps({"error": "Unauthorized to submit leave for this employee."})
     try:
-        employee = Employee.objects.get(id=employee_id)
+        employee = Employee.objects.get(id=employee_id, company=user.company)
         leave_type = LeaveType.objects.get(code=leave_type_code)
         request = LeaveRequest.objects.create(
             employee=employee,
@@ -535,7 +592,7 @@ def submit_leave_request(user, employee_id, leave_type_code, start_date, end_dat
 
 def list_attendance(user, date=None, employee_id=None):
     """Lists attendance records for a specific date or employee."""
-    records = AttendanceRecord.objects.all().select_related('employee')
+    records = AttendanceRecord.objects.filter(employee__company=user.company).select_related('employee')
     if date:
         records = records.filter(date=date)
     if employee_id:
@@ -553,7 +610,7 @@ def list_attendance(user, date=None, employee_id=None):
 
 def list_vehicles(user):
     """Lists all logistics vehicles."""
-    vehicles = Vehicle.objects.all()
+    vehicles = Vehicle.objects.filter(company=user.company)
     results = [
         {
             "id": v.id, 
@@ -571,7 +628,7 @@ def update_vehicle_status(user, vehicle_id, status, driver=None):
     if user.role not in ['admin', 'logistics', 'store']:
         return json.dumps({"error": "Unauthorized to update vehicle status."})
     try:
-        vehicle = Vehicle.objects.get(id=vehicle_id)
+        vehicle = Vehicle.objects.get(id=vehicle_id, company=user.company)
         vehicle.status = status
         if driver:
             vehicle.driver = driver
@@ -582,7 +639,7 @@ def update_vehicle_status(user, vehicle_id, status, driver=None):
 
 def list_delivery_routes(user):
     """Lists all planned and active delivery routes."""
-    routes = DeliveryRoute.objects.all().select_related('assigned_vehicle')
+    routes = DeliveryRoute.objects.filter(company=user.company).select_related('assigned_vehicle')
     results = [
         {
             "name": r.name,
@@ -607,6 +664,7 @@ TOOL_MAP = {
     "get_finance_overview": get_finance_overview,
     "list_production_recipes": list_production_recipes,
     "create_production_order": create_production_order,
+    "list_production_lines": list_production_lines,
     "list_warehouses": list_warehouses,
     "list_items": list_items,
     "create_warehouse": create_warehouse,
@@ -764,16 +822,25 @@ TOOLS_DEFINITION = [
         "type": "function",
         "function": {
             "name": "create_production_order",
-            "description": "Schedule a new production batch for a product.",
+            "description": "Schedule a new production batch for a product on a chosen production line. IMPORTANT: never pick the line yourself - first call list_production_lines, show the options to the user, and ask which line to use.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "recipe_id": {"type": "string", "description": "ID or name of the product recipe"},
                     "quantity": {"type": "number"},
                     "warehouse_id": {"type": "string", "description": "Target warehouse ID or name for finished goods"},
+                    "line_id": {"type": "string", "description": "ID or name of the production line the USER selected from list_production_lines"},
                 },
-                "required": ["recipe_id", "quantity", "warehouse_id"],
+                "required": ["recipe_id", "quantity", "warehouse_id", "line_id"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_production_lines",
+            "description": "List the production lines (name, status, capacity). Call this and show the options whenever the user wants to create a production/work order, so they can choose the line.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {

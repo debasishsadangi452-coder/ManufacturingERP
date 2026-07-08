@@ -12,6 +12,7 @@ from .serializers import (
 )
 from accounts.permission import IsAdmin
 from django.contrib.auth import get_user_model
+from core.tenancy import CompanyScopedMixin
 
 User = get_user_model()
 
@@ -24,7 +25,8 @@ class IsFinanceOrAdmin(IsAuthenticated):
 # ────────────────────────────────────────────────────────────────────────────
 # Department Budget  – Admin CRUD, all authenticated users can read
 # ────────────────────────────────────────────────────────────────────────────
-class DepartmentBudgetViewSet(viewsets.ModelViewSet):
+class DepartmentBudgetViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = DepartmentBudget.objects.all()
     serializer_class = DepartmentBudgetSerializer
     filter_backends = [DjangoFilterBackend]
@@ -36,14 +38,15 @@ class DepartmentBudgetViewSet(viewsets.ModelViewSet):
         return [IsAuthenticated()]
 
     def perform_create(self, serializer):
-        serializer.save(set_by=self.request.user)
+        serializer.save(set_by=self.request.user, company=self.request.user.company)
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Expense Request  – any authenticated user can submit;
 #                    Admin can approve/reject
 # ────────────────────────────────────────────────────────────────────────────
-class ExpenseRequestViewSet(viewsets.ModelViewSet):
+class ExpenseRequestViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = ExpenseRequest.objects.select_related(
         "budget", "requested_by", "reviewed_by"
     ).all()
@@ -54,13 +57,14 @@ class ExpenseRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        qs = super().get_queryset()
         if user.role in ["admin", "finance"]:
-            return self.queryset
+            return qs
         # Non-admins only see their own requests
-        return self.queryset.filter(requested_by=user)
+        return qs.filter(requested_by=user)
 
     def perform_create(self, serializer):
-        serializer.save(requested_by=self.request.user)
+        serializer.save(requested_by=self.request.user, company=self.request.user.company)
 
     @action(detail=True, methods=["post"], permission_classes=[IsFinanceOrAdmin])
     def approve(self, request, pk=None):
@@ -102,7 +106,8 @@ class ExpenseRequestViewSet(viewsets.ModelViewSet):
 # ────────────────────────────────────────────────────────────────────────────
 # Operational Costs  – Admin CRUD; read for authenticated
 # ────────────────────────────────────────────────────────────────────────────
-class OperationalCostViewSet(viewsets.ModelViewSet):
+class OperationalCostViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = OperationalCost.objects.select_related("recorded_by").all()
     serializer_class = OperationalCostSerializer
     filter_backends = [DjangoFilterBackend]
@@ -114,13 +119,14 @@ class OperationalCostViewSet(viewsets.ModelViewSet):
         return [IsAuthenticated()]
 
     def perform_create(self, serializer):
-        serializer.save(recorded_by=self.request.user)
+        serializer.save(recorded_by=self.request.user, company=self.request.user.company)
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Payroll  – Admin CRUD only; employees can read their own records
 # ────────────────────────────────────────────────────────────────────────────
-class PayrollRecordViewSet(viewsets.ModelViewSet):
+class PayrollRecordViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "employee__company"
     queryset = PayrollRecord.objects.select_related("employee", "processed_by").all()
     serializer_class = PayrollRecordSerializer
     filter_backends = [DjangoFilterBackend]
@@ -133,9 +139,10 @@ class PayrollRecordViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        qs = super().get_queryset()
         if user.role in ["admin", "finance"]:
-            return self.queryset
-        return self.queryset.filter(employee=user)
+            return qs
+        return qs.filter(employee=user)
 
     @action(detail=True, methods=["post"], permission_classes=[IsFinanceOrAdmin])
     def process_payroll(self, request, pk=None):
@@ -177,7 +184,8 @@ class PayrollRecordViewSet(viewsets.ModelViewSet):
 # ────────────────────────────────────────────────────────────────────────────
 # Financial Summary  – Admin CRUD; all can read
 # ────────────────────────────────────────────────────────────────────────────
-class FinancialSummaryViewSet(viewsets.ModelViewSet):
+class FinancialSummaryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
     queryset = FinancialSummary.objects.all()
     serializer_class = FinancialSummarySerializer
 
@@ -187,7 +195,7 @@ class FinancialSummaryViewSet(viewsets.ModelViewSet):
         return [IsAuthenticated()]
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        serializer.save(created_by=self.request.user, company=self.request.user.company)
 
     @action(detail=False, methods=["get"])
     def dashboard(self, request):
@@ -195,16 +203,16 @@ class FinancialSummaryViewSet(viewsets.ModelViewSet):
         from django.db.models import Sum
         from decimal import Decimal
 
-        budgets = DepartmentBudget.objects.filter(is_active=True)
+        budgets = DepartmentBudget.objects.filter(is_active=True, company=request.user.company)
         total_budget = float(sum(b.total_budget for b in budgets))
         total_spent = float(sum(b.spent for b in budgets))
 
-        pending_count = ExpenseRequest.objects.filter(status="pending").count()
+        pending_count = ExpenseRequest.objects.filter(status="pending", company=request.user.company).count()
         total_costs = float(
-            OperationalCost.objects.aggregate(t=Sum("amount"))["t"] or 0
+            OperationalCost.objects.filter(company=request.user.company).aggregate(t=Sum("amount"))["t"] or 0
         )
         payroll_total = float(
-            PayrollRecord.objects.filter(pay_status__in=["processed", "paid"])
+            PayrollRecord.objects.filter(pay_status__in=["processed", "paid"], employee__company=request.user.company)
             .aggregate(t=Sum("net_salary"))["t"] or 0
         )
 

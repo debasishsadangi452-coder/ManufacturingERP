@@ -273,8 +273,14 @@ STATIC_URL = "static/"
 
 # AI Configuration
 AI_CONFIG = {
+    # Set GROQ_API_KEY in the environment (Railway) or in the local .env file.
     "GROQ_API_KEY": os.getenv("GROQ_API_KEY"),
-    "MODEL": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+    # gpt-oss-120b: strong tool-calling model on Groq with its own daily
+    # token bucket (the llama-3.3-70b free-tier budget kept running out).
+    "MODEL": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+    # Cheap model for the auto-refreshing dashboard insights; keeps the big
+    # model's daily token budget for the interactive AI Team chat.
+    "INSIGHTS_MODEL": os.getenv("GROQ_INSIGHTS_MODEL", "llama-3.1-8b-instant"),
     # Vision-capable model used only for image → PO extraction.
     # Llama 4 Scout supports image input on Groq.
     "VISION_MODEL": os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),

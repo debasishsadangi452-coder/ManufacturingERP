@@ -24,6 +24,9 @@ class ProductionLine(models.Model):
         ("running", "Running"),
         ("maintenance", "Maintenance"),
     ]
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
     name = models.CharField(max_length=100)
     location = models.CharField(max_length=200, default="Main Facility")
     capacity = models.FloatField(default=100.0)  # Units per hour standard

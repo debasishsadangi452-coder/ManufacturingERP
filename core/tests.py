@@ -39,7 +39,7 @@ class FreshFizzERPTestSuite(APITestCase):
         # Create Item
         item_resp = self.client.post(
             "/api/inventory/items/",
-            {"name": "Sugar", "category": "Raw", "is_finished_good": False},
+            {"name": "Sugar", "category": "raw_material"},
             format="json"
         )
         self.assertEqual(item_resp.status_code, status.HTTP_201_CREATED)
@@ -54,13 +54,21 @@ class FreshFizzERPTestSuite(APITestCase):
         self.assertEqual(wh_resp.status_code, status.HTTP_201_CREATED)
         wh_id = wh_resp.data["id"]
 
-        # Create Stock
+        # Direct stock creation is intentionally blocked (must flow through
+        # procurement/production); stock levels are set via the adjust action.
         stock_resp = self.client.post(
             "/api/inventory/stock/",
             {"item": item_id, "warehouse": wh_id, "quantity": 1000},
             format="json"
         )
-        self.assertEqual(stock_resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(stock_resp.status_code, status.HTTP_403_FORBIDDEN)
+
+        adjust_resp = self.client.post(
+            "/api/inventory/stock/adjust/",
+            {"item": item_id, "warehouse": wh_id, "quantity": 1000, "reason": "Initial load"},
+            format="json"
+        )
+        self.assertEqual(adjust_resp.status_code, status.HTTP_200_OK)
 
         # Create Batch
         batch_resp = self.client.post(
@@ -95,7 +103,8 @@ class FreshFizzERPTestSuite(APITestCase):
     # ==================================================
 
     def test_production_crud(self):
-        item = Item.objects.create(name="Orange Soda", category="Finished", is_finished_good=True)
+        item = Item.objects.create(name="Orange Soda", category="finished_good")
+        warehouse = Warehouse.objects.create(name="Plant WH", location="Plant A")
 
         recipe_resp = self.client.post(
             "/api/production/recipes/",
@@ -107,7 +116,7 @@ class FreshFizzERPTestSuite(APITestCase):
 
         prod_resp = self.client.post(
             "/api/production/production-orders/",
-            {"recipe": recipe_id, "quantity": 500, "status": "pending"},
+            {"recipe": recipe_id, "quantity": 500, "warehouse": warehouse.id, "status": "scheduled"},
             format="json"
         )
         self.assertEqual(prod_resp.status_code, status.HTTP_201_CREATED)
@@ -117,9 +126,10 @@ class FreshFizzERPTestSuite(APITestCase):
     # ==================================================
 
     def test_quality_crud(self):
-        item = Item.objects.create(name="Juice", category="Finished", is_finished_good=True)
+        item = Item.objects.create(name="Juice", category="finished_good")
+        warehouse = Warehouse.objects.create(name="QC WH", location="Plant B")
         recipe = Recipe.objects.create(product=item)
-        prod = ProductionOrder.objects.create(recipe=recipe, quantity=100)
+        prod = ProductionOrder.objects.create(recipe=recipe, quantity=100, warehouse=warehouse)
 
         qc_resp = self.client.post(
             "/api/quality/quality-checks/",
