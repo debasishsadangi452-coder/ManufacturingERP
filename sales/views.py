@@ -274,38 +274,33 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Pick first warehouse for stock deduction
-        warehouse = Warehouse.objects.first()
+        company = order.customer.company
+        # Pick a warehouse belonging to this company for stock deduction
+        warehouse = Warehouse.objects.filter(company=company).first()
         if not warehouse:
             return Response({"error": "No warehouse configured."}, status=status.HTTP_400_BAD_REQUEST)
 
         errors = []
-        errors = []
         for order_item in order.salesorderitem_set.all():
             item = order_item.item
             qty_needed = order_item.quantity - order_item.shipped_quantity
-            
+
             if qty_needed <= 0:
                 continue
 
-            # Check quality-approved finished goods are available
-            approved_qty = ProductionOrder.objects.filter(
-                recipe__product=item,
-                status='completed',
-                qualitycheck__status='approved'
+            # Available = physical finished-goods stock in this company's warehouses
+            available = Stock.objects.filter(
+                item=item, warehouse__company=company
             ).aggregate(Sum('quantity'))['quantity__sum'] or 0
-
-            physical_stock = Stock.objects.filter(item=item).aggregate(Sum('quantity'))['quantity__sum'] or 0
-            available = min(physical_stock, approved_qty)
 
             if available < qty_needed:
                 errors.append(
-                    f"'{item.name}': need {qty_needed}, only {available} quality-approved in stock."
+                    f"'{item.name}': need {qty_needed}, only {available} in stock."
                 )
 
         if errors:
             return Response({
-                "error": "Insufficient quality-approved stock to fulfill order.",
+                "error": "Insufficient finished-goods stock to fulfill order.",
                 "details": errors
             }, status=status.HTTP_400_BAD_REQUEST)
 
@@ -315,7 +310,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             if qty_needed <= 0:
                 continue
 
-            stock_entry = Stock.objects.filter(item=order_item.item).order_by('-quantity').first()
+            stock_entry = Stock.objects.filter(item=order_item.item, warehouse__company=company).order_by('-quantity').first()
             if stock_entry:
                 try:
                     decrease_stock(
