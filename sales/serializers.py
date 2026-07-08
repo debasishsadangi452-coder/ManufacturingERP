@@ -29,13 +29,22 @@ class SalesOrderSerializer(serializers.ModelSerializer):
         items_data = request.data.get('items', []) if request else []
         
         order = SalesOrder.objects.create(**validated_data)
-        
+        company = order.customer.company
+
         from decimal import Decimal
+        from rest_framework import serializers as drf_serializers
+        from inventory.models import Item
         total = Decimal("0")
         for item_data in items_data:
             item_id = item_data.get('item')
             quantity = item_data.get('quantity', 0)
             if item_id and float(quantity) > 0:
+                # An order may only contain items from the customer's own company
+                if not Item.objects.filter(id=int(item_id), company=company).exists():
+                    order.delete()
+                    raise drf_serializers.ValidationError(
+                        {"items": f"Item {item_id} does not belong to {company}."}
+                    )
                 so_item = SalesOrderItem.objects.create(
                     sales_order=order,
                     item_id=int(item_id),

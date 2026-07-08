@@ -231,25 +231,24 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         """
         List items that are Finished Goods, have a Recipe, and have passed quality checks.
         """
-        items = Item.objects.filter(category='finished_good', recipes__isnull=False).distinct()
-        
+        company = request.user.company
+        items = Item.objects.filter(
+            category='finished_good', recipes__isnull=False, company=company
+        ).distinct()
+
         results = []
         for item in items:
-            physical_stock = Stock.objects.filter(item=item).aggregate(Sum('quantity'))['quantity__sum'] or 0
-            
-            approved_qty = ProductionOrder.objects.filter(
-                recipe__product=item,
-                status='completed',
-                qualitycheck__status='approved'
+            # Physical finished-goods stock in THIS company's warehouses — the
+            # same basis fulfil_order uses, so the tab never contradicts it.
+            physical_stock = Stock.objects.filter(
+                item=item, warehouse__company=company
             ).aggregate(Sum('quantity'))['quantity__sum'] or 0
-            
-            sellable_qty = min(physical_stock, approved_qty)
-            
+
             results.append({
                 "id": item.id,
                 "name": item.name,
                 "total_stock": physical_stock,
-                "available_for_sales": sellable_qty,
+                "available_for_sales": physical_stock,
                 "unit": item.unit
             })
             
