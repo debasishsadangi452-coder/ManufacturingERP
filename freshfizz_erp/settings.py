@@ -275,9 +275,9 @@ STATIC_URL = "static/"
 AI_CONFIG = {
     # Set GROQ_API_KEY in the environment (Railway) or in the local .env file.
     "GROQ_API_KEY": os.getenv("GROQ_API_KEY"),
-    # gpt-oss-120b: strong tool-calling model on Groq with its own daily
-    # token bucket (the llama-3.3-70b free-tier budget kept running out).
-    "MODEL": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+    # gpt-oss-20b: same family as the 120b we tuned prompts for, but a
+    # separate daily token bucket (the 120b / llama-3.3-70b budgets ran out).
+    "MODEL": os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
     # Cheap model for the auto-refreshing dashboard insights; keeps the big
     # model's daily token budget for the interactive AI Team chat.
     "INSIGHTS_MODEL": os.getenv("GROQ_INSIGHTS_MODEL", "llama-3.1-8b-instant"),
