@@ -382,6 +382,23 @@ class ChatView(APIView):
                                             "data": {"itemId": res_data.get('item_id'), "itemName": res_data.get('name')}
                                         })
                                         all_actions.append({"label": "📊 Check Inventory Status", "action": "check_stock"})
+                            # Template tools (uniform procurement) return a fixed
+                            # 'template'. Relay it VERBATIM and stop — no second
+                            # LLM round, so it can't be paraphrased or truncated.
+                            try:
+                                res_data = json.loads(function_response)
+                            except (json.JSONDecodeError, TypeError):
+                                res_data = {}
+                            if isinstance(res_data, dict) and res_data.get("template"):
+                                if function_name in ("procure_item", "receive_procurement", "add_vendor_price"):
+                                    data_changed = True
+                                return Response({
+                                    "response": res_data["template"],
+                                    "refresh": data_changed,
+                                    "actions": all_actions,
+                                    "agent": agent_slug,
+                                    "agent_name": agent["name"],
+                                }, status=status.HTTP_200_OK)
                         except Exception as tool_err:
                             logger.error(f"[AI Tool] {function_name} crashed: {tool_err}")
                             function_response = json.dumps({
