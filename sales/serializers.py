@@ -30,15 +30,22 @@ class SalesOrderSerializer(serializers.ModelSerializer):
         
         order = SalesOrder.objects.create(**validated_data)
         
+        from decimal import Decimal
+        total = Decimal("0")
         for item_data in items_data:
             item_id = item_data.get('item')
             quantity = item_data.get('quantity', 0)
             if item_id and float(quantity) > 0:
-                SalesOrderItem.objects.create(
+                so_item = SalesOrderItem.objects.create(
                     sales_order=order,
                     item_id=int(item_id),
                     quantity=float(quantity)
                 )
+                total += (so_item.item.selling_price or Decimal("0")) * Decimal(str(so_item.quantity))
+        # Price the order from item selling prices unless a total was supplied
+        if not order.total_amount and total:
+            order.total_amount = total
+            order.save(update_fields=["total_amount"])
         return order
 
 class ShipmentSerializer(serializers.ModelSerializer):

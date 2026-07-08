@@ -17,7 +17,7 @@ class ItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Item
-        fields = ["id", "name", "category", "is_finished_good", "unit", "warehouse_id", "initial_quantity"]
+        fields = ["id", "name", "category", "is_finished_good", "unit", "selling_price", "warehouse_id", "initial_quantity"]
 
     def create(self, validated_data):
         # Pop these fields so they don't get passed to Item.objects.create()

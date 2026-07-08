@@ -71,12 +71,14 @@ def seed_company(spec):
     # --- Items (raw materials + finished goods, with opening stock) ---
     existing_items = {i["name"]: i["id"] for i in c.get("/inventory/items/")}
     items = {}
-    for name, category, unit, wh_name, qty in spec["items"]:
+    for row in spec["items"]:
+        name, category, unit, wh_name, qty = row[:5]
+        price = row[5] if len(row) > 5 else 0
         if name in existing_items:
             items[name] = existing_items[name]
             continue
         r = c.post("/inventory/items/", {
-            "name": name, "category": category, "unit": unit,
+            "name": name, "category": category, "unit": unit, "selling_price": price,
             "warehouse_id": wh[wh_name], "initial_quantity": qty,
         })
         if r:
@@ -447,16 +449,16 @@ APEXFORGE = {
         ("Hydraulic Oil ISO VG46", "raw_material", "litre", RM_METAL, 800),
         ("Industrial Packing Crate", "raw_material", "unit", RM_METAL, 250),
         # finished goods
-        ("Compression Spring HD-40", "finished_good", "unit", FG_METAL, 5200),
-        ("Extension Spring ES-25 Zinc", "finished_good", "unit", FG_METAL, 3800),
-        ("Torsion Spring TS-12", "finished_good", "unit", FG_METAL, 2600),
-        ("Aluminium T-Slot Profile 40x40", "finished_good", "metre", FG_METAL, 1500),
-        ("Aluminium Window Frame AW-60", "finished_good", "metre", FG_METAL, 900),
-        ("Galvanized Wire Mesh Panel 2x1m", "finished_good", "unit", FG_METAL, 420),
-        ("CNC Gear Blank 80mm", "finished_good", "unit", FG_METAL, 650),
-        ("Conveyor Roller Assembly 600mm", "finished_good", "unit", FG_METAL, 310),
-        ("Wire Formed Shelf Bracket", "finished_good", "unit", FG_METAL, 1800),
-        ("Industrial Fastener Kit M8", "finished_good", "kit", FG_METAL, 950),
+        ("Compression Spring HD-40", "finished_good", "unit", FG_METAL, 5200, 22),
+        ("Extension Spring ES-25 Zinc", "finished_good", "unit", FG_METAL, 3800, 16),
+        ("Torsion Spring TS-12", "finished_good", "unit", FG_METAL, 2600, 14),
+        ("Aluminium T-Slot Profile 40x40", "finished_good", "metre", FG_METAL, 1500, 340),
+        ("Aluminium Window Frame AW-60", "finished_good", "metre", FG_METAL, 900, 520),
+        ("Galvanized Wire Mesh Panel 2x1m", "finished_good", "unit", FG_METAL, 420, 1450),
+        ("CNC Gear Blank 80mm", "finished_good", "unit", FG_METAL, 650, 950),
+        ("Conveyor Roller Assembly 600mm", "finished_good", "unit", FG_METAL, 310, 2800),
+        ("Wire Formed Shelf Bracket", "finished_good", "unit", FG_METAL, 1800, 85),
+        ("Industrial Fastener Kit M8", "finished_good", "kit", FG_METAL, 950, 420),
     ],
     "vendors": [
         {"name": "Hindalco Industries Ltd", "category": "raw_material", "email": "sales@hindalco.demo", "phone": "+91-22-66917000", "address": "Mumbai, Maharashtra", "rating": 4.7},
@@ -659,16 +661,16 @@ PURESWEET = {
         ("Food Grade PET Jar 500g", "raw_material", "unit", RM_FOOD, 15000),
         ("Kraft Stand-Up Pouch 1kg", "raw_material", "unit", RM_FOOD, 18000),
         # finished goods
-        ("Organic Agave Nectar 250ml", "finished_good", "bottle", FG_FOOD, 6200),
-        ("Coconut Sugar Pouch 500g", "finished_good", "unit", FG_FOOD, 4800),
-        ("Date Syrup Squeeze 340g", "finished_good", "unit", FG_FOOD, 3100),
-        ("Erythritol Baking Sweetener 1kg", "finished_good", "unit", FG_FOOD, 5400),
-        ("Monk Fruit Sweetener Blend 200g", "finished_good", "unit", FG_FOOD, 7200),
-        ("Birch Xylitol Jar 500g", "finished_good", "unit", FG_FOOD, 2900),
-        ("Keto Pancake Syrup 250ml", "finished_good", "unit", FG_FOOD, 3600),
-        ("Zero-Calorie Ketchup 320g", "finished_good", "unit", FG_FOOD, 2400),
-        ("Stevia Liquid Drops 60ml", "finished_good", "unit", FG_FOOD, 4100),
-        ("Golden Plant-Based Sweetener 400g", "finished_good", "unit", FG_FOOD, 3300),
+        ("Organic Agave Nectar 250ml", "finished_good", "bottle", FG_FOOD, 6200, 240),
+        ("Coconut Sugar Pouch 500g", "finished_good", "unit", FG_FOOD, 4800, 180),
+        ("Date Syrup Squeeze 340g", "finished_good", "unit", FG_FOOD, 3100, 210),
+        ("Erythritol Baking Sweetener 1kg", "finished_good", "unit", FG_FOOD, 5400, 520),
+        ("Monk Fruit Sweetener Blend 200g", "finished_good", "unit", FG_FOOD, 7200, 350),
+        ("Birch Xylitol Jar 500g", "finished_good", "unit", FG_FOOD, 2900, 410),
+        ("Keto Pancake Syrup 250ml", "finished_good", "unit", FG_FOOD, 3600, 380),
+        ("Zero-Calorie Ketchup 320g", "finished_good", "unit", FG_FOOD, 2400, 190),
+        ("Stevia Liquid Drops 60ml", "finished_good", "unit", FG_FOOD, 4100, 260),
+        ("Golden Plant-Based Sweetener 400g", "finished_good", "unit", FG_FOOD, 3300, 300),
     ],
     "vendors": [
         {"name": "AgaveMex Exports SA", "category": "raw_material", "email": "export@agavemex.demo", "phone": "+52-33-36150000", "address": "Guadalajara, Mexico", "rating": 4.6},

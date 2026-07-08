@@ -12,6 +12,9 @@ class Item(models.Model):
     name = models.CharField(max_length=200)
     category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)
     unit = models.CharField(max_length=50, default="unit")
+    # Sale price per unit for finished goods; drives sales order totals
+    # and the revenue figures on the finance dashboard.
+    selling_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
 
     class Meta:
         constraints = [

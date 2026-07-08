@@ -216,7 +216,17 @@ class FinancialSummaryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             .aggregate(t=Sum("net_salary"))["t"] or 0
         )
 
+        # Revenue recognized on fulfilment: shipped or delivered sales orders
+        from sales.models import SalesOrder
+        total_revenue = float(
+            SalesOrder.objects.filter(
+                status__in=["shipped", "delivered"],
+                customer__company=request.user.company,
+            ).aggregate(t=Sum("total_amount"))["t"] or 0
+        )
+
         return Response({
+            "total_revenue": total_revenue,
             "total_budget": total_budget,
             "total_spent": total_spent,
             "budget_remaining": total_budget - total_spent,
