@@ -587,7 +587,162 @@ def get_digital_twin(user):
 # Registry: map + Groq tool definitions for the new tools
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Uniform, template-driven procurement (deterministic — no LLM composition).
+# The tool builds a fixed-format message; the agent must relay it verbatim.
+# ---------------------------------------------------------------------------
+
+def procure_item(user, item_name, quantity):
+    """Uniform procurement: check item -> coupon price -> vendor. If all
+    present, raise the PO and prompt to receive. Otherwise, ask the user to
+    add the missing vendor/coupon price. Returns a fixed template string."""
+    if user.role not in ('admin', 'store'):
+        return json.dumps({"template": "PROCUREMENT · You are not authorized to raise purchase orders."})
+
+    company = user.company
+    try:
+        qty = float(quantity)
+    except (TypeError, ValueError):
+        qty = 0
+    if qty <= 0:
+        return json.dumps({"template": "PROCUREMENT · Please specify a quantity greater than zero."})
+
+    item = Item.objects.filter(name__icontains=item_name, company=company).first()
+    if not item:
+        return json.dumps({"template": (
+            f"PROCUREMENT · Item not found\n"
+            f"No item matching '{item_name}' exists for {company}.\n"
+            f"Add the item first, then order it."
+        )})
+
+    # Best coupon price = cheapest active vendor price for this item
+    price = (
+        VendorPriceList.objects.filter(item=item, is_active=True, vendor__company=company)
+        .select_related("vendor").order_by("unit_price").first()
+    )
+
+    if not price:
+        return json.dumps({"template": (
+            f"PROCUREMENT · Missing vendor / coupon price\n"
+            f"Item: {item.name}\n"
+            f"Quantity: {qty:g} {item.unit}\n"
+            f"No vendor or coupon price is on file for this item, so it cannot be ordered yet.\n\n"
+            f"Please add them manually (say, e.g.):\n"
+            f'  "Add vendor <name> with coupon price <amount> for {item.name}"\n'
+            f"Then order it again."
+        )})
+
+    vendor = price.vendor
+    unit_price = Decimal(str(price.unit_price))
+    total = unit_price * Decimal(str(qty))
+
+    po = PurchaseOrder.objects.create(vendor=vendor, status="approved")
+    from procurement.models import PurchaseOrderItem
+    PurchaseOrderItem.objects.create(
+        purchase_order=po, item=item, quantity=qty, unit_price=unit_price
+    )
+    po.refresh_from_db()
+
+    moq_note = ""
+    if qty < (price.min_order_qty or 0):
+        moq_note = f"\nNote: vendor minimum order qty is {price.min_order_qty:g} {item.unit}."
+
+    return json.dumps({"template": (
+        f"PURCHASE ORDER PREPARED · PO-{po.id:04d}\n"
+        f"Item        : {item.name}\n"
+        f"Quantity    : {qty:g} {item.unit}\n"
+        f"Vendor      : {vendor.name} (rating {vendor.rating or 0}/5)\n"
+        f"Coupon price: {price.currency} {unit_price:g} / {item.unit}\n"
+        f"Lead time   : {price.lead_time_days} days\n"
+        f"Total       : {price.currency} {total:g}\n"
+        f"Status      : Approved{moq_note}\n\n"
+        f'Reply "receive PO {po.id}" to book the goods into inventory.'
+    )})
+
+
+def receive_procurement(user, po_id, warehouse_name=None):
+    """Receive an approved/ordered PO: book stock in and record the cost.
+    Returns a fixed template string."""
+    if user.role not in ('admin', 'store'):
+        return json.dumps({"template": "PROCUREMENT · You are not authorized to receive goods."})
+
+    company = user.company
+    from inventory.models import Warehouse
+    from inventory.services import increase_stock
+    from procurement.models import GoodsReceipt
+
+    po = PurchaseOrder.objects.filter(id=po_id, vendor__company=company).first()
+    if not po:
+        return json.dumps({"template": f"PROCUREMENT · PO {po_id} not found for {company}."})
+    if po.status not in ("approved", "ordered"):
+        return json.dumps({"template": (
+            f"PROCUREMENT · PO-{po.id:04d} is '{po.status}'. "
+            f"Only Approved or Ordered POs can be received."
+        )})
+
+    if warehouse_name:
+        warehouse = Warehouse.objects.filter(name__icontains=warehouse_name, company=company).first()
+    else:
+        warehouse = Warehouse.objects.filter(company=company).first()
+    if not warehouse:
+        return json.dumps({"template": "PROCUREMENT · No warehouse configured for this company."})
+
+    receipt = GoodsReceipt.objects.create(purchase_order=po, warehouse=warehouse)
+    lines = []
+    for poi in po.items.all():
+        increase_stock(poi.item, warehouse, poi.quantity, user=user, reference=f"GRN PO#{po.id} (AI)")
+        lines.append(f"  {poi.quantity:g} {poi.item.unit} {poi.item.name}")
+    po.status = "received"
+    po.save()
+    from finance.services import record_procurement_cost
+    record_procurement_cost(po, user=user)
+
+    return json.dumps({"template": (
+        f"GOODS RECEIVED · PO-{po.id:04d}\n"
+        f"Warehouse: {warehouse.name}\n"
+        f"Booked into inventory:\n" + "\n".join(lines) + "\n"
+        f"Cost recorded in Finance: {po.total_amount:g}"
+    )})
+
+
+def add_vendor_price(user, vendor_name, item_name, unit_price, lead_time_days=7):
+    """Create (or reuse) a vendor and set its coupon price for an item.
+    Used when procure_item reports a missing vendor/price. Templated output."""
+    if user.role not in ('admin', 'store'):
+        return json.dumps({"template": "PROCUREMENT · You are not authorized to add vendors."})
+
+    company = user.company
+    item = Item.objects.filter(name__icontains=item_name, company=company).first()
+    if not item:
+        return json.dumps({"template": f"PROCUREMENT · Item '{item_name}' not found for {company}."})
+
+    vendor = Vendor.objects.filter(name__iexact=vendor_name, company=company).first()
+    if not vendor:
+        vendor = Vendor.objects.create(name=vendor_name, company=company)
+
+    try:
+        price = Decimal(str(unit_price))
+    except Exception:
+        return json.dumps({"template": "PROCUREMENT · Coupon price must be a number."})
+
+    VendorPriceList.objects.update_or_create(
+        vendor=vendor, item=item,
+        defaults={"unit_price": price, "lead_time_days": int(lead_time_days or 7), "is_active": True},
+    )
+    return json.dumps({"template": (
+        f"VENDOR & COUPON PRICE SAVED\n"
+        f"Vendor      : {vendor.name}\n"
+        f"Item        : {item.name}\n"
+        f"Coupon price: {price:g} / {item.unit}\n"
+        f"Lead time   : {int(lead_time_days or 7)} days\n\n"
+        f'You can now say "order <qty> {item.name}".'
+    )})
+
+
 AGENT_TOOL_MAP = {
+    "procure_item": procure_item,
+    "receive_procurement": receive_procurement,
+    "add_vendor_price": add_vendor_price,
     "predict_equipment_failure": predict_equipment_failure,
     "detect_reorder_needs": detect_reorder_needs,
     "recommend_suppliers": recommend_suppliers,
@@ -600,6 +755,53 @@ AGENT_TOOL_MAP = {
 }
 
 AGENT_TOOLS_DEFINITION = [
+    {
+        "type": "function",
+        "function": {
+            "name": "procure_item",
+            "description": "Uniform procurement for one item. Checks the item, its coupon (vendor) price and vendor; if all present it raises the PO and returns a fixed template asking the user to receive it. If the vendor/coupon price is missing it returns a template asking the user to add them. ALWAYS relay the returned 'template' text verbatim.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {"type": "string", "description": "Name of the item to order"},
+                    "quantity": {"type": "number", "description": "Quantity to order"},
+                },
+                "required": ["item_name", "quantity"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "receive_procurement",
+            "description": "Receive an approved/ordered purchase order: books stock into inventory and records the cost in finance. Relay the returned 'template' text verbatim.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "po_id": {"type": "integer", "description": "Purchase order id to receive"},
+                    "warehouse_name": {"type": "string", "description": "Optional destination warehouse name"},
+                },
+                "required": ["po_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_vendor_price",
+            "description": "Add (or update) a vendor and its coupon price for an item. Use when procure_item reports a missing vendor/coupon price. Relay the returned 'template' text verbatim.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vendor_name": {"type": "string"},
+                    "item_name": {"type": "string"},
+                    "unit_price": {"type": "number", "description": "Coupon price per unit"},
+                    "lead_time_days": {"type": "integer", "description": "Vendor lead time in days (default 7)"},
+                },
+                "required": ["vendor_name", "item_name", "unit_price"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {

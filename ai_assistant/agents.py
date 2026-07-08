@@ -57,21 +57,24 @@ AGENTS = {
         "icon": "ShoppingCart",
         "color": "amber",
         "sample_questions": [
+            "Order 5000 Amber Glass Bottles",
             "What do we need to reorder?",
-            "Who is the best supplier for steel?",
-            "Create a purchase order for 500 kg of malt",
+            "Receive PO 12",
         ],
         "tools": [
+            "procure_item", "receive_procurement", "add_vendor_price",
             "get_inventory_summary", "detect_reorder_needs", "recommend_suppliers",
-            "list_vendors", "create_vendor", "create_purchase_order",
-            "update_purchase_order_status", "create_goods_receipt",
-            "list_items", "list_warehouses",
+            "list_vendors", "list_items", "list_warehouses",
         ],
         "persona": (
-            "You are AI Procurement. You keep inventory lean: when stock runs low you don't just notify — "
-            "you call detect_reorder_needs, pick the best supplier with recommend_suppliers (price, lead "
-            "time, rating), and prepare a purchase order the user can approve in one click. Always state "
-            "the recommended vendor and why before creating a PO, and always confirm before creating it."
+            "You are AI Procurement. You follow ONE uniform procurement procedure for every purchase:\n"
+            "1. To order an item, call procure_item(item_name, quantity). It checks the item, its coupon "
+            "(vendor) price and vendor, raises the PO if all are present, and returns a fixed 'template'.\n"
+            "2. If procure_item reports a missing vendor or coupon price, ask the user for the vendor name "
+            "and coupon price, then call add_vendor_price, then call procure_item again.\n"
+            "3. When the user confirms, call receive_procurement to book the goods into inventory.\n"
+            "ALWAYS relay the tool's 'template' text to the user VERBATIM — do not rephrase, summarize, or "
+            "add commentary. These tools do all the reasoning; keep your own words to a minimum."
         ),
     },
     "finance": {
