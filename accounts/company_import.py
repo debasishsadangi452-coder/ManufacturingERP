@@ -115,10 +115,33 @@ def build_template() -> bytes:
 
 # --- Parsing + validation helpers -----------------------------------------
 
+def _norm(s):
+    """Normalize a sheet/column name: lowercase, collapse whitespace, and
+    treat '&'/'and' the same, so minor spelling differences still match."""
+    s = "" if s is None else str(s).lower().strip()
+    s = s.replace("&", " and ")
+    return " ".join(s.split())
+
+
+def resolve_sheet(wb, expected_name):
+    """Find the worksheet whose tab name matches `expected_name` regardless
+    of case/spacing. Returns the worksheet or None."""
+    target = _norm(expected_name)
+    for name in wb.sheetnames:
+        if _norm(name) == target:
+            return wb[name]
+    return None
+
+
 def _rows(ws, columns):
-    """Yield (excel_row_number, {col: value}) for non-empty data rows."""
-    header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
-    idx = {name: header.index(name) for name in columns if name in header}
+    """Yield (excel_row_number, {col: value}) for non-empty data rows.
+    Columns are matched to header cells by normalized name."""
+    header_norm = [_norm(c.value) if c.value is not None else "" for c in ws[1]]
+    idx = {}
+    for name in columns:
+        n = _norm(name)
+        if n in header_norm:
+            idx[name] = header_norm.index(n)
     for r in range(2, ws.max_row + 1):
         values = [c.value for c in ws[r]]
         if all(v is None or str(v).strip() == "" for v in values):
@@ -162,10 +185,14 @@ def import_workbook(file_obj, company, user):
     except Exception as exc:
         return False, {"errors": [f"Could not read the Excel file: {exc}"]}
 
-    missing = [s for s in SHEETS if s not in wb.sheetnames]
+    resolved = {name: resolve_sheet(wb, name) for name in SHEETS}
+    missing = [name for name, ws in resolved.items() if ws is None]
     if missing:
-        return False, {"errors": [f"Missing sheet(s): {', '.join(missing)}. "
-                                  f"Please use the provided template."]}
+        return False, {"errors": [
+            f"Missing sheet(s): {', '.join(missing)}. "
+            f"Your file has: {', '.join(wb.sheetnames)}. "
+            f"Please use the downloaded template (its tab names must be kept)."
+        ]}
 
     errors = []
 
@@ -173,7 +200,7 @@ def import_workbook(file_obj, company, user):
     item_defs = {}     # code -> dict(name, category, unit, selling_price)
     stock_rows = []    # (code, warehouse_name, qty)
     seen_stock = set()
-    ws = wb["Items & Stock"]
+    ws = resolved["Items & Stock"]
     for rn, row in _rows(ws, SHEETS["Items & Stock"]):
         code = _s(row.get("item_code"))
         if not code:
@@ -211,7 +238,7 @@ def import_workbook(file_obj, company, user):
     # ---- Pass 2: Vendors & Prices ----
     vendor_defs = {}   # name -> dict(category,email,phone,address,rating)
     price_rows = []    # (vendor_name, item_code, unit_price, currency, moq, lead)
-    ws = wb["Vendors & Prices"]
+    ws = resolved["Vendors & Prices"]
     for rn, row in _rows(ws, SHEETS["Vendors & Prices"]):
         vname = _s(row.get("vendor_name"))
         if not vname:
@@ -240,7 +267,7 @@ def import_workbook(file_obj, company, user):
 
     # ---- Pass 3: Customers ----
     customer_rows = []
-    ws = wb["Customers"]
+    ws = resolved["Customers"]
     for rn, row in _rows(ws, SHEETS["Customers"]):
         cname = _s(row.get("customer_name"))
         if not cname:
@@ -253,7 +280,7 @@ def import_workbook(file_obj, company, user):
 
     # ---- Pass 4: Production Lines ----
     line_rows = []
-    ws = wb["Production Lines"]
+    ws = resolved["Production Lines"]
     for rn, row in _rows(ws, SHEETS["Production Lines"]):
         lname = _s(row.get("line_name"))
         if not lname:
@@ -267,7 +294,7 @@ def import_workbook(file_obj, company, user):
 
     # ---- Pass 5: Recipes (BOM) ----
     recipe_rows = []   # (product_code, ingredient_code, qty)
-    ws = wb["Recipes (BOM)"]
+    ws = resolved["Recipes (BOM)"]
     for rn, row in _rows(ws, SHEETS["Recipes (BOM)"]):
         pcode = _s(row.get("product_code"))
         icode = _s(row.get("ingredient_code"))
