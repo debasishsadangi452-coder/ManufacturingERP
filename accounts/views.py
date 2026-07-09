@@ -185,3 +185,53 @@ class CompleteOnboardingView(APIView):
         subscription.onboarding_completed = True
         subscription.save()
         return Response({"configured": True, "onboarding_completed": True})
+
+
+# ── Company data import (Excel) at registration ──────────────────────────────
+from django.http import HttpResponse
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.response import Response
+from accounts.permission import IsAdmin
+
+
+class ImportTemplateView(APIView):
+    """Download the 5-sheet .xlsx template a company fills in at registration."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        from .company_import import build_template
+        data = build_template()
+        resp = HttpResponse(
+            data,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        resp["Content-Disposition"] = 'attachment; filename="company_data_template.xlsx"'
+        return resp
+
+
+class CompanyDataImportView(APIView):
+    """Upload the filled workbook. Validates everything; on any error returns
+    the list so the user can fix and re-upload. On success, imports and returns
+    a summary of what was created."""
+    permission_classes = [IsAuthenticated, IsAdmin]
+
+    def post(self, request):
+        f = request.FILES.get("file")
+        if not f:
+            return Response({"ok": False, "errors": ["No file uploaded."]},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not f.name.lower().endswith((".xlsx", ".xlsm")):
+            return Response({"ok": False, "errors": ["Please upload an .xlsx file."]},
+                            status=status.HTTP_400_BAD_REQUEST)
+        company = request.user.company
+        if company is None:
+            return Response({"ok": False, "errors": ["Your account is not linked to a company."]},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        from .company_import import import_workbook
+        ok, result = import_workbook(f, company, request.user)
+        if not ok:
+            return Response({"ok": False, "errors": result["errors"]},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response({"ok": True, "summary": result["summary"]}, status=status.HTTP_200_OK)

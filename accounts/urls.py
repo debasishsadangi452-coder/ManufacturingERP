@@ -9,11 +9,15 @@ from .views import (
     SubscriptionStatusView,
     SelectPlanView,
     CompleteOnboardingView,
+    ImportTemplateView,
+    CompanyDataImportView,
 )
 
 urlpatterns = [
     path("register/", RegisterView.as_view()),
     path("company/register/", CompanyRegisterView.as_view()),
+    path("company/import-template/", ImportTemplateView.as_view()),
+    path("company/import-data/", CompanyDataImportView.as_view()),
     path("profile/", ProfileView.as_view()),
     path("users/", UsersListView.as_view()),
     path("users/<int:pk>/", UserUpdateView.as_view()),
