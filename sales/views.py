@@ -1,10 +1,13 @@
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
+
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Sum
-from accounts.permission import IsSales, IsAdmin, IsStore
+from accounts.permission import IsSales, IsAdmin, IsStore, IsFinance
 
-from .models import Customer, SalesOrder, SalesOrderItem, Shipment
+from .models import Customer, CustomerPayment, Invoice, InvoiceLine, SalesOrder, SalesOrderItem, Shipment
 from .serializers import *
 
 from inventory.services import decrease_stock
@@ -234,7 +237,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         company = request.user.company
         items = Item.objects.filter(
             category='finished_good', recipes__isnull=False, company=company
-        ).distinct()
+        ).exclude(erp_classification='out_of_scope').distinct()
 
         results = []
         for item in items:
@@ -469,6 +472,131 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 else f"Partial shipment sent. Remaining items triggered production notification."
             )
         })
+
+    @action(detail=True, methods=['post'])
+    def generate_invoice(self, request, pk=None):
+        """
+        Create an Invoice from this sales order (lines priced from item
+        selling prices). The invoice is mirrored to QuickBooks automatically.
+        Optional payload: { "due_date": "YYYY-MM-DD" }
+        """
+        order = self.get_object()
+
+        if order.status == 'cancelled':
+            return Response({"error": "Cannot invoice a cancelled order."}, status=status.HTTP_400_BAD_REQUEST)
+        existing = order.invoices.exclude(status='cancelled').first()
+        if existing:
+            return Response(
+                {"error": f"Invoice INV-{existing.id} already exists for this order."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        due_date = None
+        if request.data.get('due_date'):
+            try:
+                due_date = date.fromisoformat(str(request.data['due_date']))
+            except ValueError:
+                return Response({"error": "due_date must be YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
+        if due_date is None:
+            due_date = date.today() + timedelta(days=30)
+
+        invoice = Invoice.objects.create(
+            company=order.customer.company,
+            sales_order=order,
+            customer=order.customer,
+            due_date=due_date,
+        )
+        total = Decimal("0")
+        for order_item in order.salesorderitem_set.select_related('item'):
+            unit_price = order_item.item.selling_price or Decimal("0")
+            amount = unit_price * Decimal(str(order_item.quantity))
+            InvoiceLine.objects.create(
+                invoice=invoice,
+                item=order_item.item,
+                description=order_item.item.name,
+                quantity=order_item.quantity,
+                unit_price=unit_price,
+                amount=amount,
+            )
+            total += amount
+        invoice.total_amount = total or order.total_amount
+        invoice.save(update_fields=["total_amount"])
+
+        # Mirror to QuickBooks (Level 1 sync); failures land in sync errors.
+        from quickbooks.push import get_active_connection, safe_push
+        connection = get_active_connection(order.customer.company)
+        if connection:
+            safe_push(connection, "invoice", invoice)
+
+        log_activity(request.user, "Sales", "Generate Invoice", f"Generated INV-{invoice.id} for SO #{order.id} (total: {invoice.total_amount})")
+        return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
+
+
+class InvoiceViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    company_field = "company"
+    queryset = Invoice.objects.select_related("customer", "sales_order").prefetch_related("lines__item")
+    serializer_class = InvoiceSerializer
+    permission_classes = [IsSales | IsAdmin | IsFinance]
+
+    @action(detail=True, methods=['post'])
+    def record_payment(self, request, pk=None):
+        """
+        Record a customer payment against this invoice and mirror it to
+        QuickBooks (which marks the invoice paid there too).
+        Payload: { "amount": 50000, "method": "bank_transfer", "reference": "...", "payment_date": "YYYY-MM-DD" }
+        """
+        invoice = self.get_object()
+        if invoice.status in ('paid', 'cancelled'):
+            return Response({"error": f"Invoice is already {invoice.status}."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            amount = Decimal(str(request.data.get('amount', '0')))
+        except InvalidOperation:
+            return Response({"error": "amount must be a number."}, status=status.HTTP_400_BAD_REQUEST)
+        if amount <= 0:
+            return Response({"error": "amount must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
+        if amount > invoice.balance_due:
+            return Response(
+                {"error": f"amount exceeds balance due ({invoice.balance_due})."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        payment_date = date.today()
+        if request.data.get('payment_date'):
+            try:
+                payment_date = date.fromisoformat(str(request.data['payment_date']))
+            except ValueError:
+                return Response({"error": "payment_date must be YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
+
+        payment = CustomerPayment.objects.create(
+            company=invoice.company,
+            customer=invoice.customer,
+            invoice=invoice,
+            amount=amount,
+            payment_date=payment_date,
+            method=request.data.get('method', 'bank_transfer'),
+            reference=request.data.get('reference', ''),
+        )
+        invoice.apply_payment(amount)
+
+        from quickbooks.push import get_active_connection, safe_push
+        connection = get_active_connection(invoice.company)
+        if connection:
+            safe_push(connection, "payment", payment)
+
+        log_activity(request.user, "Sales", "Record Payment", f"Recorded payment of {amount} against INV-{invoice.id} ({invoice.status})")
+        return Response({
+            "payment": CustomerPaymentSerializer(payment).data,
+            "invoice": InvoiceSerializer(invoice).data,
+        }, status=status.HTTP_201_CREATED)
+
+
+class CustomerPaymentViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    company_field = "company"
+    queryset = CustomerPayment.objects.select_related("customer", "invoice")
+    serializer_class = CustomerPaymentSerializer
+    permission_classes = [IsSales | IsAdmin | IsFinance]
+
 
 class SalesOrderItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "sales_order__customer__company"

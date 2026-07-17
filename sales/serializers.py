@@ -21,7 +21,8 @@ class SalesOrderSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = SalesOrder
-        fields = ["id", "customer", "customer_name", "created_at", "total_amount", "status", "items"]
+        fields = ["id", "customer", "customer_name", "created_at", "total_amount", "status", "items", "quickbooks_id"]
+        read_only_fields = ["quickbooks_id"]
 
     def create(self, validated_data):
         # Items come from raw request data (not serializer), create order first
@@ -40,14 +41,20 @@ class SalesOrderSerializer(serializers.ModelSerializer):
             quantity = item_data.get('quantity', 0)
             if item_id and float(quantity) > 0:
                 # An order may only contain items from the customer's own company
-                if not Item.objects.filter(id=int(item_id), company=company).exists():
+                item = Item.objects.filter(id=int(item_id), company=company).first()
+                if not item:
                     order.delete()
                     raise drf_serializers.ValidationError(
                         {"items": f"Item {item_id} does not belong to {company}."}
                     )
+                if item.category != "finished_good":
+                    order.delete()
+                    raise drf_serializers.ValidationError(
+                        {"items": f"Only finished goods can be sold. '{item.name}' is a raw material."}
+                    )
                 so_item = SalesOrderItem.objects.create(
                     sales_order=order,
-                    item_id=int(item_id),
+                    item=item,
                     quantity=float(quantity)
                 )
                 total += (so_item.item.selling_price or Decimal("0")) * Decimal(str(so_item.quantity))
@@ -62,3 +69,33 @@ class ShipmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Shipment
         fields = "__all__"
+
+class InvoiceLineSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source="item.name", read_only=True)
+
+    class Meta:
+        model = InvoiceLine
+        fields = ["id", "item", "item_name", "description", "quantity", "unit_price", "amount"]
+
+class InvoiceSerializer(serializers.ModelSerializer):
+    lines = InvoiceLineSerializer(many=True, read_only=True)
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+    balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = Invoice
+        fields = [
+            "id", "sales_order", "customer", "customer_name", "invoice_date", "due_date",
+            "total_amount", "amount_paid", "balance_due", "status",
+            "quickbooks_id", "quickbooks_last_synced_at", "created_at", "lines",
+        ]
+
+class CustomerPaymentSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+
+    class Meta:
+        model = CustomerPayment
+        fields = [
+            "id", "customer", "customer_name", "invoice", "amount", "payment_date",
+            "method", "reference", "quickbooks_id", "quickbooks_last_synced_at", "created_at",
+        ]

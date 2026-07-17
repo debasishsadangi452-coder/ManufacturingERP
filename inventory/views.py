@@ -1,5 +1,5 @@
 from rest_framework import viewsets, status
-from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement
+from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine
 from .serializers import (
     ItemSerializer,
     WarehouseSerializer,
@@ -7,6 +7,11 @@ from .serializers import (
     BatchSerializer,
     InventoryRequestSerializer,
     StockMovementSerializer,
+    QuickBooksOnboardingSerializer,
+    SalesQuickBooksConfigSerializer,
+    ProcurementQuickBooksConfigSerializer,
+    BOMSerializer,
+    BOMLineSerializer,
 )
 from accounts.permission import IsStore, IsAdmin, IsProduction
 from rest_framework.decorators import action
@@ -23,6 +28,18 @@ class ItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     queryset = Item.objects.all()
     serializer_class = ItemSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
+
+    def get_queryset(self):
+        """Hide items classified as out-of-scope from the ERP.
+
+        Out-of-scope items stay in QuickBooks only and must not appear in
+        inventory/procurement/production/sales. Pass ?include_out_of_scope=1
+        to include them (used by tooling that needs the full list).
+        """
+        qs = super().get_queryset()
+        if self.request.query_params.get("include_out_of_scope") not in ("1", "true", "True"):
+            qs = qs.exclude(erp_classification="out_of_scope")
+        return qs
 
     def perform_create(self, serializer):
         warehouse_id = serializer.validated_data.get('warehouse_id')
@@ -262,3 +279,249 @@ class StockMovementViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
         if item_id:
             qs = qs.filter(item_id=item_id)
         return qs
+
+
+class QuickBooksOnboardingViewSet(viewsets.ViewSet):
+    """Manage QB onboarding workflow."""
+    permission_classes = [IsAdmin]
+
+    @action(detail=False, methods=['get'])
+    def status(self, request):
+        """Get onboarding status for user's company."""
+        company = request.user.company
+        onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
+        return Response(QuickBooksOnboardingSerializer(onboarding).data)
+
+    @action(detail=False, methods=['get'])
+    def items_to_classify(self, request):
+        """Get QB items that need classification."""
+        company = request.user.company
+        items = Item.objects.filter(company=company, quickbooks_id__isnull=False, erp_classification__isnull=True)
+        return Response(ItemSerializer(items, many=True).data)
+
+    @action(detail=False, methods=['post'])
+    def acknowledge_disclaimer(self, request):
+        """Mark disclaimer as acknowledged."""
+        company = request.user.company
+        onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
+        onboarding.disclaimer_acknowledged = True
+        onboarding.save()
+        return Response({'status': 'disclaimer acknowledged'})
+
+    @action(detail=False, methods=['post'])
+    def classify_items(self, request):
+        """Bulk classify items. Payload: [{'item_id': 1, 'classification': 'raw_material'}, ...]"""
+        from django.utils import timezone
+        company = request.user.company
+        classifications = request.data.get('classifications', [])
+
+        updated_count = 0
+        for cls in classifications:
+            item_id = cls.get('item_id')
+            classification = cls.get('classification')
+            if classification not in ['raw_material', 'finished_good', 'out_of_scope']:
+                continue
+
+            try:
+                item = Item.objects.get(id=item_id, company=company)
+                item.erp_classification = classification
+                item.classification_completed_at = timezone.now()
+                # Keep `category` (used by the rest of the ERP) in sync with the
+                # onboarding decision. `category` has no "out_of_scope" value, so
+                # out-of-scope items keep their category but are excluded from ERP
+                # flows via `erp_classification`.
+                if classification in ("raw_material", "finished_good"):
+                    item.category = classification
+                item.save()
+                updated_count += 1
+            except Item.DoesNotExist:
+                pass
+
+        # Check if all items classified
+        onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
+        unclassified = Item.objects.filter(company=company, quickbooks_id__isnull=False, erp_classification__isnull=True).count()
+
+        if unclassified == 0:
+            onboarding.status = 'bom_setup'
+            onboarding.save()
+
+        return Response({'updated': updated_count, 'next_status': onboarding.status})
+
+    @action(detail=False, methods=['post'])
+    def complete_bom_setup(self, request):
+        """Finish the BOM phase and advance to customer mapping."""
+        company = request.user.company
+        onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
+        onboarding.status = 'customer_mapping'
+        onboarding.save()
+        return Response({'status': 'ok', 'next_status': onboarding.status})
+
+    @action(detail=False, methods=['get', 'post'])
+    def sales_config(self, request):
+        """Read or update the per-company sales→QuickBooks configuration.
+
+        GET  → current config (created with defaults if absent).
+        POST → patch any of: customers_mapped, sale_trigger, default_doc_type,
+               price_disclaimer_acknowledged.
+        """
+        company = request.user.company
+        config, _ = SalesQuickBooksConfig.objects.get_or_create(company=company)
+
+        if request.method == 'POST':
+            serializer = SalesQuickBooksConfigSerializer(
+                config, data=request.data, partial=True
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)
+
+        return Response(SalesQuickBooksConfigSerializer(config).data)
+
+    @action(detail=False, methods=['post'])
+    def confirm_customer_mapping(self, request):
+        """Mark customer mapping reviewed and advance to sales config phase."""
+        company = request.user.company
+        config, _ = SalesQuickBooksConfig.objects.get_or_create(company=company)
+        config.customers_mapped = True
+        config.save(update_fields=['customers_mapped', 'updated_at'])
+
+        onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
+        onboarding.status = 'sales_config'
+        onboarding.save()
+        return Response({'status': 'ok', 'next_status': onboarding.status})
+
+    @action(detail=False, methods=['post'])
+    def complete_sales_config(self, request):
+        """Finish the sales config phase and advance to vendor mapping."""
+        company = request.user.company
+        onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
+        onboarding.status = 'vendor_mapping'
+        onboarding.save()
+        return Response({'status': 'ok', 'next_status': onboarding.status})
+
+    @action(detail=False, methods=['get', 'post'])
+    def procurement_config(self, request):
+        """Read or update the per-company procurement→QuickBooks configuration.
+
+        GET  → current config (created with defaults if absent).
+        POST → patch any of: vendors_mapped, purchase_trigger, cost_source,
+               payables_disclaimer_acknowledged.
+        """
+        company = request.user.company
+        config, _ = ProcurementQuickBooksConfig.objects.get_or_create(company=company)
+
+        if request.method == 'POST':
+            serializer = ProcurementQuickBooksConfigSerializer(
+                config, data=request.data, partial=True
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)
+
+        return Response(ProcurementQuickBooksConfigSerializer(config).data)
+
+    @action(detail=False, methods=['post'])
+    def confirm_vendor_mapping(self, request):
+        """Mark vendor mapping reviewed and advance to procurement config phase."""
+        company = request.user.company
+        config, _ = ProcurementQuickBooksConfig.objects.get_or_create(company=company)
+        config.vendors_mapped = True
+        config.save(update_fields=['vendors_mapped', 'updated_at'])
+
+        onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
+        onboarding.status = 'procurement_config'
+        onboarding.save()
+        return Response({'status': 'ok', 'next_status': onboarding.status})
+
+    @action(detail=False, methods=['post'])
+    def mark_onboarding_complete(self, request):
+        """Mark onboarding as complete (final step after procurement config)."""
+        from django.utils import timezone
+        company = request.user.company
+        onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
+        onboarding.status = 'completed'
+        onboarding.completed_at = timezone.now()
+        onboarding.save()
+        return Response({'status': 'onboarding completed'})
+
+
+def _sync_bom_to_recipe(bom):
+    """Mirror an onboarding BOM into a Production Recipe.
+
+    Production uses production.Recipe / RecipeIngredient, while onboarding builds
+    inventory.BOM / BOMLine. Keeping them in sync means BOMs defined during
+    onboarding immediately drive production planning. The BOM stays the source
+    of truth; the Recipe is regenerated from it on every change.
+    """
+    from production.models import Recipe, RecipeIngredient
+
+    recipe, _ = Recipe.objects.get_or_create(product=bom.finished_good)
+    # Rebuild ingredients from the current BOM lines.
+    RecipeIngredient.objects.filter(recipe=recipe).delete()
+    for line in bom.lines.all():
+        RecipeIngredient.objects.create(
+            recipe=recipe, item=line.raw_material, quantity=line.quantity
+        )
+    return recipe
+
+
+class BOMViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """Manage Bill of Materials for finished goods."""
+    company_field = "finished_good__company"
+    queryset = BOM.objects.select_related('finished_good').prefetch_related('lines__raw_material')
+    serializer_class = BOMSerializer
+    permission_classes = [IsStore | IsAdmin]
+
+    def perform_create(self, serializer):
+        bom = serializer.save()
+        log_activity(
+            self.request.user, "Inventory",
+            "Create BOM", f"Created BOM for {bom.finished_good.name}"
+        )
+
+    @action(detail=True, methods=['post'])
+    def add_line(self, request, pk=None):
+        """Add a line item to BOM."""
+        bom = self.get_object()
+        raw_material_id = request.data.get('raw_material_id')
+        quantity = request.data.get('quantity')
+        unit = request.data.get('unit', 'unit')
+
+        if not raw_material_id or not quantity:
+            return Response({'error': 'raw_material_id and quantity required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            raw_material = Item.objects.get(id=raw_material_id, category='raw_material')
+            line, created = BOMLine.objects.get_or_create(
+                bom=bom, raw_material=raw_material,
+                defaults={'quantity': quantity, 'unit': unit}
+            )
+            if not created:
+                line.quantity = quantity
+                line.unit = unit
+                line.save()
+
+            bom.finished_good.bom_completed = True
+            bom.finished_good.save()
+
+            # Keep the Production recipe in step with the BOM.
+            _sync_bom_to_recipe(bom)
+
+            return Response(BOMLineSerializer(line).data, status=status.HTTP_201_CREATED)
+        except Item.DoesNotExist:
+            return Response({'error': 'Raw material not found or not a raw material'}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=['delete'])
+    def remove_line(self, request, pk=None):
+        """Remove a line item from BOM."""
+        bom = self.get_object()
+        line_id = request.query_params.get('line_id')
+
+        try:
+            line = BOMLine.objects.get(id=line_id, bom=bom)
+            line.delete()
+            # Keep the Production recipe in step with the BOM.
+            _sync_bom_to_recipe(bom)
+            return Response({'status': 'line removed'})
+        except BOMLine.DoesNotExist:
+            return Response({'error': 'Line not found'}, status=status.HTTP_404_NOT_FOUND)

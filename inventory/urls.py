@@ -8,5 +8,7 @@ router.register("stock", StockViewSet)
 router.register("batches", BatchViewSet)
 router.register("requests", InventoryRequestViewSet, basename="inventory-requests")
 router.register("movements", StockMovementViewSet, basename="stock-movements")
+router.register("onboarding", QuickBooksOnboardingViewSet, basename="qb-onboarding")
+router.register("bom", BOMViewSet, basename="bom")
 
 urlpatterns = router.urls

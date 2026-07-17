@@ -1,16 +1,21 @@
+from datetime import date
+
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 
-from .models import Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt
+from .models import Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt, Bill, BillLine
 from .serializers import (
     VendorSerializer, VendorPriceListSerializer,
     PurchaseOrderSerializer, PurchaseOrderItemSerializer, GoodsReceiptSerializer,
+    BillSerializer,
 )
+from inventory.models import Item
+from inventory.serializers import ItemSerializer
 from inventory.services import increase_stock
-from accounts.permission import IsStore, IsAdmin
+from accounts.permission import IsStore, IsAdmin, IsFinance
 from core.utils import log_activity
 from core.tenancy import CompanyScopedMixin
 
@@ -134,6 +139,96 @@ class PurchaseOrderItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             self.request.user, "Procurement", "Add PO Item",
             f"Added {poi.quantity} x '{poi.item.name}' @ {poi.unit_price}/unit to PO #{poi.purchase_order.id}"
         )
+
+    @action(detail=False, methods=["get"])
+    def available_items(self, request):
+        """List only raw materials (inventory items) available for purchase orders."""
+        company = request.user.company
+        items = (
+            Item.objects.filter(company=company, category="raw_material")
+            .exclude(erp_classification="out_of_scope")
+            .order_by("name")
+        )
+        return Response(ItemSerializer(items, many=True).data)
+
+
+class BillViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    Vendor bills (Accounts Payable). Created from a purchase order via
+    POST /api/procurement/bills/from_purchase_order/ and mirrored to
+    QuickBooks automatically.
+    """
+    company_field = "company"
+    queryset = Bill.objects.select_related("vendor", "purchase_order").prefetch_related("lines__item")
+    serializer_class = BillSerializer
+    permission_classes = [IsStore | IsAdmin | IsFinance]
+
+    @action(detail=False, methods=["post"])
+    def from_purchase_order(self, request):
+        """
+        Payload: { "purchase_order": 12, "bill_number": "XYZ-991",
+                   "bill_date": "YYYY-MM-DD", "due_date": "YYYY-MM-DD" }
+        Lines and total are copied from the purchase order.
+        """
+        po = PurchaseOrder.objects.filter(
+            id=request.data.get("purchase_order"), vendor__company=request.user.company
+        ).prefetch_related("items__item").first()
+        if not po:
+            return Response({"error": "Purchase order not found."}, status=status.HTTP_404_NOT_FOUND)
+        if po.status in ("draft", "cancelled"):
+            return Response(
+                {"error": f"Cannot bill a {po.status} purchase order."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        existing = po.bills.exclude(status="cancelled").first()
+        if existing:
+            return Response(
+                {"error": f"Bill {existing.bill_number or existing.id} already exists for this PO."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        def parse_date(field, default=None):
+            raw = request.data.get(field)
+            if not raw:
+                return default
+            return date.fromisoformat(str(raw))
+
+        try:
+            bill_date = parse_date("bill_date", date.today())
+            due_date = parse_date("due_date")
+        except ValueError:
+            return Response({"error": "Dates must be YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
+
+        bill = Bill.objects.create(
+            company=po.vendor.company,
+            purchase_order=po,
+            vendor=po.vendor,
+            bill_number=request.data.get("bill_number", ""),
+            bill_date=bill_date,
+            due_date=due_date,
+            total_amount=po.total_amount,
+        )
+        for po_item in po.items.all():
+            BillLine.objects.create(
+                bill=bill,
+                item=po_item.item,
+                description=po_item.item.name,
+                quantity=po_item.quantity,
+                unit_price=po_item.unit_price,
+                amount=po_item.total_price,
+            )
+
+        # Mirror to QuickBooks (Level 1 sync); failures land in sync errors.
+        from quickbooks.push import get_active_connection, safe_push
+        connection = get_active_connection(po.vendor.company)
+        if connection:
+            safe_push(connection, "bill", bill)
+
+        log_activity(
+            request.user, "Procurement", "Record Bill",
+            f"Recorded bill '{bill.bill_number or bill.id}' for PO #{po.id} (total: {bill.total_amount})"
+        )
+        return Response(BillSerializer(bill).data, status=status.HTTP_201_CREATED)
 
 
 class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):

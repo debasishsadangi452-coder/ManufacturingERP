@@ -122,6 +122,7 @@ INSTALLED_APPS = [
     'finance',
     'django_filters',
     'ai_assistant',
+    'quickbooks',
 ]
 
 REST_FRAMEWORK = {
@@ -284,5 +285,19 @@ AI_CONFIG = {
     # Vision-capable model used only for image → PO extraction.
     # Llama 4 Scout supports image input on Groq.
     "VISION_MODEL": os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
+}
+
+QUICKBOOKS_CONFIG = {
+    "CLIENT_ID": os.getenv("QUICKBOOKS_CLIENT_ID", ""),
+    "CLIENT_SECRET": os.getenv("QUICKBOOKS_CLIENT_SECRET", ""),
+    "REDIRECT_URI": os.getenv(
+        "QUICKBOOKS_REDIRECT_URI",
+        "http://localhost:8000/api/quickbooks/callback/",
+    ),
+    "ENVIRONMENT": os.getenv("QUICKBOOKS_ENVIRONMENT", "sandbox"),
+    "FRONTEND_REDIRECT_URI": os.getenv(
+        "QUICKBOOKS_FRONTEND_REDIRECT_URI",
+        "http://localhost:8080/settings",
+    ),
 }
 
