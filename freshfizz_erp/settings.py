@@ -51,10 +51,27 @@ DEBUG = os.getenv("DEBUG", "False") == "True"
 
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost 127.0.0.1 .railway.app").split()
 
-CORS_ALLOWED_ORIGINS = os.getenv(
-    "CORS_ALLOWED_ORIGINS", 
-    "http://localhost:8080 http://127.0.0.1:8080 http://localhost:5173 http://127.0.0.1:5173 https://brewmaster-ui.vercel.app"
-).split()
+def _clean_origin(origin):
+    """Reduce a value to scheme://host[:port]. django-cors-headers raises a
+    fatal system check (corsheaders.E014) if an origin carries a path, so a
+    stray 'https://host/*' in the CORS_ALLOWED_ORIGINS env var would abort boot.
+    Stripping the path here keeps a misconfigured var from crashing the app."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(origin.strip())
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return origin.strip()
+
+
+CORS_ALLOWED_ORIGINS = [
+    _clean_origin(o)
+    for o in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:8080 http://127.0.0.1:8080 http://localhost:5173 http://127.0.0.1:5173 https://brewmaster-ui.vercel.app",
+    ).split()
+    if o.strip()
+]
 
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
