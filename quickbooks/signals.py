@@ -43,6 +43,10 @@ def _item_saved(sender, instance, **kwargs):
 
 @receiver(post_save, sender=SalesOrder, dispatch_uid="qb_push_sales_order")
 def _sales_order_saved(sender, instance, **kwargs):
+    # Draft orders come from unconfirmed email parses — never sync them to
+    # QuickBooks until a human confirms (promotes them out of "draft").
+    if instance.status == "draft":
+        return
     _queue_push("sales_order", instance, instance.customer.company)
 
 
@@ -50,6 +54,8 @@ def _sales_order_saved(sender, instance, **kwargs):
 # parent order as each line lands to keep the QuickBooks estimate complete.
 @receiver(post_save, sender=SalesOrderItem, dispatch_uid="qb_push_sales_order_item")
 def _sales_order_item_saved(sender, instance, **kwargs):
+    if instance.sales_order.status == "draft":
+        return
     _queue_push("sales_order", instance.sales_order, instance.sales_order.customer.company)
 
 

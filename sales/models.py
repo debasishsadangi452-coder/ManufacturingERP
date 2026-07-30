@@ -40,6 +40,9 @@ class SalesOrder(models.Model):
     quickbooks_last_synced_at = models.DateTimeField(null=True, blank=True)
 
     STATUS_CHOICES = [
+        # "draft" = created from an inbound email and awaiting human confirmation.
+        # Draft orders are excluded from the QuickBooks push until confirmed.
+        ("draft", "Draft"),
         ("pending", "Pending"),
         ("confirmed", "Confirmed"),
         ("shipped", "Shipped"),
@@ -47,11 +50,17 @@ class SalesOrder(models.Model):
         ("cancelled", "Cancelled"),
     ]
 
+    SOURCE_CHOICES = [
+        ("manual", "Manual entry"),
+        ("email", "Email inbox"),
+    ]
+
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
         default="pending"
     )
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="manual")
 
     def __str__(self):
         return f"SO-{self.id}"
@@ -178,3 +187,60 @@ class Shipment(models.Model):
 
     def __str__(self):
         return f"Shipment for SO-{self.sales_order.id}"
+
+
+class ShipmentLot(models.Model):
+    """Genealogy link: which finished lot (and how much) left on a shipment.
+
+    Closes the SQF chain — from a customer's shipment, you can list the exact
+    finished lots delivered, and from each lot trace back through its production
+    order to the raw lots consumed. Kept permanently for recall/audit.
+    """
+    shipment = models.ForeignKey(Shipment, on_delete=models.CASCADE, related_name="shipment_lots")
+    lot = models.ForeignKey("inventory.Batch", on_delete=models.PROTECT, related_name="shipped_on")
+    quantity = models.FloatField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.quantity} of {self.lot.batch_number} on shipment {self.shipment_id}"
+
+
+class InboundOrderEmail(models.Model):
+    """An order email received in the shared inbox, its AI-extracted parse, and
+    the draft SalesOrder it produced. Kept as a permanent audit trail (SQF).
+
+    The pipeline: email arrives → AI extracts customer + line items + confidence
+    → a draft SalesOrder is created → a human reviews and confirms. Nothing
+    syncs to QuickBooks or production until the draft is confirmed.
+    """
+
+    STATUS_CHOICES = [
+        ("received", "Received"),          # ingested, not yet parsed
+        ("parsed", "Parsed"),              # AI extracted, draft created, awaiting review
+        ("needs_attention", "Needs attention"),  # low confidence / could not match
+        ("confirmed", "Confirmed"),        # human confirmed → order promoted
+        ("failed", "Failed"),              # parse/match error
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    sender = models.EmailField(blank=True)
+    subject = models.CharField(max_length=500, blank=True)
+    received_at = models.DateTimeField(default=timezone.now)
+    raw_body = models.TextField(blank=True)
+    # Full AI extraction result (customer, lines, pickup date, per-field notes).
+    parsed_data = models.JSONField(default=dict, blank=True)
+    confidence = models.FloatField(null=True, blank=True, help_text="0–1 extraction confidence")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="received")
+    sales_order = models.ForeignKey(
+        SalesOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="inbound_emails"
+    )
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-received_at"]
+
+    def __str__(self):
+        return f"Inbound order from {self.sender} ({self.status})"

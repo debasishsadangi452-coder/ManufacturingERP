@@ -246,10 +246,17 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             })
         receipt = serializer.save()
         items_received = []
+        from inventory.lots import create_raw_lot
         for poi in po.items.all():
             increase_stock(
                 poi.item, receipt.warehouse, poi.quantity,
                 user=self.request.user, reference=f"GRN PO#{po.id}",
+            )
+            # 🔗 SQF traceability: every received line becomes a raw lot tied to
+            # this goods receipt (and thus the vendor delivery).
+            create_raw_lot(
+                poi.item, receipt.warehouse, poi.quantity, receipt,
+                company=getattr(poi.item, "company", None),
             )
             items_received.append(f"{poi.quantity} x {poi.item.name}")
         po.status = "received"

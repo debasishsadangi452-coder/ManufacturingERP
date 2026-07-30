@@ -12,7 +12,7 @@ from .serializers import *
 
 from inventory.services import decrease_stock
 from inventory.models import Stock, Item, Warehouse
-from production.models import ProductionOrder, Recipe, RecipeIngredient
+from production.models import ProductionOrder, Recipe
 from core.utils import send_notification, log_activity
 from core.tenancy import CompanyScopedMixin
 
@@ -143,62 +143,81 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 errors.append(f"No recipe defined for '{item.name}'. Cannot plan production.")
                 continue
 
-            ingredients = RecipeIngredient.objects.filter(recipe=recipe)
             remaining_to_produce = qty_needed - available_sellable
+            # Ingredient quantities are per batch, so scale by whole batches.
+            requirements = recipe.material_requirements(remaining_to_produce)
 
             # --- Step 2: Check raw material availability ---
+            # A shortage does NOT block the order. We record it, then still
+            # schedule the batch below — creating the ProductionOrder fires the
+            # signal that raises the inventory requests (one place, no dupes).
             shortages = []
-            for ing in ingredients:
-                required_qty = ing.quantity * remaining_to_produce
+            for ing, required_qty in requirements:
                 available = Stock.objects.filter(item=ing.item).aggregate(Sum('quantity'))['quantity__sum'] or 0
                 if available < required_qty:
-                    shortages.append(
-                        f"{ing.item.name}: need {required_qty:.2f}, have {available:.2f}"
+                    shortages.append(f"{ing.item.name} (short {required_qty - available:.0f})")
+
+            # --- Step 3: Reserve what IS on hand (never more than available) ---
+            for ing, required_qty in requirements:
+                stock_entry = Stock.objects.filter(item=ing.item).order_by('-quantity').first()
+                if not stock_entry:
+                    continue
+                to_reserve = min(required_qty, stock_entry.quantity)
+                if to_reserve <= 0:
+                    continue
+                try:
+                    decrease_stock(
+                        ing.item,
+                        stock_entry.warehouse,
+                        to_reserve,
+                        user=request.user,
+                        reference=f"Reserved for SO#{order.id} production"
                     )
-
-            if shortages:
-                errors.append(f"Insufficient raw materials for '{item.name}': {'; '.join(shortages)}")
-                continue
-
-            # --- Step 3: Deduct (reserve) raw materials ---
-            try:
-                for ing in ingredients:
-                    required_qty = ing.quantity * remaining_to_produce
-                    # Deduct from the warehouse with the most stock of this ingredient
-                    stock_entry = Stock.objects.filter(item=ing.item).order_by('-quantity').first()
-                    if stock_entry:
-                        decrease_stock(
-                            ing.item,
-                            stock_entry.warehouse,
-                            required_qty,
-                            user=request.user,
-                            reference=f"Reserved for SO#{order.id} production"
-                        )
-            except ValueError as e:
-                errors.append(str(e))
-                continue
+                except ValueError as e:
+                    errors.append(str(e))
 
             # --- Step 4: Create a Production Order (Only for the remaining) ---
+            # materials_reserved is only True when nothing was short; otherwise
+            # production must wait for procurement to top the material up.
+            fully_reserved = not shortages
             prod_order = ProductionOrder.objects.create(
                 recipe=recipe,
                 quantity=remaining_to_produce,
                 warehouse=warehouse,
                 status='scheduled',
-                materials_reserved=True  # Ingredients already deducted above
+                sales_order=order,  # so Production's Requests tab can trace the batch back
+                materials_reserved=fully_reserved,
             )
             production_orders_created.append(prod_order.id)
+
+            if shortages:
+                errors.append(
+                    f"'{item.name}': awaiting materials — {', '.join(shortages)}. "
+                    f"Inventory requests raised."
+                )
+                send_notification(
+                    "store",
+                    f"MATERIAL SHORTAGE for SO#{order.id} ({item.name}): {', '.join(shortages)}. "
+                    f"Send to procurement.",
+                    related_id=order.id,
+                    related_type="sales_order",
+                    company=order.customer.company
+                )
 
             # --- Step 5: Notify Production ---
             send_notification(
                 "production",
-                f"NEW BATCH: Produce {remaining_to_produce} {item.unit} of {item.name} for SO#{order.id} (PO#{prod_order.id}). Materials reserved.",
+                f"NEW BATCH: Produce {remaining_to_produce} {item.unit} of {item.name} for SO#{order.id} (PO#{prod_order.id}). "
+                + ("Materials reserved." if fully_reserved else "AWAITING MATERIALS."),
                 related_id=prod_order.id,
                 related_type="production_order",
                 company=order.customer.company
             )
 
-        if errors and not production_orders_created and not any(oi.quantity <= (min(Stock.objects.filter(item=oi.item).aggregate(Sum('quantity'))['quantity__sum'] or 0, ProductionOrder.objects.filter(recipe__product=oi.item, status='completed', qualitycheck__status='approved').aggregate(Sum('quantity'))['quantity__sum'] or 0)) for oi in order.salesorderitem_set.all()):
-             return Response({"error": "Could not prepare order.", "details": errors}, status=status.HTTP_400_BAD_REQUEST)
+        # Only a hard failure (no recipe at all) blocks the order now — a material
+        # shortage raises inventory requests and still schedules the batch.
+        if errors and not production_orders_created:
+            return Response({"error": "Could not prepare order.", "details": errors}, status=status.HTTP_400_BAD_REQUEST)
 
         # Mark the order as confirmed (materials prepped OR stock allocated)
         order.status = 'confirmed'
@@ -228,6 +247,51 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             "production_orders": production_orders_created,
             "warnings": errors
         })
+
+    @action(detail=False, methods=['get'])
+    def production_requests(self, request):
+        """Orders Inventory has sent to Production.
+
+        This is the feed for Production's Requests tab: one row per sales order
+        that Inventory confirmed, excluding any whose batches are all finished
+        (those have moved on to Inventory's "Send to Shipment" step).
+        """
+        orders = self.filter_queryset(self.get_queryset()).filter(status='confirmed')
+
+        results = []
+        for order in orders:
+            batches = list(order.production_orders.all())
+            # Confirmed but no batch = fully covered by stock; nothing to produce.
+            if not batches:
+                continue
+            pending = [b for b in batches if b.status != 'completed']
+            if not pending:
+                continue
+
+            results.append({
+                "sales_order_id": order.id,
+                "customer_name": order.customer.name,
+                "created_at": order.created_at,
+                "items": [
+                    {"item_name": oi.item.name, "quantity": oi.quantity, "unit": oi.item.unit}
+                    for oi in order.salesorderitem_set.all()
+                ],
+                "production_orders": [
+                    {
+                        "id": b.id,
+                        "product": b.recipe.product.name,
+                        "quantity": b.quantity,
+                        "status": b.status,
+                        "materials_reserved": b.materials_reserved,
+                    }
+                    for b in batches
+                ],
+                # Convenience for the tab's primary button
+                "next_batch_id": pending[0].id,
+                "all_running": all(b.status == 'running' for b in pending),
+            })
+
+        return Response(results)
 
     @action(detail=False, methods=['get'])
     def available_inventory(self, request):
@@ -617,6 +681,7 @@ class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         order = shipment.sales_order
 
         # Deduct finished goods stock on shipment
+        from inventory.lots import ship_lots_fifo
         for item in order.salesorderitem_set.all():
             decrease_stock(
                 item.item,
@@ -625,7 +690,50 @@ class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 user=self.request.user,
                 reference=f"Shipment SO#{order.id}"
             )
+            # 🔗 SQF traceability: record which finished lots left on this
+            # shipment (FIFO), closing the receive→produce→QC→ship chain.
+            ship_lots_fifo(
+                shipment, item.item, item.quantity,
+                company=getattr(item.item, "company", None),
+            )
 
         # Update order status
         order.status = "shipped"
         order.save()
+
+
+class InboundOrderEmailViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    """The 'Orders from Email' inbox. Read-only list/detail plus a `confirm`
+    action that promotes a reviewed draft into a real order.
+
+    Confirming flips the linked SalesOrder from "draft" → "pending", which
+    releases the QuickBooks push guardrail so the order syncs normally from
+    that point on. Nothing syncs while it sits in draft."""
+    company_field = "company"
+    queryset = InboundOrderEmail.objects.all()
+    serializer_class = InboundOrderEmailSerializer
+    permission_classes = [IsSales | IsStore | IsAdmin]
+
+    @action(detail=True, methods=["post"])
+    def confirm(self, request, pk=None):
+        inbound = self.get_object()
+        order = inbound.sales_order
+        if not order:
+            return Response(
+                {"detail": "No draft order to confirm — parse produced no matched customer/lines."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if order.status != "draft":
+            return Response(
+                {"detail": f"Order already confirmed (status: {order.status})."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.status = "pending"  # leaving "draft" releases the QB push guardrail
+        order.save()
+        inbound.status = "confirmed"
+        inbound.save(update_fields=["status"])
+        log_activity(
+            request.user, "Sales", "Confirm Email Order",
+            f"Confirmed email order from {inbound.sender} → SO-{order.id}",
+        )
+        return Response(SalesOrderSerializer(order).data)

@@ -1,7 +1,7 @@
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 
-from production.models import ProductionOrder, RecipeIngredient
+from production.models import ProductionOrder
 from quality.models import QualityCheck
 from inventory.models import Stock, InventoryRequest, Item
 from sales.models import SalesOrder
@@ -98,13 +98,15 @@ def on_production_order_change(sender, instance, created, **kwargs):
         payload = _serialize(instance, ['recipe', 'warehouse', 'quantity', 'status'])
         _push('ProductionOrder', instance, 'created' if created else 'updated', payload, PRODUCTION_ROLES)
 
-        if created:
+        # Materials that were reserved up front (by mark_ready_for_production)
+        # are already deducted from stock, so a shortage check here would see
+        # the depleted balance and re-request material that is in hand.
+        if created and not instance.materials_reserved:
             _notify('admin', f'New Production Order #{instance.id} created for {instance.quantity} units.', instance.id, 'ProductionOrder')
 
-            ingredients = RecipeIngredient.objects.filter(recipe=instance.recipe)
             shortages = []
-            for ing in ingredients:
-                required = ing.quantity * instance.quantity
+            # Ingredient quantities are per batch — scale by whole batches.
+            for ing, required in instance.recipe.material_requirements(instance.quantity):
                 stock = Stock.objects.filter(item=ing.item, warehouse=instance.warehouse).first()
                 current_qty = stock.quantity if stock else 0
                 if current_qty < required:
@@ -118,8 +120,17 @@ def on_production_order_change(sender, instance, created, **kwargs):
 
             if shortages:
                 _notify('store', f'Material shortage for Production #{instance.id}: {", ".join(shortages)}. Inventory request created.', instance.id, 'ProductionOrder')
+        elif created:
+            _notify('admin', f'New Production Order #{instance.id} created for {instance.quantity} units.', instance.id, 'ProductionOrder')
 
         if not created and instance.status == 'completed':
+            # The batch is made, so any material request it raised is moot.
+            # Without this they sit "pending" forever and clutter the store's
+            # queue with shortages nobody needs to act on any more.
+            InventoryRequest.objects.filter(
+                production_order=instance, status__in=['pending', 'procuring']
+            ).update(status='cancelled')
+
             if not QualityCheck.objects.filter(production_order=instance).exists():
                 QualityCheck.objects.create(
                     production_order=instance,

@@ -2,6 +2,9 @@ from rest_framework.routers import DefaultRouter
 from .views import *
 
 router = DefaultRouter()
+router.register("units", UnitOfMeasureViewSet, basename="units")
+router.register("transfers", StockTransferViewSet, basename="transfers")
+router.register("cycle-counts", CycleCountViewSet, basename="cycle-counts")
 router.register("items", ItemViewSet)
 router.register("warehouses", WarehouseViewSet)
 router.register("stock", StockViewSet)

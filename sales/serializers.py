@@ -18,11 +18,41 @@ class SalesOrderSerializer(serializers.ModelSerializer):
     # Read-only nested items for display
     items = SalesOrderItemSerializer(source="salesorderitem_set", many=True, read_only=True)
     customer_name = serializers.CharField(source="customer.name", read_only=True)
+    production_status = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesOrder
-        fields = ["id", "customer", "customer_name", "created_at", "total_amount", "status", "items", "quickbooks_id"]
+        fields = [
+            "id", "customer", "customer_name", "created_at", "total_amount",
+            "status", "items", "quickbooks_id", "production_status",
+        ]
         read_only_fields = ["quickbooks_id"]
+
+    def get_production_status(self, order):
+        """Where this order sits in the Inventory → Production → Shipment handoff.
+
+        Drives which single action Inventory offers on the order row:
+          not_sent  → "Send for Production"
+          in_production → nothing (Production still working)
+          produced  → "Send to Shipment"
+          shipped   → nothing (done)
+        """
+        if order.status in ("shipped", "delivered"):
+            return "shipped"
+        if order.status == "cancelled":
+            return "cancelled"
+        if order.status != "confirmed":
+            return "not_sent"
+
+        from production.models import ProductionOrder
+
+        orders = ProductionOrder.objects.filter(sales_order=order)
+        if not orders.exists():
+            # Confirmed with no batch needed — covered entirely by existing stock.
+            return "produced"
+        if orders.exclude(status="completed").exists():
+            return "in_production"
+        return "produced"
 
     def create(self, validated_data):
         # Items come from raw request data (not serializer), create order first
@@ -99,3 +129,36 @@ class CustomerPaymentSerializer(serializers.ModelSerializer):
             "id", "customer", "customer_name", "invoice", "amount", "payment_date",
             "method", "reference", "quickbooks_id", "quickbooks_last_synced_at", "created_at",
         ]
+
+
+class InboundOrderEmailSerializer(serializers.ModelSerializer):
+    """The 'Orders from Email' list. Flattens the draft order's lines and the
+    matched customer so the review screen can render a row without extra calls."""
+    customer_name = serializers.SerializerMethodField()
+    order_lines = serializers.SerializerMethodField()
+    total_cases = serializers.SerializerMethodField()
+
+    class Meta:
+        model = InboundOrderEmail
+        fields = [
+            "id", "sender", "subject", "received_at", "confidence", "status",
+            "sales_order", "customer_name", "order_lines", "total_cases",
+            "parsed_data", "error_message",
+        ]
+
+    def get_customer_name(self, obj):
+        if obj.sales_order:
+            return obj.sales_order.customer.name
+        return obj.parsed_data.get("customer", "")
+
+    def get_order_lines(self, obj):
+        if obj.sales_order:
+            return [
+                {"product": li.item.name, "cases": li.quantity}
+                for li in obj.sales_order.salesorderitem_set.select_related("item")
+            ]
+        return obj.parsed_data.get("lines", [])
+
+    def get_total_cases(self, obj):
+        lines = self.get_order_lines(obj)
+        return sum(float(li.get("cases") or 0) for li in lines)

@@ -108,6 +108,20 @@ class RecipeViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         log_activity(self.request.user, "Production", "Delete Recipe", f"Deleted recipe for '{instance.product.name}'")
         instance.delete()
 
+    @action(detail=True, methods=["get"])
+    def plan_batches(self, request, pk=None):
+        """Given ?units=<cases ordered>, return how many batches to make.
+
+        This is the cases→batches auto-calc that replaces the customer's manual
+        production-planning spreadsheet.
+        """
+        recipe = self.get_object()
+        try:
+            units = float(request.query_params.get("units", 0))
+        except (TypeError, ValueError):
+            return Response({"error": "units must be a number."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"product": recipe.product.name, **recipe.batches_for(units)})
+
 
 # -------------------------------------------------
 # 🧪 Recipe Ingredient ViewSet
@@ -225,8 +239,8 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 # was "marked ready for production", so we must NOT deduct them again.
                 if not order.materials_reserved:
                     errors = []
-                    for ing in ingredients:
-                        required_qty = ing.quantity * order.quantity
+                    # Ingredient quantities are per batch — scale by whole batches.
+                    for ing, required_qty in recipe.material_requirements(order.quantity):
 
                         # Check total stock across ALL warehouses (raw materials may
                         # be received into a different warehouse than the finished-goods
@@ -263,6 +277,14 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                                 errors.append(str(e))
                                 break
 
+                        # 🔗 SQF traceability: record which raw lots this run
+                        # consumed (FIFO). Best-effort over lots that exist.
+                        from inventory.lots import consume_lots_fifo
+                        consume_lots_fifo(
+                            order, ing.item, required_qty,
+                            company=getattr(ing.item, "company", None),
+                        )
+
                     if errors:
                         raise ValidationError(errors)
 
@@ -273,6 +295,14 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     order.quantity,
                     user=request.user,
                     reference=f"Production #{order.id}"
+                )
+
+                # 🔗 SQF traceability: mint the finished lot for this run, linked
+                # back to the raw lots consumed above via the production order.
+                from inventory.lots import create_finished_lot
+                create_finished_lot(
+                    recipe.product, warehouse, order.quantity, order,
+                    company=getattr(recipe.product, "company", None),
                 )
 
                 # Update status

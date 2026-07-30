@@ -1,6 +1,10 @@
 from rest_framework import viewsets, status
-from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine
+from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine, UnitOfMeasure, StockTransfer, CycleCount, CycleCountLine
 from .serializers import (
+    UnitOfMeasureSerializer,
+    StockTransferSerializer,
+    CycleCountSerializer,
+    CycleCountLineSerializer,
     ItemSerializer,
     WarehouseSerializer,
     StockSerializer,
@@ -21,6 +25,35 @@ from .services import adjust_stock
 from .models import Item, Warehouse
 from core.utils import log_activity
 from core.tenancy import CompanyScopedMixin
+
+
+class UnitOfMeasureViewSet(viewsets.ModelViewSet):
+    """Units of measure. Standard units are shared (company=NULL); tenants may
+    add their own. The list returns both. `needs_review` surfaces items whose
+    unit hasn't been mapped yet (the backfill review screen)."""
+    serializer_class = UnitOfMeasureSerializer
+    permission_classes = [IsStore | IsProduction | IsAdmin]
+
+    def get_queryset(self):
+        company = getattr(self.request.user, "company", None)
+        from django.db.models import Q
+        return UnitOfMeasure.objects.filter(Q(company=None) | Q(company=company))
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company)
+
+    @action(detail=False, methods=["get"])
+    def needs_review(self, request):
+        """Items in this company that still lack a base_unit — the backfill
+        review queue. Frontend lets an admin assign units here."""
+        company = request.user.company
+        items = Item.objects.filter(company=company, base_unit__isnull=True).exclude(
+            erp_classification="out_of_scope"
+        )
+        return Response([
+            {"id": i.id, "name": i.name, "legacy_unit": i.unit, "sku": i.sku}
+            for i in items
+        ])
 
 
 class ItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
@@ -99,6 +132,103 @@ class BatchViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     queryset = Batch.objects.all()
     serializer_class = BatchSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
+
+    @action(detail=True, methods=["get"])
+    def trace_back(self, request, pk=None):
+        """Ingredient genealogy: the raw lots that went into this finished lot."""
+        from .lots import trace_backward
+        lot = self.get_object()
+        return Response({
+            "lot": lot.batch_number,
+            "item": lot.item.name,
+            "source": lot.source,
+            "production_order": lot.production_order_id,
+            "consumed_raw_lots": trace_backward(lot),
+        })
+
+    @action(detail=True, methods=["get"])
+    def trace_forward(self, request, pk=None):
+        """Recall reach: the finished lots and shipments a raw lot ended up in."""
+        from .lots import trace_forward
+        lot = self.get_object()
+        return Response({
+            "lot": lot.batch_number,
+            "item": lot.item.name,
+            "downstream": trace_forward(lot),
+        })
+
+
+class StockTransferViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """Move stock between warehouses (plant → Milton staging → cold storage).
+
+    Creating a transfer executes it immediately (decrement source, increment
+    dest, carry lots). `complete` is exposed for a two-step flow if needed."""
+    company_field = "company"
+    queryset = StockTransfer.objects.all()
+    serializer_class = StockTransferSerializer
+    permission_classes = [IsStore | IsProduction | IsAdmin]
+
+    def perform_create(self, serializer):
+        from .operations import complete_transfer
+        transfer = serializer.save(
+            company=self.request.user.company, created_by=self.request.user
+        )
+        complete_transfer(transfer, user=self.request.user)
+        log_activity(
+            self.request.user, "Inventory", "Stock Transfer",
+            f"Transferred {transfer.quantity} x '{transfer.item.name}' "
+            f"from '{transfer.source_warehouse.name}' to '{transfer.dest_warehouse.name}'",
+        )
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        from .operations import complete_transfer
+        transfer = complete_transfer(self.get_object(), user=request.user)
+        return Response(StockTransferSerializer(transfer).data)
+
+
+class CycleCountViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """Physical inventory reconciliation — replaces the weekly manual count.
+
+    Flow: create a count for a warehouse → add_line per item (system qty is
+    snapshotted) → post to apply variances as stock adjustments."""
+    company_field = "company"
+    queryset = CycleCount.objects.all()
+    serializer_class = CycleCountSerializer
+    permission_classes = [IsStore | IsProduction | IsAdmin]
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company, created_by=self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def add_line(self, request, pk=None):
+        """Add a counted item to the count. Snapshots current on-hand as the
+        system quantity so the variance is stable."""
+        count = self.get_object()
+        if count.status != "open":
+            return Response({"error": f"Count is {count.status}."}, status=status.HTTP_400_BAD_REQUEST)
+        item = Item.objects.get(id=request.data.get("item"))
+        stock = Stock.objects.filter(item=item, warehouse=count.warehouse).first()
+        line, _ = CycleCountLine.objects.update_or_create(
+            cycle_count=count, item=item,
+            defaults={
+                "system_quantity": stock.quantity if stock else 0,
+                "counted_quantity": float(request.data.get("counted_quantity", 0)),
+            },
+        )
+        return Response(CycleCountLineSerializer(line).data)
+
+    @action(detail=True, methods=["post"])
+    def post_count(self, request, pk=None):
+        """Apply the count's variances to on-hand stock."""
+        from .operations import post_cycle_count
+        count = self.get_object()
+        adjusted = post_cycle_count(count, user=request.user)
+        log_activity(
+            request.user, "Inventory", "Cycle Count Posted",
+            f"Posted cycle count #{count.id} @ '{count.warehouse.name}': {adjusted} adjustment(s)",
+        )
+        return Response({"status": "posted", "adjustments": adjusted})
 
 
 class StockViewSet(CompanyScopedMixin, viewsets.ModelViewSet):

@@ -1,5 +1,48 @@
 from rest_framework import serializers
-from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine
+from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine, UnitOfMeasure, StockTransfer, CycleCount, CycleCountLine
+
+
+class StockTransferSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source="item.name", read_only=True)
+    source_name = serializers.CharField(source="source_warehouse.name", read_only=True)
+    dest_name = serializers.CharField(source="dest_warehouse.name", read_only=True)
+
+    class Meta:
+        model = StockTransfer
+        fields = [
+            "id", "item", "item_name", "source_warehouse", "source_name",
+            "dest_warehouse", "dest_name", "quantity", "status", "reference",
+            "created_at", "completed_at",
+        ]
+        read_only_fields = ["status", "completed_at"]
+
+
+class CycleCountLineSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source="item.name", read_only=True)
+    variance = serializers.ReadOnlyField()
+
+    class Meta:
+        model = CycleCountLine
+        fields = ["id", "item", "item_name", "system_quantity", "counted_quantity", "variance"]
+
+
+class CycleCountSerializer(serializers.ModelSerializer):
+    lines = CycleCountLineSerializer(many=True, read_only=True)
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+
+    class Meta:
+        model = CycleCount
+        fields = [
+            "id", "warehouse", "warehouse_name", "status", "note",
+            "created_at", "posted_at", "lines",
+        ]
+        read_only_fields = ["status", "posted_at"]
+
+
+class UnitOfMeasureSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UnitOfMeasure
+        fields = ["id", "code", "name", "dimension", "to_base_factor", "is_base"]
 
 class InventoryRequestSerializer(serializers.ModelSerializer):
     item_name = serializers.ReadOnlyField(source='item.name')
@@ -24,6 +67,7 @@ class ItemSerializer(serializers.ModelSerializer):
             "quickbooks_id", "quickbooks_sync_token", "quickbooks_last_synced_at",
             "quickbooks_item_type", "procurement_policy", "sku", "purchase_cost",
             "reorder_point", "warehouse_id", "initial_quantity",
+            "base_unit", "purchase_unit",
         ]
         read_only_fields = ["quickbooks_id", "quickbooks_sync_token", "quickbooks_last_synced_at"]
 
@@ -57,9 +101,15 @@ class WarehouseSerializer(serializers.ModelSerializer):
 
 
 class BatchSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source="item.name", read_only=True)
+
     class Meta:
         model = Batch
-        fields = ["id", "item", "batch_number", "quantity"]
+        fields = [
+            "id", "item", "item_name", "batch_number", "quantity",
+            "remaining_quantity", "source", "expiry_date", "warehouse",
+            "goods_receipt", "production_order", "created_at",
+        ]
 
 
 class StockSerializer(serializers.ModelSerializer):

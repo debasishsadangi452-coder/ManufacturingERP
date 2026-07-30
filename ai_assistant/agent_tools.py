@@ -16,7 +16,7 @@ from django.utils import timezone
 from inventory.models import Stock, Item
 from sales.models import SalesOrder, Customer
 from procurement.models import PurchaseOrder, Vendor, VendorPriceList
-from production.models import ProductionOrder, ProductionLine, Recipe, RecipeIngredient
+from production.models import ProductionOrder, ProductionLine, Recipe
 from maintenance.models import Equipment, MaintenanceTask
 from quality.models import QualityCheck
 from finance.models import ExpenseRequest, FinancialSummary, OperationalCost
@@ -261,8 +261,8 @@ def check_order_feasibility(user, product_name, quantity, due_date=None, shift_h
 
     # 1. Raw materials
     shortages = []
-    for ing in RecipeIngredient.objects.filter(recipe=recipe).select_related('item'):
-        required = ing.quantity * quantity
+    # Ingredient quantities are per batch — scale by whole batches.
+    for ing, required in recipe.material_requirements(quantity):
         available = Stock.objects.filter(item=ing.item).aggregate(t=Sum('quantity'))['t'] or 0
         if available < required:
             shortages.append({

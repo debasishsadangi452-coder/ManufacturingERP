@@ -15,6 +15,14 @@ class QualityCheck(models.Model):
         on_delete=models.CASCADE
     )
 
+    # The finished lot this QC check covers, so quality results are traceable
+    # per-lot (SQF). Nullable: existing checks predate lots, and a check may be
+    # recorded before the lot is created.
+    lot = models.ForeignKey(
+        "inventory.Batch", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="quality_checks",
+    )
+
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
