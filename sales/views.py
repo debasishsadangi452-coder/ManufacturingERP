@@ -103,10 +103,14 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Pick the first available warehouse as the production warehouse
-        warehouse = Warehouse.objects.first()
+        # Production must happen in a warehouse belonging to THIS order's
+        # company — an unscoped lookup will happily pick another tenant's.
+        warehouse = Warehouse.objects.filter(company=order.customer.company).first()
         if not warehouse:
-            return Response({"error": "No warehouse found in the system."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": f"No warehouse configured for {order.customer.company}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         errors = []
         production_orders_created = []
@@ -508,8 +512,9 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         order.status = 'delivered' if fully_fulfilled else 'shipped'
         order.save()
 
-        # Create Logistics Shipment for this partial drop
-        warehouse = Warehouse.objects.first()
+        # Create Logistics Shipment for this partial drop — from this
+        # company's own warehouse, never another tenant's.
+        warehouse = Warehouse.objects.filter(company=order.customer.company).first()
         if warehouse:
             Shipment.objects.create(
                 sales_order=order,
