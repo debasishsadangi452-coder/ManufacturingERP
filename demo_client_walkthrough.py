@@ -40,10 +40,10 @@ SLUG = "redvelvetnyc"
 PASSWORD = "RedVelvet@123"
 
 ROLES = {
-    "Admin / Owner":            ("owner.admin@redvelvetnyc",      "admin"),
-    "Operations Manager":       ("maria.production@redvelvetnyc", "production"),
-    "Quality Control Manager":  ("david.quality@redvelvetnyc",    "quality"),
-    "Operations Coordinator":   ("priya.store@redvelvetnyc",      "store"),
+    "Admin / Owner":            ("admin@redvelvetnyc",      "admin"),
+    "Operations Manager":       ("production@redvelvetnyc", "production"),
+    "Quality Control Manager":  ("quality@redvelvetnyc",    "quality"),
+    "Operations Coordinator":   ("store@redvelvetnyc",      "store"),
 }
 
 # Endpoint each role must be able to reach, per the agreed role matrix.

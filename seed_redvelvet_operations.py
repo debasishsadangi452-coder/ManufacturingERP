@@ -19,7 +19,7 @@ from datetime import timedelta
 from django.db import transaction
 from django.utils import timezone
 
-from accounts.models import Company, User, generate_username
+from accounts.models import Company, User
 from inventory.lots import (
     consume_lots_fifo, create_finished_lot, create_raw_lot, ship_lots_fifo,
 )
@@ -134,12 +134,18 @@ INBOUND_EMAILS = [
 
 
 def ensure_team(company):
+    """Create the three non-admin ERP users.
+
+    Usernames are role-based (`production@slug`) rather than the default
+    `firstname.role@slug`, so the login names stay tied to the job rather than
+    to whoever currently holds it.
+    """
     created = []
     for first, role, title in TEAM:
         if User.objects.filter(company=company, role=role).exists():
             continue
         u = User.objects.create_user(
-            username=generate_username(first, role, company),
+            username=f"{role}@{company.slug}",
             password="RedVelvet@123", role=role, company=company, first_name=first,
         )
         created.append((u.username, title))
