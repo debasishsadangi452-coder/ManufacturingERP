@@ -15,7 +15,7 @@ from .serializers import (
 from inventory.models import Item
 from inventory.serializers import ItemSerializer
 from inventory.services import increase_stock
-from accounts.permission import IsStore, IsAdmin, IsFinance
+from accounts.permission import IsStore, IsAdmin, IsFinance, IsQuality
 from core.utils import log_activity
 from core.tenancy import CompanyScopedMixin
 
@@ -235,7 +235,9 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "purchase_order__vendor__company"
     queryset = GoodsReceipt.objects.all()
     serializer_class = GoodsReceiptSerializer
-    permission_classes = [IsStore | IsAdmin]
+    # Quality verifies received quantities and records lot codes at receiving,
+    # which is where the SQF lot chain starts.
+    permission_classes = [IsStore | IsAdmin | IsQuality]
 
     def perform_create(self, serializer):
         po = serializer.validated_data["purchase_order"]

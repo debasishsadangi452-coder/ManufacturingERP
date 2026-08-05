@@ -3,7 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import Driver, Vehicle, DeliveryRoute, Shipment
 from .serializers import DriverSerializer, VehicleSerializer, DeliveryRouteSerializer, ShipmentSerializer
-from accounts.permission import IsAdmin, IsSales, IsStore
+from accounts.permission import IsAdmin, IsSales, IsStore, IsQuality
 from core.utils import log_activity
 from core.tenancy import CompanyScopedMixin
 
@@ -11,7 +11,7 @@ class DriverViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
     queryset = Driver.objects.all()
     serializer_class = DriverSerializer
-    permission_classes = [IsSales | IsStore | IsAdmin]
+    permission_classes = [IsSales | IsStore | IsAdmin | IsQuality]
 
     def perform_create(self, serializer):
         driver = serializer.save(company=self.request.user.company)
@@ -21,7 +21,7 @@ class VehicleViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
     queryset = Vehicle.objects.all()
     serializer_class = VehicleSerializer
-    permission_classes = [IsSales | IsStore | IsAdmin]
+    permission_classes = [IsSales | IsStore | IsAdmin | IsQuality]
 
     def perform_create(self, serializer):
         vehicle = serializer.save(company=self.request.user.company)
@@ -42,7 +42,7 @@ class DeliveryRouteViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
     queryset = DeliveryRoute.objects.all()
     serializer_class = DeliveryRouteSerializer
-    permission_classes = [IsSales | IsStore | IsAdmin]
+    permission_classes = [IsSales | IsStore | IsAdmin | IsQuality]
 
     def perform_create(self, serializer):
         route = serializer.save(company=self.request.user.company)
@@ -63,7 +63,7 @@ class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
     queryset = Shipment.objects.all().order_by('-created_at')
     serializer_class = ShipmentSerializer
-    permission_classes = [IsSales | IsStore | IsAdmin]
+    permission_classes = [IsSales | IsStore | IsAdmin | IsQuality]
 
     def perform_create(self, serializer):
         shipment = serializer.save(company=self.request.user.company)

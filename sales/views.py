@@ -5,7 +5,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Sum
-from accounts.permission import IsSales, IsAdmin, IsStore, IsFinance
+from accounts.permission import IsSales, IsAdmin, IsStore, IsFinance, IsProduction, IsQuality
 
 from .models import Customer, CustomerPayment, Invoice, InvoiceLine, SalesOrder, SalesOrderItem, Shipment
 from .serializers import *
@@ -27,7 +27,10 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "customer__company"
     queryset = SalesOrder.objects.all().order_by('-created_at')
     serializer_class = SalesOrderSerializer
-    permission_classes = [IsSales | IsAdmin | IsStore]
+    # Production is included because the Operations Manager builds the
+    # production schedule from confirmed customer orders — the orders are the
+    # input to that job, so the role needs to see them.
+    permission_classes = [IsSales | IsAdmin | IsStore | IsProduction]
 
     def perform_create(self, serializer):
         order = serializer.save()
@@ -677,7 +680,9 @@ class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "sales_order__customer__company"
     queryset = Shipment.objects.all()
     serializer_class = ShipmentSerializer
-    permission_classes = [IsSales | IsAdmin]
+    # Store dispatches shipments; Quality verifies shipped quantities and lot
+    # codes against what left the building (SQF requirement).
+    permission_classes = [IsSales | IsAdmin | IsStore | IsQuality]
 
     def perform_create(self, serializer):
 
