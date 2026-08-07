@@ -290,7 +290,19 @@ class InventoryRequestViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = InventoryRequest.objects.filter(item__company=user.company).order_by('-created_at')
+        qs = (
+            InventoryRequest.objects
+            .filter(item__company=user.company)
+            # The serializer walks production_order → recipe → product and
+            # → sales_order → customer to explain what each request is for;
+            # without these joins that is four extra queries per row.
+            .select_related(
+                'item', 'warehouse',
+                'production_order__recipe__product',
+                'production_order__sales_order__customer',
+            )
+            .order_by('-created_at')
+        )
         # Production users only see requests tied to their own production orders
         if getattr(user, 'role', None) == 'production':
             qs = qs.filter(production_order__isnull=False)
@@ -380,6 +392,9 @@ class InventoryRequestViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             unit_price=price_entry.unit_price
         )
         req.status = 'procuring'
+        # Remember which PO covers this request so goods receipt can trace back
+        # here — and from here to the production order waiting on the material.
+        req.purchase_order = po
         req.save()
         log_activity(
             request.user,

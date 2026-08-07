@@ -42,6 +42,7 @@ class MaintenanceTaskViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         if status_val == "requested":
             Notification.objects.create(
                 recipient_role="quality",
+            module="maintenance",
                 message=f"Maintenance requested for {task.equipment.name} by {user.username}.",
                 related_id=task.id,
                 related_type="MaintenanceTask"
@@ -66,6 +67,7 @@ class MaintenanceTaskViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
         Notification.objects.create(
             recipient_role="production",
+            module="maintenance",
             message=f"Maintenance request for {task.equipment.name} was REJECTED: {reason}",
             related_id=task.id,
             related_type="MaintenanceTask"
@@ -127,6 +129,7 @@ class MaintenanceTaskViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
         Notification.objects.create(
             recipient_role="quality",
+            module="maintenance",
             message=f"Maintenance for {equipment.name} completed in {duration_str}. Approval required.",
             related_id=task.id,
             related_type="MaintenanceTask"
@@ -192,6 +195,7 @@ class MaintenanceTaskViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
         Notification.objects.create(
             recipient_role="production",
+            module="maintenance",
             message=f"Maintenance for {equipment.name} APPROVED. Total time: {duration_str}",
             related_id=task.id,
             related_type="MaintenanceTask"

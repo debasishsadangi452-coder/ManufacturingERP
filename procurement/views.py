@@ -6,11 +6,14 @@ from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 
-from .models import Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt, Bill, BillLine
+from .models import (
+    Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt,
+    Bill, BillLine, VendorEmail,
+)
 from .serializers import (
     VendorSerializer, VendorPriceListSerializer,
     PurchaseOrderSerializer, PurchaseOrderItemSerializer, GoodsReceiptSerializer,
-    BillSerializer,
+    BillSerializer, VendorEmailSerializer,
 )
 from inventory.models import Item
 from inventory.serializers import ItemSerializer
@@ -99,6 +102,80 @@ class PurchaseOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 f"PO #{po.id} status changed from '{instance.status}' to '{new_status}'"
             )
 
+        # Placing the order is the point at which the vendor needs to hear from
+        # us. A single-order update is its own ordering action, so it gets its
+        # own email; batches go through `bulk_order` instead.
+        if new_status == "ordered":
+            self._draft_emails([po])
+
+    @staticmethod
+    def _draft_emails(orders):
+        """Draft vendor emails for a batch of just-placed orders. Never fatal —
+        a composition failure must not cost the user the order itself."""
+        from .emails import draft_for_orders
+
+        try:
+            return draft_for_orders(orders)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Could not draft vendor email(s) for PO(s) %s",
+                [o.id for o in orders], exc_info=True,
+            )
+            return []
+
+    @action(detail=False, methods=["post"])
+    def bulk_order(self, request):
+        """Place several purchase orders as ONE ordering action.
+
+        This is what the "Order All" button calls. Because the whole selection
+        arrives together, orders can be grouped by vendor into a single email
+        each — which per-order PATCHes could never achieve, since each request
+        is blind to the others.
+
+        Body: {"ids": [1, 2, 3]}
+        """
+        ids = request.data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return Response(
+                {"error": "Provide a non-empty 'ids' list."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # get_queryset() is company-scoped, so this cannot reach another tenant.
+        orders = list(self.get_queryset().filter(id__in=ids).select_related("vendor"))
+        found_ids = {o.id for o in orders}
+        missing = [i for i in ids if i not in found_ids]
+
+        placed, rejected = [], []
+        for po in orders:
+            if po.status not in ("draft", "pending", "approved"):
+                rejected.append({"id": po.id, "error": f"Cannot order a {po.status} order."})
+                continue
+            po.status = "ordered"
+            po.save(update_fields=["status"])
+            placed.append(po)
+            log_activity(
+                request.user, "Procurement", "Order Purchase Order",
+                f"PO #{po.id} placed with vendor '{po.vendor.name}'",
+            )
+
+        drafts = self._draft_emails(placed)
+
+        return Response({
+            "ordered": [po.id for po in placed],
+            "rejected": rejected,
+            "missing": missing,
+            "emails_created": [
+                {
+                    "id": d.id,
+                    "vendor": d.vendor.name,
+                    "purchase_orders": [f"PO-{p.id:04d}" for p in d.purchase_orders.all()],
+                }
+                for d in drafts
+            ],
+        })
+
     @action(detail=True, methods=["post"])
     def request_approval(self, request, pk=None):
         """
@@ -123,6 +200,129 @@ class PurchaseOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             po.save()
             log_activity(user, "Procurement", "Request PO Approval", f"PO #{po.id} ($ {po.total_amount}) sent to admin for approval (User limit: $ {limit})")
             return Response({"status": "pending", "message": "Order sent to admin for approval."})
+
+
+class VendorEmailViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """Mail Center: drafts generated from purchase orders, plus their history.
+
+    Sending is not implemented. `send` returns 501 so the UI can surface a
+    truthful "not configured yet" message rather than pretending to deliver.
+    """
+    company_field = "company"
+    queryset = (
+        VendorEmail.objects
+        .select_related("vendor", "sent_by")
+        .prefetch_related("purchase_orders", "attachments")
+        .all()
+    )
+    serializer_class = VendorEmailSerializer
+    permission_classes = [IsStore | IsAdmin]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["vendor", "status", "purchase_orders"]
+
+    def perform_update(self, serializer):
+        email = serializer.save()
+        log_activity(
+            self.request.user, "Procurement", "Edit Vendor Email",
+            f"Edited draft email #{email.id} to '{email.vendor.name}'",
+        )
+
+    def perform_destroy(self, instance):
+        """Delete a draft. Sent mail is a record of what a vendor received and
+        is never deletable — losing it would break the communication log the
+        order relies on."""
+        if instance.status == "sent":
+            raise ValidationError(
+                {"error": "Sent emails cannot be deleted; they are part of the order's record."}
+            )
+        log_activity(
+            self.request.user, "Procurement", "Delete Vendor Email",
+            f"Deleted {instance.status} email #{instance.id} to '{instance.vendor.name}'",
+        )
+        instance.delete()
+
+    @action(detail=False, methods=["post"])
+    def bulk_delete(self, request):
+        """Delete several drafts at once.
+
+        Body: {"ids": [1,2,3]}  — or {"all_drafts": true} to clear every draft.
+        Sent emails are always excluded and reported back, never silently
+        skipped, so the caller knows exactly what was kept.
+        """
+        qs = self.get_queryset()  # company-scoped
+
+        if request.data.get("all_drafts"):
+            targets = list(qs.filter(status="draft"))
+            protected = []
+        else:
+            ids = request.data.get("ids") or []
+            if not isinstance(ids, list) or not ids:
+                return Response(
+                    {"error": "Provide a non-empty 'ids' list, or 'all_drafts': true."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            selected = list(qs.filter(id__in=ids))
+            targets = [e for e in selected if e.status != "sent"]
+            protected = [e.id for e in selected if e.status == "sent"]
+
+        deleted_ids = [e.id for e in targets]
+        count = len(deleted_ids)
+        if count:
+            self.get_queryset().filter(id__in=deleted_ids).delete()
+            log_activity(
+                request.user, "Procurement", "Delete Vendor Emails",
+                f"Deleted {count} vendor email draft(s)",
+            )
+
+        return Response({
+            "deleted": count,
+            "deleted_ids": deleted_ids,
+            "protected_sent": protected,
+        })
+
+    @action(detail=True, methods=["post"])
+    def regenerate(self, request, pk=None):
+        """Rebuild the body from the covered orders, discarding manual edits."""
+        from .emails import compose_body, compose_subject
+
+        email = self.get_object()
+        if email.status != "draft":
+            return Response(
+                {"error": f"Only drafts can be regenerated. This email is {email.status}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        orders = list(email.purchase_orders.prefetch_related("items__item").order_by("id"))
+        email.subject = compose_subject(email.vendor, orders, email.company)
+        email.body_html = compose_body(email.vendor, orders, email.company)
+        email.body_edited = False
+        email.save()
+        return Response(VendorEmailSerializer(email).data)
+
+    @action(detail=True, methods=["post"])
+    def send(self, request, pk=None):
+        """Placeholder for the future SMTP transport.
+
+        Returns 501 rather than silently marking the draft sent — reporting a
+        delivery that never happened would corrupt the audit trail this model
+        exists to keep.
+        """
+        email = self.get_object()
+        if email.status != "draft":
+            return Response(
+                {"error": f"This email is already {email.status}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(
+            {
+                "error": "Email sending is not configured yet.",
+                "detail": (
+                    "SMTP delivery is planned for a future release. The draft has "
+                    "been saved and will be ready to send once configured."
+                ),
+            },
+            status=status.HTTP_501_NOT_IMPLEMENTED,
+        )
 
 
 class PurchaseOrderItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
@@ -265,7 +465,106 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         po.save()
         from finance.services import record_procurement_cost
         record_procurement_cost(po, user=self.request.user)
+
+        # Close the loop back to production. Material was procured because a
+        # production order was short of it; now that it has landed, the people
+        # waiting on it have to be told, or the batch sits blocked indefinitely.
+        self._notify_waiting_production(po, receipt)
+
         log_activity(
             self.request.user, "Procurement", "Goods Receipt",
             f"Received goods for PO #{po.id} into '{receipt.warehouse.name}': {', '.join(items_received)}"
         )
+
+    @staticmethod
+    def _notify_waiting_production(po, receipt):
+        """Release the inventory requests this PO was raised to fill and tell
+        production once per production order.
+
+        A batch can be short of several materials, all covered by one PO. The
+        per-request signal would then fire once per material, so it is
+        suppressed here and replaced with a single summary per production
+        order — and, when nothing is outstanding, that summary says the order
+        is fully supplied and ready to run.
+
+        Never fatal: a failure here must not undo a receipt that moved stock.
+        """
+        from core.utils import send_notification
+        from inventory.models import InventoryRequest
+
+        try:
+            requests = list(
+                InventoryRequest.objects
+                .filter(purchase_order=po, status__in=["pending", "procuring"])
+                .select_related("item", "warehouse", "production_order")
+            )
+            if not requests:
+                return
+
+            for req in requests:
+                # The summary below replaces the per-request message.
+                req._suppress_supply_notification = True
+                req.status = "supplied"
+                req.save(update_fields=["status"])
+
+            company = getattr(po.vendor, "company", None)
+
+            # Group by production order so each waiting batch gets one message.
+            by_order = {}
+            for req in requests:
+                by_order.setdefault(req.production_order_id, []).append(req)
+
+            for prod_id, reqs in by_order.items():
+                materials = ", ".join(
+                    sorted({f"{r.quantity:g} {r.item.unit} {r.item.name}" for r in reqs})
+                )
+                warehouse = reqs[0].warehouse.name
+
+                if prod_id is None:
+                    # Not raised for a batch — a plain restock.
+                    send_notification(
+                        "production",
+                        f"Material received at {warehouse}: {materials}.",
+                        related_id=po.id, related_type="PurchaseOrder",
+                        company=company, module="production",
+                    )
+                    continue
+
+                # Anything still outstanding on this batch, beyond what just landed.
+                still_waiting = (
+                    InventoryRequest.objects
+                    .filter(production_order_id=prod_id, status__in=["pending", "procuring"])
+                    .select_related("item")
+                )
+                pending_names = sorted({r.item.name for r in still_waiting})
+
+                if pending_names:
+                    tail = (
+                        f" Still awaiting: {', '.join(pending_names)}."
+                        if len(pending_names) <= 4
+                        else f" Still awaiting {len(pending_names)} other materials."
+                    )
+                    headline = f"Materials received for Production Order #{prod_id}"
+                else:
+                    tail = " All materials are now in stock — production can start."
+                    headline = f"Production Order #{prod_id} is fully supplied"
+
+                send_notification(
+                    "production",
+                    f"{headline} at {warehouse}: {materials}.{tail}",
+                    related_id=prod_id, related_type="ProductionOrder",
+                    company=company, module="production",
+                )
+
+            names = ", ".join(sorted({r.item.name for r in requests}))
+            send_notification(
+                "store",
+                f"PO #{po.id} received — {names} released to production.",
+                related_id=po.id, related_type="PurchaseOrder",
+                company=company, module="inventory",
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Could not notify production for PO #%s", po.id, exc_info=True
+            )

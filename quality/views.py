@@ -11,7 +11,15 @@ from core.tenancy import CompanyScopedMixin
 
 class QualityCheckViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "production_order__recipe__product__company"
-    queryset = QualityCheck.objects.all()
+    # Newest arrivals first — a batch that just reached quality is the one
+    # awaiting a decision, so it belongs at the top of the queue. `-id` breaks
+    # ties within the same second, which auto_now_add timestamps can collide on
+    # when a run completes several checks at once.
+    queryset = (
+        QualityCheck.objects
+        .select_related("production_order__recipe__product", "lot")
+        .order_by("-inspected_at", "-id")
+    )
     serializer_class = QualityCheckSerializer
     permission_classes = [IsQuality | IsAdmin]
 

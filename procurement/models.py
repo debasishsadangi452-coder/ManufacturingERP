@@ -68,6 +68,7 @@ class PurchaseOrder(models.Model):
     ]
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
+    notes = models.TextField(blank=True, help_text="Internal notes; not sent to the vendor.")
 
     def recalculate_total(self):
         """Recalculate total_amount from line items."""
@@ -104,6 +105,75 @@ class PurchaseOrderItem(models.Model):
 
     def __str__(self):
         return f"{self.quantity} x {self.item.name} @ {self.unit_price}"
+
+
+class VendorEmail(models.Model):
+    """A purchase-order email to a vendor, drafted automatically on PO creation.
+
+    Covers one or more purchase orders: orders raised for the same vendor while
+    a draft is still open are consolidated into that draft rather than each
+    producing its own message.
+
+    Delivery is not implemented. The transport-facing fields (`status`,
+    `sent_at`, `sent_by`, `error_message`) exist so adding SMTP later is a
+    matter of writing a sender, not migrating the schema.
+    """
+
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("queued", "Queued"),
+        ("sent", "Sent"),
+        ("failed", "Failed"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name="emails")
+    purchase_orders = models.ManyToManyField(
+        PurchaseOrder, related_name="emails", blank=True,
+        help_text="Every order this message covers.",
+    )
+
+    to_email = models.EmailField(blank=True)
+    cc = models.CharField(max_length=500, blank=True, help_text="Comma-separated")
+    bcc = models.CharField(max_length=500, blank=True, help_text="Comma-separated")
+    subject = models.CharField(max_length=300, blank=True)
+    body_html = models.TextField(blank=True)
+
+    # Set once the user edits the body, so regenerating the draft for a newly
+    # added order never discards their wording.
+    body_edited = models.BooleanField(default=False)
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft", db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # Populated by a future SMTP transport; unused today.
+    sent_at = models.DateTimeField(null=True, blank=True)
+    sent_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    error_message = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"], name="proc_email_scope_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.get_status_display()} email to {self.vendor.name}"
+
+
+class VendorEmailAttachment(models.Model):
+    email = models.ForeignKey(VendorEmail, on_delete=models.CASCADE, related_name="attachments")
+    file = models.FileField(upload_to="vendor_emails/")
+    filename = models.CharField(max_length=255)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.filename
 
 
 class GoodsReceipt(models.Model):

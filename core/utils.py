@@ -11,9 +11,14 @@ def log_activity(user, module, action, description):
         description=description
     )
 
-def send_notification(role, message, related_id=None, related_type="", company=None):
+def send_notification(role, message, related_id=None, related_type="", company=None,
+                      module="general"):
     """
-    Quality notification helper. `company` scopes the notification to a tenant.
+    Create a role-addressed notification filed under `module`.
+
+    `module` decides which page shows it — see Notification.MODULE_CHOICES.
+    `company` scopes it to a tenant; without it the notification is invisible to
+    everyone, because the viewset filters on the caller's company.
     """
     Notification.objects.create(
         recipient_role=role,
@@ -21,4 +26,5 @@ def send_notification(role, message, related_id=None, related_type="", company=N
         related_id=related_id,
         related_type=related_type,
         company=company,
+        module=module,
     )

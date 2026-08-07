@@ -219,6 +219,13 @@ class InventoryRequest(models.Model):
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE)
     quantity = models.FloatField()
     production_order = models.ForeignKey("production.ProductionOrder", on_delete=models.CASCADE, null=True, blank=True)
+    # The PO raised to fill this request. Without it, goods receipt has no way
+    # back to the production order that is waiting on the material, so nobody
+    # tells production the delivery has landed.
+    purchase_order = models.ForeignKey(
+        "procurement.PurchaseOrder", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="inventory_requests",
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
     created_at = models.DateTimeField(auto_now_add=True)
 

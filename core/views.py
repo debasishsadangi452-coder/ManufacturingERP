@@ -13,10 +13,24 @@ class NotificationViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        """Scope by tenant, then role, then page.
+
+        Admin is exempt from the role filter — they see every role's traffic —
+        but never from the module filter, so the Production page shows only
+        production notifications regardless of who is looking at it.
+        """
         user = self.request.user
         qs = Notification.objects.filter(company=user.company)
         if user.role != 'admin':
             qs = qs.filter(recipient_role=user.role)
+
+        module = self.request.query_params.get('module')
+        if module and module != 'all':
+            qs = qs.filter(module__in=[m.strip() for m in module.split(',') if m.strip()])
+
+        if self.request.query_params.get('unread') == 'true':
+            qs = qs.filter(is_read=False)
+
         return qs.order_by('-created_at')
 
     @action(detail=True, methods=['post'])
@@ -28,13 +42,28 @@ class NotificationViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def mark_all_read(self, request):
-        self.get_queryset().update(is_read=True)
-        return Response({'status': 'all marked as read'})
+        """Mark read. Honours ?module=, so clearing one page leaves others alone."""
+        updated = self.get_queryset().update(is_read=True)
+        return Response({'status': 'all marked as read', 'updated': updated})
 
     @action(detail=False, methods=['get'])
     def unread_count(self, request):
-        count = self.get_queryset().filter(is_read=False).count()
-        return Response({'unread': count})
+        """Unread total, plus a per-module breakdown for page badges."""
+        from django.db.models import Count
+
+        user = request.user
+        base = Notification.objects.filter(company=user.company, is_read=False)
+        if user.role != 'admin':
+            base = base.filter(recipient_role=user.role)
+
+        by_module = {
+            row['module']: row['total']
+            for row in base.values('module').annotate(total=Count('id'))
+        }
+        return Response({
+            'unread': sum(by_module.values()),
+            'by_module': by_module,
+        })
 
 
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):

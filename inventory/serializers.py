@@ -48,9 +48,60 @@ class InventoryRequestSerializer(serializers.ModelSerializer):
     item_name = serializers.ReadOnlyField(source='item.name')
     item_category = serializers.ReadOnlyField(source='item.category')
     warehouse_name = serializers.ReadOnlyField(source='warehouse.name')
+
+    # Why this material is needed. A request is raised against a production
+    # order, which may itself exist to fill a customer order — store needs to
+    # see that customer order to judge urgency, not just an internal PO number.
+    product_name = serializers.SerializerMethodField()
+    production_quantity = serializers.SerializerMethodField()
+    sales_order_id = serializers.SerializerMethodField()
+    customer_name = serializers.SerializerMethodField()
+    origin_label = serializers.SerializerMethodField()
+
     class Meta:
         model = InventoryRequest
         fields = '__all__'
+
+    def get_product_name(self, obj):
+        po = obj.production_order
+        return getattr(getattr(getattr(po, 'recipe', None), 'product', None), 'name', None)
+
+    def get_production_quantity(self, obj):
+        return getattr(obj.production_order, 'quantity', None)
+
+    def get_sales_order_id(self, obj):
+        return getattr(obj.production_order, 'sales_order_id', None)
+
+    def get_customer_name(self, obj):
+        so = getattr(obj.production_order, 'sales_order', None)
+        return getattr(getattr(so, 'customer', None), 'name', None)
+
+    purchase_order_status = serializers.SerializerMethodField()
+
+    def get_purchase_order_status(self, obj):
+        return getattr(obj.purchase_order, 'status', None)
+
+    def get_origin_label(self, obj):
+        """Short human phrase naming what this material is for.
+
+        Falls back down the chain: customer order → product being made →
+        production order number → a manual request with no production behind it.
+        """
+        po = obj.production_order
+        if po is None:
+            return "Manual request"
+
+        product = self.get_product_name(obj)
+        so_id = self.get_sales_order_id(obj)
+        customer = self.get_customer_name(obj)
+
+        if so_id:
+            who = f" for {customer}" if customer else ""
+            made = f" ({product})" if product else ""
+            return f"Sales Order #{so_id}{who}{made}"
+        if product:
+            return f"Production of {product} (stock)"
+        return f"Production Order #{po.id}"
 
 
 class ItemSerializer(serializers.ModelSerializer):

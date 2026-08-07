@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from django.db.models import Sum
 from accounts.permission import IsSales, IsAdmin, IsStore, IsFinance, IsProduction, IsQuality
@@ -65,7 +66,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                         f"CRITICAL: SO#{order.id} needs {item.name}, but NO RECIPE is defined!",
                         related_id=order.id,
                         related_type="sales_order",
-                        company=order.customer.company
+                        company=order.customer.company,
+                        module="sales",
                     )
                     continue
 
@@ -75,7 +77,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     f"FULFILLMENT REQ: Produce {shortage} {item.unit} of {item.name} for SO#{order.id}",
                     related_id=order.id,
                     related_type="sales_order",
-                    company=order.customer.company
+                    company=order.customer.company,
+                    module="production",
                 )
                 
                 # Notify Store (Inventory) to gather raw materials for this production
@@ -84,7 +87,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     f"GATHERING REQ: Prepare raw materials for production of {item.name} (SO#{order.id})",
                     related_id=order.id,
                     related_type="sales_order",
-                    company=order.customer.company
+                    company=order.customer.company,
+                    module="inventory",
                 )
 
     @action(detail=True, methods=['post'])
@@ -140,7 +144,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     f"STOCK ALLOCATED: SO#{order.id} for {item.name} is covered by existing stock.",
                     related_id=order.id,
                     related_type="sales_order",
-                    company=order.customer.company
+                    company=order.customer.company,
+                    module="sales",
                 )
                 continue
 
@@ -208,7 +213,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     f"Send to procurement.",
                     related_id=order.id,
                     related_type="sales_order",
-                    company=order.customer.company
+                    company=order.customer.company,
+                    module="inventory",
                 )
 
             # --- Step 5: Notify Production ---
@@ -218,7 +224,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 + ("Materials reserved." if fully_reserved else "AWAITING MATERIALS."),
                 related_id=prod_order.id,
                 related_type="production_order",
-                company=order.customer.company
+                company=order.customer.company,
+                module="production",
             )
 
         # Only a hard failure (no recipe at all) blocks the order now — a material
@@ -244,7 +251,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             f"SO#{order.id} is confirmed. {'Existing stock allocated.' if not production_orders_created else 'Production has been notified and raw materials are reserved.'}",
             related_id=order.id,
             related_type="sales_order",
-            company=order.customer.company
+            company=order.customer.company,
+            module="sales",
         )
 
         log_activity(request.user, "Sales", "Mark Ready for Production", f"SO #{order.id} marked ready. POs created: {production_orders_created}. Warnings: {errors or 'None'}")
@@ -416,7 +424,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             f"SO#{order.id} FULFILLED. {', '.join([f'{oi.quantity} {oi.item.unit} of {oi.item.name}' for oi in order.salesorderitem_set.all()])} deducted from inventory.",
             related_id=order.id,
             related_type="sales_order",
-            company=order.customer.company
+            company=order.customer.company,
+            module="inventory",
         )
 
         log_activity(request.user, "Sales", "Fulfill Sales Order", f"SO #{order.id} fulfilled and delivered. Items: {', '.join([f'{oi.quantity} x {oi.item.name}' for oi in order.salesorderitem_set.all()])}")
@@ -508,7 +517,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     f"PARTIAL SHIP: SO#{order.id} still needs {remaining} {order_item.item.unit} of {order_item.item.name}. Please fulfil remaining batch.",
                     related_id=order.id,
                     related_type="sales_order",
-                    company=order.customer.company
+                    company=order.customer.company,
+                    module="production",
                 )
 
         # Update order status
@@ -532,7 +542,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             f"Partial shipment: SO#{order.id} — Shipped: {', '.join(shipped_summary)}. Remaining: {', '.join(remaining_summary) or 'None'}.",
             related_id=order.id,
             related_type="sales_order",
-            company=order.customer.company
+            company=order.customer.company,
+            module="inventory",
         )
 
         return Response({
@@ -712,17 +723,68 @@ class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         order.save()
 
 
-class InboundOrderEmailViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
-    """The 'Orders from Email' inbox. Read-only list/detail plus a `confirm`
-    action that promotes a reviewed draft into a real order.
+class InboundOrderEmailViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """The 'Orders from Email' inbox. List/detail plus a `confirm` action that
+    promotes a reviewed draft into a real order, and delete for clearing
+    unwanted mail.
 
     Confirming flips the linked SalesOrder from "draft" → "pending", which
     releases the QuickBooks push guardrail so the order syncs normally from
     that point on. Nothing syncs while it sits in draft."""
     company_field = "company"
-    queryset = InboundOrderEmail.objects.all()
+    queryset = InboundOrderEmail.objects.select_related("sales_order").all()
     serializer_class = InboundOrderEmailSerializer
     permission_classes = [IsSales | IsStore | IsAdmin]
+    http_method_names = ["get", "post", "delete", "head", "options"]
+
+    def perform_destroy(self, instance):
+        """Delete an inbox entry. Confirmed mail is the audit record of an order
+        that reached production and QuickBooks, so it is never deletable —
+        removing it would break the order's provenance trail (SQF)."""
+        if instance.status == "confirmed":
+            raise ValidationError(
+                {"error": "Confirmed emails cannot be deleted; they are the order's audit record."}
+            )
+        log_activity(
+            self.request.user, "Sales", "Delete Inbound Email",
+            f"Deleted inbound order email #{instance.id} from '{instance.sender}'",
+        )
+        instance.delete()
+
+    @action(detail=False, methods=["post"])
+    def bulk_delete(self, request):
+        """Delete several inbox entries. Body: {"ids": [...]} or
+        {"all_unconfirmed": true}. Confirmed mail is always kept and reported
+        back rather than silently skipped."""
+        qs = self.get_queryset()
+
+        if request.data.get("all_unconfirmed"):
+            targets = list(qs.exclude(status="confirmed"))
+            protected = []
+        else:
+            ids = request.data.get("ids") or []
+            if not isinstance(ids, list) or not ids:
+                return Response(
+                    {"error": "Provide a non-empty 'ids' list, or 'all_unconfirmed': true."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            selected = list(qs.filter(id__in=ids))
+            targets = [e for e in selected if e.status != "confirmed"]
+            protected = [e.id for e in selected if e.status == "confirmed"]
+
+        deleted_ids = [e.id for e in targets]
+        if deleted_ids:
+            qs.filter(id__in=deleted_ids).delete()
+            log_activity(
+                request.user, "Sales", "Delete Inbound Emails",
+                f"Deleted {len(deleted_ids)} inbound order email(s)",
+            )
+
+        return Response({
+            "deleted": len(deleted_ids),
+            "deleted_ids": deleted_ids,
+            "protected_confirmed": protected,
+        })
 
     @action(detail=True, methods=["post"])
     def confirm(self, request, pk=None):
