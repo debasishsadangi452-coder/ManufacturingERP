@@ -9,15 +9,15 @@ class Vendor(models.Model):
     )
     name = models.CharField(max_length=200)
     category = models.CharField(max_length=100, default="raw_material")
-    email = models.EmailField(blank=True)
-    phone = models.CharField(max_length=20, blank=True)
-    address = models.TextField(blank=True)
+    email = models.EmailField(blank=True, default="")
+    phone = models.CharField(max_length=20, blank=True, default="")
+    address = models.TextField(blank=True, default="")
     rating = models.FloatField(default=0.0)
-    quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True)
-    quickbooks_sync_token = models.CharField(max_length=100, blank=True)
+    quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True, default="")
+    quickbooks_sync_token = models.CharField(max_length=100, blank=True, default="")
     quickbooks_last_synced_at = models.DateTimeField(null=True, blank=True)
-    payment_terms = models.CharField(max_length=100, blank=True)
-    tax_id = models.CharField(max_length=100, blank=True)
+    payment_terms = models.CharField(max_length=100, blank=True, default="")
+    tax_id = models.CharField(max_length=100, blank=True, default="")
     outstanding_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
 
     def __str__(self):
@@ -35,7 +35,7 @@ class VendorPriceList(models.Model):
     currency = models.CharField(max_length=10, default="USD")
     min_order_qty = models.FloatField(default=1, help_text="Minimum order quantity")
     lead_time_days = models.IntegerField(default=7, help_text="Vendor lead time in days")
-    notes = models.TextField(blank=True)
+    notes = models.TextField(blank=True, default="")
     is_active = models.BooleanField(default=True)
     effective_date = models.DateField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -68,7 +68,7 @@ class PurchaseOrder(models.Model):
     ]
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
-    notes = models.TextField(blank=True, help_text="Internal notes; not sent to the vendor.")
+    notes = models.TextField(blank=True, default="", help_text="Internal notes; not sent to the vendor.")
 
     def recalculate_total(self):
         """Recalculate total_amount from line items."""
@@ -135,11 +135,11 @@ class VendorEmail(models.Model):
         help_text="Every order this message covers.",
     )
 
-    to_email = models.EmailField(blank=True)
-    cc = models.CharField(max_length=500, blank=True, help_text="Comma-separated")
-    bcc = models.CharField(max_length=500, blank=True, help_text="Comma-separated")
-    subject = models.CharField(max_length=300, blank=True)
-    body_html = models.TextField(blank=True)
+    to_email = models.EmailField(blank=True, default="")
+    cc = models.CharField(max_length=500, blank=True, help_text="Comma-separated", default="")
+    bcc = models.CharField(max_length=500, blank=True, help_text="Comma-separated", default="")
+    subject = models.CharField(max_length=300, blank=True, default="")
+    body_html = models.TextField(blank=True, default="")
 
     # Set once the user edits the body, so regenerating the draft for a newly
     # added order never discards their wording.

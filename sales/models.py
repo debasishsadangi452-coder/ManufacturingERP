@@ -12,14 +12,14 @@ class Customer(models.Model):
         "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
     )
     name = models.CharField(max_length=200)
-    email = models.EmailField(blank=True)
-    phone = models.CharField(max_length=20, blank=True)
-    address = models.TextField(blank=True)
-    quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True)
-    quickbooks_sync_token = models.CharField(max_length=100, blank=True)
+    email = models.EmailField(blank=True, default="")
+    phone = models.CharField(max_length=20, blank=True, default="")
+    address = models.TextField(blank=True, default="")
+    quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True, default="")
+    quickbooks_sync_token = models.CharField(max_length=100, blank=True, default="")
     quickbooks_last_synced_at = models.DateTimeField(null=True, blank=True)
-    payment_terms = models.CharField(max_length=100, blank=True)
-    tax_status = models.CharField(max_length=100, blank=True)
+    payment_terms = models.CharField(max_length=100, blank=True, default="")
+    tax_status = models.CharField(max_length=100, blank=True, default="")
     balance_due = models.DecimalField(max_digits=12, decimal_places=2, default=0)
 
     def __str__(self):
@@ -177,10 +177,10 @@ class Shipment(models.Model):
     shipped_at = models.DateTimeField(auto_now_add=True)
     
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="preparing")
-    driver = models.CharField(max_length=100, blank=True)
-    vehicle = models.CharField(max_length=100, blank=True)
-    departure_time = models.CharField(max_length=50, blank=True)
-    estimated_arrival = models.CharField(max_length=50, blank=True)
+    driver = models.CharField(max_length=100, blank=True, default="")
+    vehicle = models.CharField(max_length=100, blank=True, default="")
+    departure_time = models.CharField(max_length=50, blank=True, default="")
+    estimated_arrival = models.CharField(max_length=50, blank=True, default="")
     progress = models.IntegerField(default=0)
     priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default="normal")
     temperature = models.FloatField(null=True, blank=True)
@@ -225,8 +225,8 @@ class InboundOrderEmail(models.Model):
     company = models.ForeignKey(
         "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
     )
-    sender = models.EmailField(blank=True)
-    subject = models.CharField(max_length=500, blank=True)
+    sender = models.EmailField(blank=True, default="")
+    subject = models.CharField(max_length=500, blank=True, default="")
     received_at = models.DateTimeField(default=timezone.now)
     raw_body = models.TextField(blank=True)
     # Full AI extraction result (customer, lines, pickup date, per-field notes).
@@ -236,7 +236,7 @@ class InboundOrderEmail(models.Model):
     sales_order = models.ForeignKey(
         SalesOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="inbound_emails"
     )
-    error_message = models.TextField(blank=True)
+    error_message = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

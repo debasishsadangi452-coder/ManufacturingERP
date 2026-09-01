@@ -74,7 +74,7 @@ class Item(models.Model):
     quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True)
     quickbooks_sync_token = models.CharField(max_length=100, blank=True)
     quickbooks_last_synced_at = models.DateTimeField(null=True, blank=True)
-    sku = models.CharField(max_length=100, blank=True)
+    sku = models.CharField(max_length=100, blank=True, default="")
     purchase_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     reorder_point = models.FloatField(null=True, blank=True)
     # Onboarding fields
@@ -255,7 +255,7 @@ class StockTransfer(models.Model):
     dest_warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE, related_name="transfers_in")
     quantity = models.FloatField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="in_transit")
-    reference = models.CharField(max_length=200, blank=True)
+    reference = models.CharField(max_length=200, blank=True, default="")
     created_by = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -288,7 +288,7 @@ class CycleCount(models.Model):
     )
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="open")
-    note = models.CharField(max_length=255, blank=True)
+    note = models.CharField(max_length=255, blank=True, default="")
     created_by = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
