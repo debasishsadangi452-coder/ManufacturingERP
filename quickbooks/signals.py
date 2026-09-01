@@ -63,6 +63,13 @@ def _sales_order_item_saved(sender, instance, **kwargs):
 # re-fires this receiver — so line changes are mirrored without a separate hook.
 @receiver(post_save, sender=PurchaseOrder, dispatch_uid="qb_push_purchase_order")
 def _purchase_order_saved(sender, instance, **kwargs):
+    # The UI creates the PO header first and adds lines afterwards, so this
+    # receiver fires once on a line-less order. QuickBooks rejects a
+    # PurchaseOrder with no Line ("Required parameter Line is missing", code
+    # 2020), which would leave the order permanently unlinked. Wait for the
+    # first line — adding it re-saves the PO and fires this receiver again.
+    if not instance.items.exists():
+        return
     _queue_push("purchase_order", instance, instance.vendor.company)
 
 

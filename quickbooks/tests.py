@@ -282,6 +282,123 @@ class PushTestCase(TestCase):
         self.assertEqual(payment.invoice, invoice)
         self.assertEqual(payment.amount, Decimal("150"))
 
+    def test_pull_quickbooks_purchase_order_with_lines(self):
+        """QuickBooks sends PO item lines as ItemBasedExpenseLineDetail -- the
+        same shape push.py writes. Reading any other key silently imports a PO
+        with no lines."""
+        _, vendor, item = self._make_masters()
+        vendor.quickbooks_id = "qb-vendor-10"
+        vendor.save(update_fields=["quickbooks_id"])
+        item.quickbooks_id = "qb-item-10"
+        item.save(update_fields=["quickbooks_id"])
+
+        created = services._upsert_purchase_order(
+            self.connection,
+            {
+                "Id": "qb-po-1",
+                "SyncToken": "0",
+                "VendorRef": {"value": "qb-vendor-10", "name": vendor.name},
+                "TotalAmt": 2000,
+                "Line": [
+                    {
+                        "Description": item.name,
+                        "Amount": 2000,
+                        "DetailType": "ItemBasedExpenseLineDetail",
+                        "ItemBasedExpenseLineDetail": {
+                            "ItemRef": {"value": "qb-item-10", "name": item.name},
+                            "Qty": 1000,
+                            "UnitPrice": 2,
+                        },
+                    }
+                ],
+            },
+        )
+
+        order = PurchaseOrder.objects.get(quickbooks_id="qb-po-1")
+        self.assertTrue(created)
+        self.assertEqual(order.items.count(), 1)
+        line = order.items.first()
+        self.assertEqual(line.quantity, 1000)
+        self.assertEqual(line.unit_price, Decimal("2"))
+
+    def test_pull_quickbooks_bill_with_lines(self):
+        _, vendor, item = self._make_masters()
+        vendor.quickbooks_id = "qb-vendor-11"
+        vendor.save(update_fields=["quickbooks_id"])
+        item.quickbooks_id = "qb-item-11"
+        item.save(update_fields=["quickbooks_id"])
+
+        services._upsert_bill(
+            self.connection,
+            {
+                "Id": "qb-bill-1",
+                "SyncToken": "0",
+                "VendorRef": {"value": "qb-vendor-11", "name": vendor.name},
+                "TxnDate": "2026-07-01",
+                "DocNumber": "VEND-9",
+                "TotalAmt": 500,
+                "Balance": 500,
+                "Line": [
+                    {
+                        "Description": item.name,
+                        "Amount": 500,
+                        "DetailType": "ItemBasedExpenseLineDetail",
+                        "ItemBasedExpenseLineDetail": {
+                            "ItemRef": {"value": "qb-item-11", "name": item.name},
+                            "Qty": 250,
+                            "UnitPrice": 2,
+                        },
+                    }
+                ],
+            },
+        )
+
+        bill = Bill.objects.get(quickbooks_id="qb-bill-1")
+        self.assertEqual(bill.lines.count(), 1)
+        self.assertEqual(bill.lines.first().quantity, 250)
+
+    def test_pull_does_not_blank_lines_it_cannot_parse(self):
+        """An account-coded bill carries no ItemRef. Deleting the ERP's lines
+        and importing nothing in their place would lose real data."""
+        _, vendor, item = self._make_masters()
+        vendor.quickbooks_id = "qb-vendor-12"
+        vendor.save(update_fields=["quickbooks_id"])
+        with push.suppress_auto_push():
+            bill = Bill.objects.create(
+                company=self.company, vendor=vendor, bill_number="KEEP-1",
+                bill_date=timezone.localdate(), total_amount=Decimal("100"),
+                quickbooks_id="qb-bill-2",
+            )
+            BillLine.objects.create(
+                bill=bill, item=item, quantity=5,
+                unit_price=Decimal("20.00"), amount=Decimal("100"),
+            )
+
+        services._upsert_bill(
+            self.connection,
+            {
+                "Id": "qb-bill-2",
+                "SyncToken": "1",
+                "VendorRef": {"value": "qb-vendor-12", "name": vendor.name},
+                "TxnDate": "2026-07-02",
+                "TotalAmt": 100,
+                "Balance": 0,
+                "Line": [
+                    {
+                        "Amount": 100,
+                        "DetailType": "AccountBasedExpenseLineDetail",
+                        "AccountBasedExpenseLineDetail": {
+                            "AccountRef": {"value": "80", "name": "Office Supplies"}
+                        },
+                    }
+                ],
+            },
+        )
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.lines.count(), 1)
+        self.assertEqual(bill.lines.first().quantity, 5)
+
     def test_sales_order_pushed_as_estimate_with_lines(self):
         customer, _, item = self._make_masters()
         with push.suppress_auto_push():
@@ -355,6 +472,39 @@ class PushTestCase(TestCase):
         self.assertEqual(body["DocNumber"], "XYZ-77")
         bill.refresh_from_db()
         self.assertTrue(bill.quickbooks_id)
+
+    def test_line_less_purchase_order_is_not_pushed(self):
+        """The UI creates the PO header before its lines. QuickBooks rejects a
+        PurchaseOrder with no Line (code 2020), so the empty save must not push
+        -- adding the first line re-saves the PO and pushes it complete."""
+        _, vendor, item = self._make_masters()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            order = PurchaseOrder.objects.create(vendor=vendor, status="approved")
+        order.refresh_from_db()
+        self.assertEqual(order.quickbooks_id, "")
+        self.assertIsNone(self.fake.last_body("purchaseorder"))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            PurchaseOrderItem.objects.create(
+                purchase_order=order, item=item, quantity=10, unit_price=Decimal("50.00")
+            )
+        order.refresh_from_db()
+        self.assertTrue(order.quickbooks_id)
+        body = self.fake.last_body("purchaseorder")
+        self.assertEqual(len(body["Line"]), 1)
+
+    def test_push_all_skips_line_less_purchase_orders(self):
+        """A line-less PO would fail on every nightly run, so the backfill
+        must leave it out rather than retrying it forever."""
+        _, vendor, item = self._make_masters()
+        with push.suppress_auto_push():
+            PurchaseOrder.objects.create(vendor=vendor, status="approved")
+
+        run = push.push_all(self.connection)
+
+        self.assertEqual(run.status, "success")
+        self.assertFalse(any(r == "purchaseorder" for r, _ in self.fake.requests))
 
     def test_auto_push_signal_on_customer_create(self):
         with self.captureOnCommitCallbacks(execute=True):

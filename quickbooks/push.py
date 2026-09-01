@@ -528,9 +528,12 @@ def push_all(connection):
         ),
         (
             "purchase_order",
-            PurchaseOrder.objects.filter(vendor__company=company, quickbooks_id="").exclude(
-                status__in=["draft", "cancelled"]
-            ),
+            # items__isnull=False: QuickBooks rejects a PurchaseOrder with no
+            # Line (code 2020), so a line-less order would fail on every run.
+            PurchaseOrder.objects.filter(vendor__company=company, quickbooks_id="")
+            .exclude(status__in=["draft", "cancelled"])
+            .filter(items__isnull=False)
+            .distinct(),
         ),
         ("invoice", Invoice.objects.filter(company=company, quickbooks_id="").exclude(status="cancelled")),
         ("bill", Bill.objects.filter(company=company, quickbooks_id="").exclude(status="cancelled")),

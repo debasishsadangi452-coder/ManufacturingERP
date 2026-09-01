@@ -737,8 +737,12 @@ def _get_or_create_catalogue_vendor(company):
 
 
 def _purchase_order_lines(connection, lines):
+    # QuickBooks returns item lines on a PurchaseOrder as
+    # ItemBasedExpenseLineDetail -- the same shape push.py sends. Lines coded
+    # straight to an expense account (AccountBasedExpenseLineDetail) carry no
+    # ItemRef, so there is nothing to map onto a PurchaseOrderItem; skip them.
     for line in lines or []:
-        detail = line.get("PurchaseOrderItemLineDetail")
+        detail = line.get("ItemBasedExpenseLineDetail")
         if not detail:
             continue
         item = _item_for_ref(connection, detail.get("ItemRef"), line.get("Description") or "QuickBooks Item")
@@ -751,14 +755,23 @@ def _purchase_order_lines(connection, lines):
 
 
 def _replace_purchase_order_lines(connection, order, lines):
+    # Parse before deleting: a payload we cannot read (or one made up entirely
+    # of account-coded lines) must leave the existing lines alone rather than
+    # emptying an order that the ERP populated.
+    parsed = list(_purchase_order_lines(connection, lines))
+    if not parsed:
+        return
     order.items.all().delete()
-    for item, quantity, unit_price in _purchase_order_lines(connection, lines):
+    for item, quantity, unit_price in parsed:
         PurchaseOrderItem.objects.create(purchase_order=order, item=item, quantity=quantity, unit_price=unit_price)
 
 
 def _bill_lines(connection, lines):
+    # As with purchase orders, QuickBooks Bill item lines arrive as
+    # ItemBasedExpenseLineDetail. Account-coded lines have no ItemRef and are
+    # skipped rather than invented as items.
     for line in lines or []:
-        detail = line.get("LineDetail")
+        detail = line.get("ItemBasedExpenseLineDetail")
         if not detail:
             continue
         item = _item_for_ref(connection, detail.get("ItemRef"), line.get("Description") or "QuickBooks Item")
@@ -771,8 +784,13 @@ def _bill_lines(connection, lines):
 
 
 def _replace_bill_lines(connection, bill, lines):
+    # See _replace_purchase_order_lines: never blank out existing lines on an
+    # unparseable payload.
+    parsed = list(_bill_lines(connection, lines))
+    if not parsed:
+        return
     bill.lines.all().delete()
-    for item, quantity, unit_price, amount, description in _bill_lines(connection, lines):
+    for item, quantity, unit_price, amount, description in parsed:
         BillLine.objects.create(
             bill=bill,
             item=item,
