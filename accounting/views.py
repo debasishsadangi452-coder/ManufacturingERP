@@ -275,3 +275,19 @@ class AccountingFoundationSummaryViewSet(viewsets.ViewSet):
             "lock_date": settings_obj.lock_date if settings_obj else None,
             "setup_complete": total_accounts > 0 and total_fiscal_years > 0,
         })
+
+
+from .erp_context import get_company_erp_context
+
+
+class ERPContextViewSet(viewsets.ViewSet):
+    """Audits and provides live integration context linking operational ERP modules to Accounting."""
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "No company associated with user"}, status=status.HTTP_400_BAD_REQUEST)
+        context_data = get_company_erp_context(company)
+        return Response(context_data)
+

@@ -223,3 +223,40 @@ class AccountingAPITests(TestCase):
         self.assertIn("category_counts", res.data)
         self.assertIn("asset", res.data["category_counts"])
         self.assertTrue(res.data["setup_complete"])
+
+    def test_erp_context_endpoint(self):
+        from sales.models import Customer
+        from procurement.models import Vendor
+        from inventory.models import Item
+
+        # Create sample operational entities
+        Customer.objects.create(company=self.company1, name="Acme Beverages")
+        Vendor.objects.create(company=self.company1, name="Global Packaging Co")
+        Item.objects.create(company=self.company1, name="Glass Bottles 500ml", category="raw_material")
+
+        res = self.client.get("/api/accounting/erp-context/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["company"]["id"], self.company1.id)
+        self.assertEqual(res.data["counts"]["customers"], 1)
+        self.assertEqual(res.data["counts"]["vendors"], 1)
+        self.assertEqual(res.data["counts"]["items"], 1)
+        self.assertIn("readiness", res.data)
+        self.assertIn("integration_contract", res.data)
+        self.assertGreater(len(res.data["integration_contract"]), 3)
+
+        # Multi-tenancy check
+        admin2 = User.objects.create_user(
+            username="admin_comp2",
+            email="admin@comp2.com",
+            password="pass",
+            role="admin",
+            company=self.company2,
+        )
+        client2 = APIClient()
+        client2.force_authenticate(user=admin2)
+        res2 = client2.get("/api/accounting/erp-context/")
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data["counts"]["customers"], 0)
+        self.assertEqual(res2.data["counts"]["vendors"], 0)
+        self.assertEqual(res2.data["counts"]["items"], 0)
+
