@@ -291,3 +291,115 @@ class ERPContextViewSet(viewsets.ViewSet):
         context_data = get_company_erp_context(company)
         return Response(context_data)
 
+
+from .models import JournalEntry, JournalEntryLine
+from .serializers import JournalEntrySerializer, JournalEntryLineSerializer
+from .engine import post_journal_entry, reverse_journal_entry
+from django.core.exceptions import ValidationError as DjangoValidationError
+
+
+class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    Manages double-entry Journal Entries.
+    Supports draft creation, line manipulation, atomic posting, and reversals.
+    """
+    queryset = JournalEntry.objects.all().prefetch_related("lines__account")
+    serializer_class = JournalEntrySerializer
+    permission_classes = [IsFinanceOrAdmin]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        period_param = self.request.query_params.get("accounting_period")
+        if period_param:
+            qs = qs.filter(accounting_period_id=period_param)
+
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(
+                models.Q(entry_number__icontains=search)
+                | models.Q(reference__icontains=search)
+                | models.Q(description__icontains=search)
+            )
+
+        start_date = self.request.query_params.get("start_date")
+        if start_date:
+            qs = qs.filter(transaction_date__gte=start_date)
+
+        end_date = self.request.query_params.get("end_date")
+        if end_date:
+            qs = qs.filter(transaction_date__lte=end_date)
+
+        return qs
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.status != "draft":
+            return Response(
+                {"error": f"Cannot delete a journal entry with status '{instance.status}'. Only draft entries may be deleted."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"], url_path="post")
+    def post_entry(self, request, pk=None):
+        """Atomically post a draft journal entry."""
+        entry = self.get_object()
+        company = getattr(request.user, "company", None)
+        try:
+            posted_entry = post_journal_entry(entry.id, request.user, company=company)
+            serializer = self.get_serializer(posted_entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reverse")
+    def reverse_entry(self, request, pk=None):
+        """Create an atomic reversal of a posted journal entry."""
+        entry = self.get_object()
+        company = getattr(request.user, "company", None)
+        reason = request.data.get("reason", "")
+        reversal_date = request.data.get("transaction_date")
+        try:
+            reversal_entry = reverse_journal_entry(
+                entry.id, request.user, reason=reason, reversal_date=reversal_date, company=company
+            )
+            serializer = self.get_serializer(reversal_entry)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["get"], url_path="validate-balance")
+    def validate_balance(self, request, pk=None):
+        """Checks if the draft entry is mathematically balanced and ready for posting."""
+        entry = self.get_object()
+        try:
+            entry.validate_double_entry()
+            return Response({
+                "is_balanced": True,
+                "total_debit": entry.total_debit,
+                "total_credit": entry.total_credit,
+                "difference": Decimal("0.00"),
+                "status": "ready_to_post",
+            })
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            diff = abs(entry.total_debit - entry.total_credit)
+            return Response({
+                "is_balanced": False,
+                "total_debit": entry.total_debit,
+                "total_credit": entry.total_credit,
+                "difference": diff,
+                "errors": msg,
+            }, status=status.HTTP_200_OK)
+
+
