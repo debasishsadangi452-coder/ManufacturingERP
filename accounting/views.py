@@ -525,4 +525,170 @@ class GeneralLedgerViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+from .receivables import (
+    get_ar_summary,
+    get_ar_aging_report,
+    get_ar_invoices,
+    post_invoice_to_ar,
+    record_and_allocate_ar_payment,
+    get_customer_ar_statement,
+)
+
+
+class AccountsReceivableViewSet(viewsets.ViewSet):
+    """
+    Accounts Receivable Subledger API (Blueprint Section No. 10).
+    Provides customer receivables ledger, deterministic AR aging calculations,
+    payment allocation, and atomic double-entry posting through the Double-Entry Engine (#8).
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/receivables/summary/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        as_of_date = request.query_params.get("as_of_date")
+        try:
+            res = get_ar_summary(company=company, as_of_date=as_of_date)
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="aging")
+    def aging_report(self, request):
+        """GET /api/accounting/receivables/aging/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        as_of_date = request.query_params.get("as_of_date")
+        try:
+            res = get_ar_aging_report(company=company, as_of_date=as_of_date)
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="invoices")
+    def invoices(self, request):
+        """GET /api/accounting/receivables/invoices/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        customer_id = request.query_params.get("customer_id")
+        status_filter = request.query_params.get("status")
+        search = request.query_params.get("search")
+        as_of_date = request.query_params.get("as_of_date")
+        try:
+            res = get_ar_invoices(
+                company=company,
+                customer_id=customer_id,
+                status_filter=status_filter,
+                search=search,
+                as_of_date=as_of_date,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="post-invoice")
+    def post_invoice(self, request):
+        """POST /api/accounting/receivables/post-invoice/ {"invoice_id": 123}"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        invoice_id = request.data.get("invoice_id")
+        if not invoice_id:
+            return Response({"error": "invoice_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            posted_entry = post_invoice_to_ar(invoice_id=invoice_id, user=request.user, company=company)
+            return Response({
+                "message": f"Invoice INV-{invoice_id} successfully posted to General Ledger.",
+                "journal_entry_id": posted_entry.id,
+                "journal_entry_number": posted_entry.entry_number,
+                "posted_at": posted_entry.posted_at,
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="record-payment")
+    def record_payment(self, request):
+        """
+        POST /api/accounting/receivables/record-payment/
+        """
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        customer_id = request.data.get("customer_id")
+        amount = request.data.get("amount")
+        payment_date = request.data.get("payment_date")
+        method = request.data.get("method", "bank_transfer")
+        reference = request.data.get("reference", "")
+        allocations = request.data.get("allocations")
+        invoice_id = request.data.get("invoice_id")
+        bank_account_id = request.data.get("bank_account_id")
+
+        if not allocations and invoice_id:
+            allocations = [{"invoice_id": invoice_id, "amount": amount}]
+
+        if not customer_id or not amount:
+            return Response({"error": "customer_id and amount are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            res = record_and_allocate_ar_payment(
+                customer_id=customer_id,
+                amount=amount,
+                user=request.user,
+                company=company,
+                payment_date=payment_date,
+                method=method,
+                reference=reference,
+                allocations=allocations,
+                bank_account_id=bank_account_id,
+            )
+            je = res["journal_entry"]
+            return Response({
+                "message": f"Payment successfully recorded, allocated, and posted to General Ledger.",
+                "journal_entry_id": je.id,
+                "journal_entry_number": je.entry_number,
+                "payments_created": res["payments"],
+                "total_allocated": res["total_allocated"],
+            }, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="customer/(?P<customer_id>[^/.]+)/statement")
+    def customer_statement(self, request, customer_id=None):
+        """GET /api/accounting/receivables/customer/{customer_id}/statement/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+
+        try:
+            res = get_customer_ar_statement(
+                customer_id=customer_id,
+                company=company,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
 

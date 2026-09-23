@@ -777,4 +777,385 @@ class GeneralLedgerTests(TestCase):
         self.assertEqual(Decimal(gl_res.data["summary"]["closing_balance"]), Decimal("0.00"))
 
 
+from datetime import timedelta
+from sales.models import Customer, Invoice, CustomerPayment
+from accounting.receivables import (
+    get_ar_summary,
+    get_ar_aging_report,
+    get_ar_invoices,
+    post_invoice_to_ar,
+    record_and_allocate_ar_payment,
+    get_customer_ar_statement,
+)
+
+
+class AccountsReceivableTests(APITestCase):
+    """
+    Test suite for Master Accounting Blueprint Section #10: Accounts Receivable (AR).
+    Covers customer receivables, invoice posting, payment allocation, aging engine,
+    GL integration, tenant isolation, and period locking.
+    """
+
+    def setUp(self):
+        # 1. Tenants
+        self.comp1 = Company.objects.create(name="Brewing Co", slug="brewco")
+        self.comp2 = Company.objects.create(name="Distillery Co", slug="distco")
+
+        # 2. Users
+        self.finance_user = User.objects.create_user(
+            username="finuser",
+            email="fin@brew.com",
+            role="finance",
+            company=self.comp1,
+            password="pass"
+        )
+        self.store_user = User.objects.create_user(
+            username="storeuser",
+            email="store@brew.com",
+            role="store_manager",
+            company=self.comp1,
+            password="pass"
+        )
+        self.comp2_user = User.objects.create_user(
+            username="comp2fin",
+            email="fin@dist.com",
+            role="finance",
+            company=self.comp2,
+            password="pass"
+        )
+
+        # 3. Seed Accounts & Fiscal Year
+        seed_standard_chart_of_accounts(self.comp1)
+        seed_standard_fiscal_year(self.comp1, 2026)
+        seed_standard_chart_of_accounts(self.comp2)
+        seed_standard_fiscal_year(self.comp2, 2026)
+
+        self.acc_ar = Account.objects.get(company=self.comp1, code="1100")
+        self.acc_sales = Account.objects.get(company=self.comp1, code="4010")
+        self.acc_bank = Account.objects.get(company=self.comp1, code="1010")
+
+        # 4. Customers
+        self.customer1 = Customer.objects.create(
+            company=self.comp1,
+            name="Acme Pubs",
+            email="acme@pub.com",
+            payment_terms="Net 30",
+        )
+        self.customer_comp2 = Customer.objects.create(
+            company=self.comp2,
+            name="Rival Bar",
+            email="rival@bar.com",
+        )
+
+        self.client.force_authenticate(user=self.finance_user)
+
+    def test_post_invoice_to_ar_creates_balanced_journal_entry(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 1, 15),
+            due_date=date(2026, 2, 14),
+            total_amount=Decimal("1500.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        res = self.client.post("/api/accounting/receivables/post-invoice/", {
+            "invoice_id": inv.id
+        }, format="json")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        je_id = res.data["journal_entry_id"]
+
+        je = JournalEntry.objects.get(id=je_id)
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.company, self.comp1)
+        self.assertEqual(je.lines.count(), 2)
+
+        # Verify Debit AR 1100, Credit Revenue 4010
+        debit_line = je.lines.get(account=self.acc_ar)
+        credit_line = je.lines.get(account=self.acc_sales)
+        self.assertEqual(debit_line.debit, Decimal("1500.00"))
+        self.assertEqual(debit_line.credit, Decimal("0.00"))
+        self.assertEqual(credit_line.debit, Decimal("0.00"))
+        self.assertEqual(credit_line.credit, Decimal("1500.00"))
+
+        # Verify invoice list endpoint shows is_posted_to_gl=True
+        inv_res = self.client.get("/api/accounting/receivables/invoices/")
+        self.assertEqual(inv_res.status_code, status.HTTP_200_OK)
+        item = [x for x in inv_res.data if x["id"] == inv.id][0]
+        self.assertTrue(item["is_posted_to_gl"])
+        self.assertEqual(item["journal_entry_id"], je.id)
+
+    def test_posted_ar_invoice_flows_into_general_ledger(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 1, 15),
+            due_date=date(2026, 2, 14),
+            total_amount=Decimal("2000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        self.client.post("/api/accounting/receivables/post-invoice/", {"invoice_id": inv.id}, format="json")
+
+        # Check Account 1100 (AR) in General Ledger
+        gl_ar = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_ar.id}")
+        self.assertEqual(gl_ar.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(gl_ar.data["summary"]["period_total_debit"]), Decimal("2000.00"))
+        self.assertEqual(Decimal(gl_ar.data["summary"]["closing_balance"]), Decimal("2000.00"))
+        self.assertEqual(gl_ar.data["summary"]["closing_balance_side"], "DR")
+
+        # Check Account 4010 (Sales Revenue) in General Ledger
+        gl_sales = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_sales.id}")
+        self.assertEqual(gl_sales.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(gl_sales.data["summary"]["period_total_credit"]), Decimal("2000.00"))
+        self.assertEqual(Decimal(gl_sales.data["summary"]["closing_balance"]), Decimal("2000.00"))
+        self.assertEqual(gl_sales.data["summary"]["closing_balance_side"], "CR")
+
+    def test_duplicate_invoice_posting_is_prevented(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 1, 15),
+            total_amount=Decimal("500.00"),
+            status="open",
+        )
+        # First post succeeds
+        res1 = self.client.post("/api/accounting/receivables/post-invoice/", {"invoice_id": inv.id}, format="json")
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+
+        # Second post is rejected with duplicate error
+        res2 = self.client.post("/api/accounting/receivables/post-invoice/", {"invoice_id": inv.id}, format="json")
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been posted", str(res2.data))
+
+    def test_partial_and_full_payment_allocation(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 1, 10),
+            due_date=date(2026, 2, 10),
+            total_amount=Decimal("1000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        self.client.post("/api/accounting/receivables/post-invoice/", {"invoice_id": inv.id}, format="json")
+
+        # 1. Partial payment: $400
+        res1 = self.client.post("/api/accounting/receivables/record-payment/", {
+            "customer_id": self.customer1.id,
+            "amount": "400.00",
+            "payment_date": "2026-01-20",
+            "method": "bank_transfer",
+            "reference": "WIRE-400",
+            "allocations": [{"invoice_id": inv.id, "amount": "400.00"}]
+        }, format="json")
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "partial")
+        self.assertEqual(inv.amount_paid, Decimal("400.00"))
+        self.assertEqual(inv.balance_due, Decimal("600.00"))
+
+        # Verify Bank GL increased by $400, AR balance is now $600
+        gl_bank = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_bank.id}")
+        self.assertEqual(Decimal(gl_bank.data["summary"]["closing_balance"]), Decimal("400.00"))
+
+        gl_ar = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_ar.id}")
+        self.assertEqual(Decimal(gl_ar.data["summary"]["closing_balance"]), Decimal("600.00"))
+
+        # 2. Full remaining payment: $600
+        res2 = self.client.post("/api/accounting/receivables/record-payment/", {
+            "customer_id": self.customer1.id,
+            "amount": "600.00",
+            "payment_date": "2026-01-25",
+            "method": "bank_transfer",
+            "reference": "WIRE-600",
+            "allocations": [{"invoice_id": inv.id, "amount": "600.00"}]
+        }, format="json")
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "paid")
+        self.assertEqual(inv.balance_due, Decimal("0.00"))
+
+        # AR GL is fully settled (closing balance 0.00)
+        gl_ar2 = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_ar.id}")
+        self.assertEqual(Decimal(gl_ar2.data["summary"]["closing_balance"]), Decimal("0.00"))
+
+    def test_multiple_invoice_payment_allocation(self):
+        inv1 = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 1, 5),
+            total_amount=Decimal("300.00"),
+            status="open",
+        )
+        inv2 = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 1, 8),
+            total_amount=Decimal("700.00"),
+            status="open",
+        )
+        self.client.post("/api/accounting/receivables/post-invoice/", {"invoice_id": inv1.id}, format="json")
+        self.client.post("/api/accounting/receivables/post-invoice/", {"invoice_id": inv2.id}, format="json")
+
+        # Allocate $1000 payment across both invoices
+        res = self.client.post("/api/accounting/receivables/record-payment/", {
+            "customer_id": self.customer1.id,
+            "amount": "1000.00",
+            "payment_date": "2026-01-22",
+            "method": "bank_transfer",
+            "reference": "BULK-1000",
+            "allocations": [
+                {"invoice_id": inv1.id, "amount": "300.00"},
+                {"invoice_id": inv2.id, "amount": "700.00"},
+            ]
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        inv1.refresh_from_db()
+        inv2.refresh_from_db()
+        self.assertEqual(inv1.status, "paid")
+        self.assertEqual(inv2.status, "paid")
+
+    def test_ar_aging_buckets_calculation(self):
+        ref_date = date(2026, 4, 15)
+
+        # 1. Current (due in future)
+        Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 4, 1), due_date=date(2026, 4, 20),
+            total_amount=Decimal("100.00"), status="open",
+        )
+        # 2. 1-30 days overdue (due 15 days ago, April 01)
+        Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 3, 1), due_date=date(2026, 4, 1),
+            total_amount=Decimal("200.00"), status="open",
+        )
+        # 3. 31-60 days overdue (due 45 days ago, March 01)
+        Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 2, 1), due_date=date(2026, 3, 1),
+            total_amount=Decimal("300.00"), status="open",
+        )
+        # 4. 61-90 days overdue (due 75 days ago, Jan 30)
+        Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 1, 1), due_date=date(2026, 1, 30),
+            total_amount=Decimal("400.00"), status="open",
+        )
+        # 5. 90+ days overdue (due 105 days ago, Dec 31 2025)
+        Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2025, 12, 1), due_date=date(2025, 12, 31),
+            total_amount=Decimal("500.00"), status="open",
+        )
+
+        res = self.client.get(f"/api/accounting/receivables/aging/?as_of_date={ref_date.isoformat()}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        totals = res.data["totals"]
+
+        self.assertEqual(Decimal(totals["total_receivables"]), Decimal("1500.00"))
+        self.assertEqual(Decimal(totals["current"]), Decimal("100.00"))
+        self.assertEqual(Decimal(totals["days_1_30"]), Decimal("200.00"))
+        self.assertEqual(Decimal(totals["days_31_60"]), Decimal("300.00"))
+        self.assertEqual(Decimal(totals["days_61_90"]), Decimal("400.00"))
+        self.assertEqual(Decimal(totals["days_90_plus"]), Decimal("500.00"))
+        self.assertEqual(Decimal(totals["overdue_total"]), Decimal("1400.00"))
+
+    def test_customer_ar_statement(self):
+        inv = Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 1, 10), due_date=date(2026, 1, 25),
+            total_amount=Decimal("800.00"), status="open",
+        )
+        CustomerPayment.objects.create(
+            company=self.comp1, customer=self.customer1, invoice=inv,
+            amount=Decimal("300.00"), payment_date=date(2026, 1, 15),
+            method="cheque", reference="CHK-1234",
+        )
+
+        res = self.client.get(f"/api/accounting/receivables/customer/{self.customer1.id}/statement/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data["transactions"]), 2)
+        # Line 1: Invoice debit 800, running balance 800
+        self.assertEqual(Decimal(res.data["transactions"][0]["debit"]), Decimal("800.00"))
+        self.assertEqual(Decimal(res.data["transactions"][0]["running_balance"]), Decimal("800.00"))
+        # Line 2: Payment credit 300, running balance 500
+        self.assertEqual(Decimal(res.data["transactions"][1]["credit"]), Decimal("300.00"))
+        self.assertEqual(Decimal(res.data["transactions"][1]["running_balance"]), Decimal("500.00"))
+        self.assertEqual(Decimal(res.data["summary"]["ending_balance"]), Decimal("500.00"))
+
+    def test_locked_period_blocks_invoice_and_payment_posting(self):
+        # Lock Period 1 (Jan 2026)
+        p1 = AccountingPeriod.objects.get(company=self.comp1, period_number=1)
+        p1.status = "locked"
+        p1.save()
+
+        inv = Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 1, 15), total_amount=Decimal("350.00"),
+            status="open",
+        )
+
+        # Attempt to post in locked period
+        res = self.client.post("/api/accounting/receivables/post-invoice/", {
+            "invoice_id": inv.id
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("locked", str(res.data).lower())
+
+    def test_tenant_isolation_in_receivables(self):
+        # Company 2 invoice
+        inv_comp2 = Invoice.objects.create(
+            company=self.comp2, customer=self.customer_comp2,
+            invoice_date=date(2026, 1, 15), total_amount=Decimal("999.00"),
+            status="open",
+        )
+
+        # Company 1 user attempts to post Company 2 invoice -> 400
+        res = self.client.post("/api/accounting/receivables/post-invoice/", {
+            "invoice_id": inv_comp2.id
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Company 1 user attempts to query Company 2 customer statement -> 400
+        res2 = self.client.get(f"/api/accounting/receivables/customer/{self.customer_comp2.id}/statement/")
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unauthorized_user_denied_ar_access(self):
+        self.client.force_authenticate(user=self.store_user)
+        res = self.client.get("/api/accounting/receivables/summary/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_invalid_payment_amounts_rejected(self):
+        inv = Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 1, 10), total_amount=Decimal("100.00"),
+            status="open",
+        )
+
+        # Negative amount
+        res1 = self.client.post("/api/accounting/receivables/record-payment/", {
+            "customer_id": self.customer1.id,
+            "amount": "-50.00",
+            "allocations": [{"invoice_id": inv.id, "amount": "-50.00"}]
+        }, format="json")
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Amount exceeding balance due
+        res2 = self.client.post("/api/accounting/receivables/record-payment/", {
+            "customer_id": self.customer1.id,
+            "amount": "250.00",
+            "allocations": [{"invoice_id": inv.id, "amount": "250.00"}]
+        }, format="json")
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("exceeds balance due", str(res2.data).lower())
+
+
+
 
