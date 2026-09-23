@@ -96,7 +96,8 @@ class ItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
 class WarehouseViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
-    queryset = Warehouse.objects.all()
+    # Serializer nests stock rows + item names — prefetch to avoid N+1.
+    queryset = Warehouse.objects.prefetch_related('stock_set__item')
     serializer_class = WarehouseSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
 
@@ -233,7 +234,7 @@ class CycleCountViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
 class StockViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "item__company"
-    queryset = Stock.objects.all()
+    queryset = Stock.objects.select_related('item', 'warehouse')
     serializer_class = StockSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
 

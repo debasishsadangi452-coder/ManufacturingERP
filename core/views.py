@@ -84,6 +84,17 @@ def poll_changes(request):
     since_change = int(request.query_params.get('since', 0))
     since_notif  = int(request.query_params.get('nonce', 0))
 
+    # First poll from a client (since=-1, no cursor yet): hand back the current high-water
+    # marks instead of replaying history — replaying old events makes the client
+    # invalidate every query on page load, restarting in-flight fetches.
+    if since_change < 0:
+        latest_change = DataChangeEvent.objects.order_by('-id').values_list('id', flat=True).first() or 0
+        latest_notif = Notification.objects.order_by('-id').values_list('id', flat=True).first() or 0
+        return Response({
+            'changes': [], 'notifications': [],
+            'latest_change_id': latest_change, 'latest_notif_id': latest_notif,
+        })
+
     if user.role == 'admin':
         change_qs = DataChangeEvent.objects.filter(id__gt=since_change).order_by('id')[:50]
         notif_qs  = Notification.objects.filter(id__gt=since_notif, company=user.company).order_by('id')[:20]
