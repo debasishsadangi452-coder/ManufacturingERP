@@ -318,3 +318,17 @@ QUICKBOOKS_CONFIG = {
     ),
 }
 
+# SendGrid (contact / demo request form on the marketing site).
+# Sent over HTTPS instead of raw SMTP — Railway (and most PaaS hosts) block
+# outbound SMTP ports by default, which used to hang requests until gunicorn's
+# worker timeout killed them. `from` must be a Single Sender verified in the
+# SendGrid dashboard, or sends are rejected.
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "hello@venusglobaltech.com")
+CONTACT_RECIPIENT_EMAILS = [
+    e.strip() for e in os.getenv(
+        "CONTACT_RECIPIENT_EMAILS", "hello@venusglobaltech.com"
+    ).split()
+    if e.strip()
+]
+

@@ -1,7 +1,12 @@
+import json
+import urllib.request
+import urllib.error
+
+from django.conf import settings
 from django.db.utils import NotSupportedError
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from .models import Notification, AuditLog, DataChangeEvent
 from .serializers import NotificationSerializer, AuditLogSerializer
@@ -123,3 +128,58 @@ def poll_changes(request):
         for n in notif_qs
     ]
     return Response({'changes': changes, 'notifications': notifications})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def contact_request(request):
+    """Marketing-site demo request form (public, unauthenticated)."""
+    data = request.data
+    full_name = (data.get('fullName') or '').strip()
+    work_email = (data.get('workEmail') or '').strip()
+
+    if not full_name or not work_email:
+        return Response({'success': False, 'error': 'fullName and workEmail are required'}, status=400)
+
+    company = data.get('company') or 'N/A'
+    phone = data.get('phone') or 'N/A'
+    where_today = data.get('whereToday') or 'N/A'
+    focus_area = data.get('focusArea') or 'None provided'
+
+    subject = f"[VGT ERP AI] New Demo Request - {full_name} ({company})"
+    body = (
+        f"New Lead: {full_name}\n"
+        f"Company: {company}\n"
+        f"Work Email: {work_email}\n"
+        f"Phone: {phone}\n"
+        f"Where are you today: {where_today}\n"
+        f"Focus area: {focus_area}\n"
+    )
+
+    payload = json.dumps({
+        'personalizations': [{
+            'to': [{'email': email} for email in settings.CONTACT_RECIPIENT_EMAILS],
+        }],
+        'from': {'email': settings.SENDGRID_FROM_EMAIL, 'name': 'VGT ERP AI'},
+        'subject': subject,
+        'content': [{'type': 'text/plain', 'value': body}],
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        'https://api.sendgrid.com/v3/mail/send',
+        data=payload,
+        method='POST',
+        headers={
+            'Authorization': f'Bearer {settings.SENDGRID_API_KEY}',
+            'Content-Type': 'application/json',
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        return Response({'success': True})
+    except urllib.error.HTTPError as exc:
+        return Response({'success': False, 'error': exc.read().decode('utf-8', 'ignore')}, status=502)
+    except Exception as exc:
+        return Response({'success': False, 'error': str(exc)}, status=502)
