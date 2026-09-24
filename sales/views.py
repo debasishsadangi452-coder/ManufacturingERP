@@ -386,6 +386,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             }, status=status.HTTP_400_BAD_REQUEST)
 
         # Deduct finished goods from inventory
+        shipped_lines = []
         for order_item in order.salesorderitem_set.all():
             qty_needed = order_item.quantity - order_item.shipped_quantity
             if qty_needed <= 0:
@@ -403,6 +404,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     )
                     order_item.shipped_quantity += qty_needed
                     order_item.save()
+                    shipped_lines.append({"item_id": order_item.item_id, "quantity": qty_needed})
                 except ValueError as e:
                     return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -427,6 +429,9 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             company=order.customer.company,
             module="inventory",
         )
+
+        from accounting.auto_posting import queue_auto_post
+        queue_auto_post("sales_shipment", company, order.id, request.user, {"lines": shipped_lines})
 
         log_activity(request.user, "Sales", "Fulfill Sales Order", f"SO #{order.id} fulfilled and delivered. Items: {', '.join([f'{oi.quantity} x {oi.item.name}' for oi in order.salesorderitem_set.all()])}")
         return Response({"status": "delivered", "message": f"SO#{order.id} fulfilled and marked as delivered."})
@@ -459,6 +464,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return Response({"error": "No items with a valid ship quantity provided."}, status=status.HTTP_400_BAD_REQUEST)
 
         shipped_summary = []
+        shipped_lines = []
         remaining_summary = []
         fully_fulfilled = True
 
@@ -504,6 +510,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
                 order_item.shipped_quantity += ship_qty
                 order_item.save()
+                shipped_lines.append({"item_id": order_item.item_id, "quantity": ship_qty})
 
             shipped_summary.append(f"{ship_qty} {order_item.item.unit} of {order_item.item.name}")
 
@@ -536,6 +543,9 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 progress=20,
                 driver="Partial LTL Route"
             )
+
+        from accounting.auto_posting import queue_auto_post
+        queue_auto_post("sales_shipment", order.customer.company, order.id, request.user, {"lines": shipped_lines})
 
         send_notification(
             "store",
@@ -611,6 +621,9 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         if connection:
             safe_push(connection, "invoice", invoice)
 
+        from accounting.auto_posting import queue_auto_post
+        queue_auto_post("sales_invoice", invoice.company, invoice.id, request.user)
+
         log_activity(request.user, "Sales", "Generate Invoice", f"Generated INV-{invoice.id} for SO #{order.id} (total: {invoice.total_amount})")
         return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
 
@@ -667,6 +680,9 @@ class InvoiceViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
         if connection:
             safe_push(connection, "payment", payment)
 
+        from accounting.auto_posting import queue_auto_post
+        queue_auto_post("customer_payment", invoice.company, payment.id, request.user)
+
         log_activity(request.user, "Sales", "Record Payment", f"Recorded payment of {amount} against INV-{invoice.id} ({invoice.status})")
         return Response({
             "payment": CustomerPaymentSerializer(payment).data,
@@ -721,6 +737,12 @@ class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         # Update order status
         order.status = "shipped"
         order.save()
+
+        from accounting.auto_posting import queue_auto_post
+        queue_auto_post(
+            "sales_shipment", order.customer.company, order.id, self.request.user,
+            {"lines": [{"item_id": i.item_id, "quantity": i.quantity} for i in order.salesorderitem_set.all()]},
+        )
 
 
 class InboundOrderEmailViewSet(CompanyScopedMixin, viewsets.ModelViewSet):

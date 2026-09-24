@@ -54,3 +54,47 @@ There were no merge conflicts. The two commits already on `main` (`core/views.py
 - Smoke-tested on localhost: the backend on `:8000` and the frontend on `:8080` both started. Existing `/api/sales/` and `/api/procurement/` return 200. `/api/accounting/*` returns 401 without a token, which is expected.
 - No new environment variables or Python dependencies are needed.
 - To roll back the code: `git reset --hard pre-accounting-merge`. If the migrations have already run, first run `migrate procurement 0009`, then `migrate accounting zero`.
+
+## Follow-up: Automatic GL posting
+
+Operational events now post to the General Ledger automatically. Sales orders and purchase orders are commitments, so they are **not** posted. The books change when goods or money move:
+
+| Event (where it fires) | Journal entry |
+|---|---|
+| Goods received against a PO (`procurement` goods receipt) | Dr 1210 Raw Materials Inventory / Cr 2050 Goods Received Not Invoiced |
+| Vendor bill from a PO (`bills/from_purchase_order`) | Dr 2050 GRNI (or 1210 if the goods weren't received first) / Cr 2010 Accounts Payable |
+| Production order completed | Dr 1220 WIP / Cr 1210 Raw Materials, then Dr 1230 Finished Goods / Cr 1220 WIP |
+| SO fulfilled, partially fulfilled, or shipment created | Dr 5050 Cost of Goods Sold / Cr 1230 Finished Goods (Cr 1210 for bought-in items with no recipe) |
+| Sales invoice generated from an SO | Dr 1100 Accounts Receivable / Cr 4010 Sales |
+| Customer payment recorded on an invoice | Dr 1010 Operating Bank / Cr 1100 Accounts Receivable |
+
+Costing uses standard material cost: `Item.purchase_cost`, and for manufactured items the recipe's ingredient cost per finished unit (batch cost ÷ batch size).
+
+**Files**
+
+| File | Change |
+|---|---|
+| `accounting/auto_posting.py` (new) | Event handlers, `queue_auto_post()`, logging and retry |
+| `accounting/models.py`, `migrations/0003_auto_posting.py` | `AccountingSettings.auto_post_enabled` (default on) and a new `AutoPostingLog` table |
+| `accounting/views.py`, `serializers.py`, `urls.py` | `GET /api/accounting/auto-posting/`, `POST .../{id}/retry/`, `POST .../retry_failed/`; `auto_post_enabled` added to settings |
+| `accounting/seeds.py` | Standard chart gains `2050 GRNI` and `5050 Cost of Goods Sold - Finished Goods`. Companies seeded earlier get these accounts created automatically the first time they're needed. |
+| `accounting/payables.py` | Manual bill posting now debits GRNI instead of inventory when the PO's goods receipt was already posted, so inventory isn't counted twice |
+| `sales/views.py`, `procurement/views.py`, `production/views.py` | One `queue_auto_post(...)` call after each event above, next to the existing QuickBooks push |
+| `accounting/test_auto_posting.py` (new) | 7 end-to-end tests that drive the real endpoints |
+
+**How existing workflows are protected**
+
+- Posting runs with `transaction.on_commit`, **after** the sale, receipt or production run has been saved. It cannot roll back or block them.
+- It never raises into the calling view. Every attempt is written to `AutoPostingLog` as posted, skipped or failed. Failed attempts can be retried from Accounting → Accounting Settings.
+- It only runs for companies that have a chart of accounts and have `auto_post_enabled` switched on. Companies that don't use the Accounting module see no change.
+- It won't post the same event twice. Duplicate events are logged as "skipped".
+- Balance updates made while posting don't trigger QuickBooks pushes.
+
+**Verification:** 150 tests pass (the 143 existing tests plus 7 new ones) across accounting, procurement, sales, production, quickbooks, accounts, inventory and finance. The migration was applied to the local DB, and the backend was smoke-tested on localhost.
+
+**Deployment:** one additive migration (`accounting.0003`: one new column with a default, one new table). It does not lock existing tables.
+
+**Known limits:**
+- Purchase price variance (the bill total differing from the PO/receipt value) isn't split out.
+- Items with no `purchase_cost` post nothing for cost-of-goods and production, and are logged as "skipped".
+- Events from before this change are not back-posted. Use the manual AR/AP/Sales tabs for those.

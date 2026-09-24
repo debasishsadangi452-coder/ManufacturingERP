@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .models import FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings
+from .models import FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings, AutoPostingLog
 
 
 class FiscalYearSerializer(serializers.ModelSerializer):
@@ -197,6 +197,7 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "retained_earnings_account_name",
             "lock_date",
             "allow_direct_posting_to_parent_accounts",
+            "auto_post_enabled",
             "created_at",
             "updated_at",
         ]
@@ -357,3 +358,21 @@ class JournalEntrySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(msg)
 
 
+class AutoPostingLogSerializer(serializers.ModelSerializer):
+    journal_entry_number = serializers.ReadOnlyField(source="journal_entry.entry_number")
+
+    class Meta:
+        model = AutoPostingLog
+        fields = [
+            "id",
+            "event",
+            "source_id",
+            "status",
+            "message",
+            "journal_entry",
+            "journal_entry_number",
+            "attempts",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields

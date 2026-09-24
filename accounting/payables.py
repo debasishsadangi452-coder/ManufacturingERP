@@ -170,6 +170,13 @@ def post_bill_to_ap(bill_id, user, company, expense_account_id=None):
             ))
 
         ap_account = get_ap_account(company)
+        if expense_account_id is None:
+            # Goods already capitalised to inventory at receipt (auto-posted GRN)
+            # must clear the GRNI accrual instead of debiting inventory twice.
+            from accounting.auto_posting import grni_account_for_bill
+            grni = grni_account_for_bill(bill)
+            if grni:
+                expense_account_id = grni.id
         expense_account = get_bill_expense_account(company, account_id=expense_account_id)
 
         # Create draft journal entry

@@ -996,3 +996,39 @@ class SalesAccountingViewSet(viewsets.ViewSet):
 
 
 
+
+
+# ==========================================
+# GL Auto-Posting (operational events -> GL)
+# ==========================================
+from django.core.exceptions import ValidationError as DjangoValidationError
+from .models import AutoPostingLog
+from .serializers import AutoPostingLogSerializer
+from .auto_posting import retry_auto_post
+
+
+class AutoPostingLogViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    """Audit trail of automatic postings, with retry for failed ones."""
+    company_field = "company"
+    queryset = AutoPostingLog.objects.select_related("journal_entry").all()
+    serializer_class = AutoPostingLogSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["status", "event"]
+    ordering = ["-created_at"]
+
+    @action(detail=True, methods=["post"])
+    def retry(self, request, pk=None):
+        log = self.get_object()
+        try:
+            log = retry_auto_post(log, user=request.user)
+        except DjangoValidationError as e:
+            return Response({"error": " ".join(e.messages)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(log).data)
+
+    @action(detail=False, methods=["post"])
+    def retry_failed(self, request):
+        results = {"posted": 0, "skipped": 0, "failed": 0}
+        for log in self.get_queryset().filter(status="failed"):
+            results[retry_auto_post(log, user=request.user).status] += 1
+        return Response(results)

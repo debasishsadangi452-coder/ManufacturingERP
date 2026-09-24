@@ -82,6 +82,7 @@ def seed_standard_chart_of_accounts(company):
         # --- 2000: LIABILITIES ---
         ("2000", "Current Liabilities", "Accounts Payable", None, "Header for all short-term obligations"),
         ("2010", "Accounts Payable (Trade Vendors)", "Accounts Payable", "2000", "Amounts due to material and packaging suppliers"),
+        ("2050", "Goods Received Not Invoiced (GRNI)", "Accrued Expenses & Other Current Liabilities", "2000", "Accrual for goods received against a PO but not yet billed by the vendor"),
         ("2100", "Accrued Payroll & Wages", "Accrued Expenses & Other Current Liabilities", "2000", "Unpaid accrued employee compensation"),
         ("2110", "Accrued Operating Expenses", "Accrued Expenses & Other Current Liabilities", "2000", "Accrued utilities, freight, and service invoices"),
         ("2500", "Long-Term Bank Loan", "Long-Term Debt", None, "Commercial bank facility for plant expansion"),
@@ -101,6 +102,7 @@ def seed_standard_chart_of_accounts(company):
         ("5000", "Cost of Goods Sold", "Cost of Goods Sold (Raw Materials)", None, "Total production cost header"),
         ("5010", "Direct Raw Materials Consumed", "Cost of Goods Sold (Raw Materials)", "5000", "Cost of syrup, billets, chemicals, concentrate used in recipes"),
         ("5020", "Direct Packaging Consumed", "Cost of Goods Sold (Raw Materials)", "5000", "Cost of bottles, cans, caps, boxes, pallets used in batches"),
+        ("5050", "Cost of Goods Sold - Finished Goods", "Cost of Goods Sold (Raw Materials)", "5000", "Standard cost of finished goods shipped to customers"),
         ("5100", "Direct Manufacturing Labor", "Cost of Goods Sold (Direct Labor)", "5000", "Direct hourly wages for line operators & technicians"),
         ("5200", "Factory Power & Utilities", "Cost of Goods Sold (Manufacturing Overhead)", "5000", "Electricity, gas, and water consumed in plant operations"),
         ("5210", "Factory Maintenance & Consumables", "Cost of Goods Sold (Manufacturing Overhead)", "5000", "Machine repair parts, lubricants, sanitation supplies"),

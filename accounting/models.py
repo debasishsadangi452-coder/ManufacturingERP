@@ -252,6 +252,11 @@ class AccountingSettings(models.Model):
         default=False,
         help_text="If false, entries can only be posted to leaf (non-parent) accounts."
     )
+    auto_post_enabled = models.BooleanField(
+        default=True,
+        help_text="Automatically post goods receipts, vendor bills, production, shipments, "
+                  "sales invoices and customer payments to the General Ledger."
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -579,3 +584,44 @@ class JournalEntryLine(models.Model):
         side = f"DR {self.debit:.2f}" if self.debit > 0 else f"CR {self.credit:.2f}"
         return f"Line {self.line_number}: {self.account.code} - {side}"
 
+
+
+class AutoPostingLog(models.Model):
+    """One row per automatic posting attempt triggered by an operational event
+    (see accounting/auto_posting.py). Failed rows can be retried."""
+
+    STATUS_CHOICES = [
+        ("posted", "Posted"),
+        ("skipped", "Skipped"),
+        ("failed", "Failed"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="+"
+    )
+    event = models.CharField(max_length=40, db_index=True)
+    source_id = models.PositiveIntegerField()
+    payload = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES)
+    message = models.TextField(blank=True)
+    journal_entry = models.ForeignKey(
+        JournalEntry,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    attempts = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"], name="acct_autopost_status_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.event} #{self.source_id} ({self.status})"

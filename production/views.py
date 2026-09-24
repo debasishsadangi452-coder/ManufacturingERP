@@ -308,6 +308,10 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 # Update status
                 order.status = "completed"
                 order.save()
+
+                # Posted to the GL after this transaction commits.
+                from accounting.auto_posting import queue_auto_post
+                queue_auto_post("production_completed", recipe.product.company, order.id, request.user)
                 log_activity(request.user, "Production", "Complete Production Order", f"Completed PO #{order.id}: {order.quantity} x '{order.recipe.product.name}' added to inventory (materials_reserved={order.materials_reserved})")
 
         except (ValidationError, ValueError) as e:

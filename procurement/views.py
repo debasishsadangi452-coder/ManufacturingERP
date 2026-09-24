@@ -424,6 +424,9 @@ class BillViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
         if connection:
             safe_push(connection, "bill", bill)
 
+        from accounting.auto_posting import queue_auto_post
+        queue_auto_post("vendor_bill", bill.company, bill.id, request.user)
+
         log_activity(
             request.user, "Procurement", "Record Bill",
             f"Recorded bill '{bill.bill_number or bill.id}' for PO #{po.id} (total: {bill.total_amount})"
@@ -465,6 +468,8 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         po.save()
         from finance.services import record_procurement_cost
         record_procurement_cost(po, user=self.request.user)
+        from accounting.auto_posting import queue_auto_post
+        queue_auto_post("goods_receipt", po.vendor.company, receipt.id, self.request.user)
 
         # Close the loop back to production. Material was procured because a
         # production order was short of it; now that it has landed, the people
