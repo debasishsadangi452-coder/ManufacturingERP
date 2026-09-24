@@ -992,6 +992,141 @@ class SalesAccountingViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+from .purchase_accounting import (
+    get_purchase_accounting_summary,
+    get_purchase_accounting_bills,
+    get_purchase_accounting_preview,
+    post_purchase_to_accounting,
+    reverse_purchase_accounting,
+)
+
+
+class PurchaseAccountingViewSet(viewsets.ViewSet):
+    """
+    Purchase-to-Accounting Subledger API (Blueprint Section No. 13).
+    Connects operational procurement vendor bills, line items, material/expense allocation,
+    input tax accounting, and Accounts Payable directly to the Double-Entry Engine (#8) and General Ledger (#9).
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/purchases/summary/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        as_of_date = request.query_params.get("as_of_date")
+        try:
+            res = get_purchase_accounting_summary(company=company, as_of_date=as_of_date)
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="bills")
+    def bills(self, request):
+        """GET /api/accounting/purchases/bills/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        search = request.query_params.get("search")
+        status_filter = request.query_params.get("status")
+        posted_filter = request.query_params.get("posted")
+        try:
+            res = get_purchase_accounting_bills(
+                company=company,
+                search=search,
+                status_filter=status_filter,
+                posted_filter=posted_filter,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="preview")
+    def preview(self, request, pk=None):
+        """POST /api/accounting/purchases/{id}/preview/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        expense_account_id = request.data.get("expense_account_id")
+        tax_account_id = request.data.get("tax_account_id")
+        tax_amount = request.data.get("tax_amount")
+        try:
+            res = get_purchase_accounting_preview(
+                bill_id=pk,
+                company=company,
+                expense_account_id=expense_account_id,
+                tax_account_id=tax_account_id,
+                tax_amount=tax_amount,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="post")
+    def post_bill(self, request, pk=None):
+        """POST /api/accounting/purchases/{id}/post/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        expense_account_id = request.data.get("expense_account_id")
+        tax_account_id = request.data.get("tax_account_id")
+        tax_amount = request.data.get("tax_amount")
+        try:
+            posted_je = post_purchase_to_accounting(
+                bill_id=pk,
+                user=request.user,
+                company=company,
+                expense_account_id=expense_account_id,
+                tax_account_id=tax_account_id,
+                tax_amount=tax_amount,
+            )
+            return Response({
+                "message": f"Bill #{pk} posted successfully to General Ledger.",
+                "journal_entry_id": posted_je.id,
+                "journal_entry_number": posted_je.entry_number,
+                "transaction_date": posted_je.transaction_date.isoformat(),
+                "status": posted_je.status,
+            }, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reverse")
+    def reverse_bill(self, request, pk=None):
+        """POST /api/accounting/purchases/{id}/reverse/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        reason = request.data.get("reason", "")
+        try:
+            res = reverse_purchase_accounting(
+                bill_id=pk,
+                user=request.user,
+                company=company,
+                reason=reason,
+            )
+            reversal_je = res.get("reversal_journal_entry")
+            return Response({
+                "message": f"Bill #{pk} reversed and cancelled successfully.",
+                "bill_id": res["bill_id"],
+                "status": res["status"],
+                "reversal_journal_entry_id": reversal_je.id if reversal_je else None,
+                "reversal_journal_entry_number": reversal_je.entry_number if reversal_je else None,
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
 
 
 

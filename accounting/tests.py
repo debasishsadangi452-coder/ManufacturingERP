@@ -1931,6 +1931,427 @@ class SalesAccountingTests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class PurchaseAccountingTests(APITestCase):
+    """
+    Test suite for Master Accounting Blueprint Section #13: Purchase-to-Accounting.
+    Covers operational vendor bill posting, preview calculation, material/expense allocation,
+    input tax recoverable, reversal/cancellation, GL integration, and security controls.
+    """
+
+    def setUp(self):
+        # 1. Tenants
+        self.comp1 = Company.objects.create(name="Brewing Master Co", slug="brewmaster")
+        self.comp2 = Company.objects.create(name="Competitor Distilling", slug="compdist")
+
+        # 2. Users
+        self.finance_user = User.objects.create_user(
+            username="purchfin",
+            email="fin@purchmaster.com",
+            role="finance",
+            company=self.comp1,
+            password="pass"
+        )
+        self.store_user = User.objects.create_user(
+            username="purchstore",
+            email="store@purchmaster.com",
+            role="store_manager",
+            company=self.comp1,
+            password="pass"
+        )
+        self.comp2_user = User.objects.create_user(
+            username="comp2purchfin",
+            email="fin@compdistpurch.com",
+            role="finance",
+            company=self.comp2,
+            password="pass"
+        )
+
+        # 3. Seed Accounts & Fiscal Year
+        seed_standard_chart_of_accounts(self.comp1)
+        seed_standard_fiscal_year(self.comp1, 2026)
+        seed_standard_chart_of_accounts(self.comp2)
+        seed_standard_fiscal_year(self.comp2, 2026)
+
+        self.acc_ap = Account.objects.get(company=self.comp1, code="2010")
+        self.acc_inv = Account.objects.get(company=self.comp1, code="1210")
+        self.acc_bank = Account.objects.get(company=self.comp1, code="1010")
+
+        # 4. Vendors
+        from procurement.models import Vendor, Bill
+        self.vendor1 = Vendor.objects.create(
+            company=self.comp1,
+            name="Apex Hops & Barley Ltd",
+            email="hops@barley.com",
+            payment_terms="Net 30",
+        )
+        self.vendor_comp2 = Vendor.objects.create(
+            company=self.comp2,
+            name="Other Hops Corp",
+            email="other@hops.com",
+        )
+
+        self.client.force_authenticate(user=self.finance_user)
+
+    def test_purchase_accounting_preview_endpoint(self):
+        from procurement.models import Bill
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-PRV-100",
+            bill_date=date(2026, 2, 10),
+            due_date=date(2026, 3, 12),
+            total_amount=Decimal("1200.00"),
+            status="open",
+        )
+
+        # Preview with tax
+        res = self.client.post(f"/api/accounting/purchases/{bill.id}/preview/", {
+            "tax_amount": "120.00"
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+        self.assertTrue(data["is_balanced"])
+        self.assertEqual(data["total_debit"], 1200.00)
+        self.assertEqual(data["total_credit"], 1200.00)
+        self.assertEqual(data["net_purchase"], 1080.00)
+        self.assertEqual(data["tax_amount"], 120.00)
+        self.assertEqual(len(data["lines"]), 3)
+
+    def test_post_purchase_bill_creates_balanced_journal_entry(self):
+        from procurement.models import Bill
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-BAL-200",
+            bill_date=date(2026, 2, 10),
+            total_amount=Decimal("1500.00"),
+            status="open",
+        )
+
+        res = self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertIn("journal_entry_id", res.data)
+
+        je = JournalEntry.objects.get(pk=res.data["journal_entry_id"])
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.total_debit, Decimal("1500.00"))
+        self.assertEqual(je.total_credit, Decimal("1500.00"))
+
+        # Verify lines
+        lines = list(je.lines.order_by("line_number"))
+        self.assertEqual(len(lines), 2)
+        # Line 1: Purchase / Inventory Debit
+        self.assertEqual(lines[0].account.code, "1210")
+        self.assertEqual(lines[0].debit, Decimal("1500.00"))
+        self.assertEqual(lines[0].credit, Decimal("0.00"))
+        # Line 2: AP Credit
+        self.assertEqual(lines[1].account.code, "2010")
+        self.assertEqual(lines[1].debit, Decimal("0.00"))
+        self.assertEqual(lines[1].credit, Decimal("1500.00"))
+
+        # Vendor balance synced
+        self.vendor1.refresh_from_db()
+        self.assertEqual(self.vendor1.outstanding_balance, Decimal("1500.00"))
+
+    def test_post_purchase_bill_with_tax(self):
+        from procurement.models import Bill
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-TAX-300",
+            bill_date=date(2026, 2, 15),
+            total_amount=Decimal("1100.00"),
+            status="open",
+        )
+
+        res = self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {
+            "tax_amount": "100.00"
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        je = JournalEntry.objects.get(pk=res.data["journal_entry_id"])
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.total_debit, Decimal("1100.00"))
+        self.assertEqual(je.total_credit, Decimal("1100.00"))
+
+        lines = list(je.lines.order_by("line_number"))
+        self.assertEqual(len(lines), 3)
+
+        # Line 1: Raw Materials Debit = 1000
+        self.assertEqual(lines[0].account.code, "1210")
+        self.assertEqual(lines[0].debit, Decimal("1000.00"))
+        self.assertEqual(lines[0].credit, Decimal("0.00"))
+
+        # Line 2: Input Tax Recoverable Debit = 100
+        self.assertEqual(lines[1].account.code, "1310")
+        self.assertEqual(lines[1].debit, Decimal("100.00"))
+        self.assertEqual(lines[1].credit, Decimal("0.00"))
+
+        # Line 3: Accounts Payable Credit = 1100
+        self.assertEqual(lines[2].account.code, "2010")
+        self.assertEqual(lines[2].debit, Decimal("0.00"))
+        self.assertEqual(lines[2].credit, Decimal("1100.00"))
+
+    def test_duplicate_purchase_bill_posting_is_prevented(self):
+        from procurement.models import Bill
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-DUP-400",
+            bill_date=date(2026, 2, 12),
+            total_amount=Decimal("750.00"),
+            status="open",
+        )
+
+        res1 = self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {}, format="json")
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+
+        res2 = self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {}, format="json")
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been posted", str(res2.data).lower())
+
+    def test_posted_purchase_bill_flows_into_general_ledger(self):
+        from procurement.models import Bill
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-GL-500",
+            bill_date=date(2026, 2, 18),
+            total_amount=Decimal("2000.00"),
+            status="open",
+        )
+
+        self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {
+            "tax_amount": "200.00"
+        }, format="json")
+
+        # 1. GL Summary
+        gl_res = self.client.get("/api/accounting/general-ledger/summary/")
+        self.assertEqual(gl_res.status_code, status.HTTP_200_OK)
+        balances = {item["code"]: item for item in gl_res.data["accounts"]}
+
+        # Inventory (1210): Debit 1800, closing 1800
+        self.assertEqual(Decimal(balances["1210"]["period_debit"]), Decimal("1800.00"))
+        self.assertEqual(Decimal(balances["1210"]["closing_balance"]), Decimal("1800.00"))
+
+        # Input Tax (1310): Debit 200, closing 200
+        self.assertEqual(Decimal(balances["1310"]["period_debit"]), Decimal("200.00"))
+        self.assertEqual(Decimal(balances["1310"]["closing_balance"]), Decimal("200.00"))
+
+        # Accounts Payable (2010): Credit 2000, closing 2000
+        self.assertEqual(Decimal(balances["2010"]["period_credit"]), Decimal("2000.00"))
+        self.assertEqual(Decimal(balances["2010"]["closing_balance"]), Decimal("2000.00"))
+
+    def test_draft_or_unposted_purchase_bill_does_not_affect_gl(self):
+        from procurement.models import Bill
+        Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-DRAFT-600",
+            bill_date=date(2026, 2, 20),
+            total_amount=Decimal("3500.00"),
+            status="open",
+        )
+
+        gl_res = self.client.get("/api/accounting/general-ledger/summary/")
+        self.assertEqual(gl_res.status_code, status.HTTP_200_OK)
+        balances = {item["code"]: item for item in gl_res.data["accounts"]}
+        self.assertEqual(Decimal(balances["2010"]["closing_balance"]), Decimal("0.00"))
+        self.assertEqual(Decimal(balances["1210"]["closing_balance"]), Decimal("0.00"))
+
+    def test_reverse_purchase_bill_accounting(self):
+        from procurement.models import Bill
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-REV-700",
+            bill_date=date(2026, 2, 22),
+            total_amount=Decimal("800.00"),
+            status="open",
+        )
+
+        post_res = self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {}, format="json")
+        self.assertEqual(post_res.status_code, status.HTTP_201_CREATED)
+
+        # Now reverse
+        rev_res = self.client.post(f"/api/accounting/purchases/{bill.id}/reverse/", {
+            "reason": "Damaged goods returned to vendor"
+        }, format="json")
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "cancelled")
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.status, "cancelled")
+
+        # Check reversing journal entry
+        reversal_je_id = rev_res.data["reversal_journal_entry_id"]
+        reversal_je = JournalEntry.objects.get(pk=reversal_je_id)
+        self.assertEqual(reversal_je.status, "posted")
+        self.assertEqual(reversal_je.total_debit, Decimal("800.00"))
+        self.assertEqual(reversal_je.total_credit, Decimal("800.00"))
+
+        # GL Net Balance for AP and Inventory should now be 0
+        gl_res = self.client.get("/api/accounting/general-ledger/summary/")
+        balances = {item["code"]: item for item in gl_res.data["accounts"]}
+        self.assertEqual(Decimal(balances["2010"]["closing_balance"]), Decimal("0.00"))
+        self.assertEqual(Decimal(balances["1210"]["closing_balance"]), Decimal("0.00"))
+
+        # Vendor balance synced back to 0
+        self.vendor1.refresh_from_db()
+        self.assertEqual(self.vendor1.outstanding_balance, Decimal("0.00"))
+
+    def test_reversal_blocked_if_payments_already_applied(self):
+        from procurement.models import Bill
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-PMT-800",
+            bill_date=date(2026, 2, 25),
+            total_amount=Decimal("1000.00"),
+            status="open",
+        )
+        self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {}, format="json")
+
+        # Apply a payment
+        bill.apply_payment(Decimal("300.00"))
+
+        rev_res = self.client.post(f"/api/accounting/purchases/{bill.id}/reverse/", {
+            "reason": "Invalid attempt"
+        }, format="json")
+        self.assertEqual(rev_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("payments totaling", str(rev_res.data).lower())
+
+    def test_purchase_bill_settlement_with_ap_payment(self):
+        from procurement.models import Bill
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-SETTLE-900",
+            bill_date=date(2026, 2, 10),
+            total_amount=Decimal("1000.00"),
+            status="open",
+        )
+        self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {}, format="json")
+
+        # Settle via existing AP payment mechanism
+        pay_res = self.client.post("/api/accounting/payables/record-payment/", {
+            "vendor_id": self.vendor1.id,
+            "amount": "1000.00",
+            "bill_id": bill.id,
+            "method": "bank_transfer",
+        }, format="json")
+        self.assertEqual(pay_res.status_code, status.HTTP_201_CREATED)
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.status, "paid")
+        self.assertEqual(bill.balance_due, Decimal("0.00"))
+
+        self.vendor1.refresh_from_db()
+        self.assertEqual(self.vendor1.outstanding_balance, Decimal("0.00"))
+
+        # GL AP balance should return to 0
+        gl_res = self.client.get("/api/accounting/general-ledger/summary/")
+        balances = {item["code"]: item for item in gl_res.data["accounts"]}
+        self.assertEqual(Decimal(balances["2010"]["closing_balance"]), Decimal("0.00"))
+
+    def test_purchase_accounting_summary_metrics(self):
+        from procurement.models import Bill
+        # 1. Posted bill
+        bill1 = Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="BILL-SUM-1",
+            bill_date=date(2026, 2, 1), total_amount=Decimal("1000.00"), status="open",
+        )
+        self.client.post(f"/api/accounting/purchases/{bill1.id}/post/", {"tax_amount": "100.00"}, format="json")
+
+        # 2. Unposted bill
+        Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="BILL-SUM-2",
+            bill_date=date(2026, 2, 5), total_amount=Decimal("500.00"), status="open",
+        )
+
+        res = self.client.get("/api/accounting/purchases/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["total_bills_count"], 2)
+        self.assertEqual(Decimal(str(data["total_bills_amount"])), Decimal("1500.00"))
+        self.assertEqual(data["posted_bills_count"], 1)
+        self.assertEqual(Decimal(str(data["posted_bills_amount"])), Decimal("1000.00"))
+        self.assertEqual(data["unposted_bills_count"], 1)
+        self.assertEqual(Decimal(str(data["unposted_bills_amount"])), Decimal("500.00"))
+        self.assertEqual(Decimal(str(data["gl_purchase_expense"])), Decimal("900.00"))
+        self.assertEqual(Decimal(str(data["gl_input_tax"])), Decimal("100.00"))
+        self.assertEqual(Decimal(str(data["gl_accounts_payable"])), Decimal("1000.00"))
+
+    def test_purchase_accounting_bills_list(self):
+        from procurement.models import Bill
+        bill1 = Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="BILL-LIST-1",
+            bill_date=date(2026, 2, 1), total_amount=Decimal("1000.00"), status="open",
+        )
+        self.client.post(f"/api/accounting/purchases/{bill1.id}/post/", {}, format="json")
+
+        bill2 = Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="BILL-LIST-2",
+            bill_date=date(2026, 2, 5), total_amount=Decimal("500.00"), status="open",
+        )
+
+        res = self.client.get("/api/accounting/purchases/bills/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        items = {item["id"]: item for item in res.data}
+
+        self.assertEqual(items[bill1.id]["accounting_status"], "posted")
+        self.assertIsNotNone(items[bill1.id]["journal_entry"])
+        self.assertEqual(items[bill2.id]["accounting_status"], "not_posted")
+        self.assertIsNone(items[bill2.id]["journal_entry"])
+
+    def test_locked_period_blocks_purchase_bill_posting(self):
+        from procurement.models import Bill
+        # Close Period 02 (February 2026)
+        p2 = AccountingPeriod.objects.get(fiscal_year__company=self.comp1, period_number=2)
+        p2.status = "closed"
+        p2.save()
+
+        bill = Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="BILL-LCK-1",
+            bill_date=date(2026, 2, 10), total_amount=Decimal("1000.00"), status="open",
+        )
+
+        res = self.client.post(f"/api/accounting/purchases/{bill.id}/post/", {}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("closed", str(res.data).lower())
+
+    def test_multi_tenant_isolation_purchase_accounting(self):
+        from procurement.models import Bill
+        bill_comp2 = Bill.objects.create(
+            company=self.comp2, vendor=self.vendor_comp2,
+            bill_number="BILL-COMP2-1",
+            bill_date=date(2026, 2, 10), total_amount=Decimal("900.00"), status="open",
+        )
+
+        # Company 1 finance user cannot post Company 2 bill
+        res = self.client.post(f"/api/accounting/purchases/{bill_comp2.id}/post/", {}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not found", str(res.data).lower())
+
+        # Company 1 list does not include Company 2 bill
+        list_res = self.client.get("/api/accounting/purchases/bills/")
+        self.assertEqual(list_res.status_code, status.HTTP_200_OK)
+        comp1_bill_ids = [item["id"] for item in list_res.data]
+        self.assertNotIn(bill_comp2.id, comp1_bill_ids)
+
+    def test_unauthorized_user_forbidden(self):
+        self.client.force_authenticate(user=self.store_user)
+        res = self.client.get("/api/accounting/purchases/summary/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+
 
 
 

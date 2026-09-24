@@ -13,6 +13,7 @@ from .views import (
     AccountsReceivableViewSet,
     AccountsPayableViewSet,
     SalesAccountingViewSet,
+    PurchaseAccountingViewSet,
 )
 
 router = DefaultRouter()
@@ -28,6 +29,7 @@ router.register(r'general-ledger', GeneralLedgerViewSet, basename='accounting-ge
 router.register(r'receivables', AccountsReceivableViewSet, basename='accounting-receivables')
 router.register(r'payables', AccountsPayableViewSet, basename='accounting-payables')
 router.register(r'sales', SalesAccountingViewSet, basename='accounting-sales')
+router.register(r'purchases', PurchaseAccountingViewSet, basename='accounting-purchases')
 
 urlpatterns = [
     path('', include(router.urls)),
