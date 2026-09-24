@@ -746,8 +746,88 @@ def add_vendor_price(user, vendor_name, item_name, unit_price, lead_time_days=7)
     )})
 
 
+
+def schedule_procurement(user, item_name, quantity, order_date, vendor_name=None, repeat="none"):
+    """Schedule a purchase order to be placed automatically on `order_date`.
+    Returns a fixed template string."""
+    from datetime import date as _date
+    from django.core.exceptions import ValidationError
+    from procurement.models import ScheduledPurchaseOrder
+    from procurement.scheduled import resolve_vendor_price
+
+    if user.role not in ('admin', 'store'):
+        return json.dumps({"template": "PROCUREMENT · You are not authorized to schedule purchase orders."})
+    company = user.company
+    try:
+        qty = float(quantity)
+    except (TypeError, ValueError):
+        qty = 0
+    if qty <= 0:
+        return json.dumps({"template": "PROCUREMENT · Please specify a quantity greater than zero."})
+    try:
+        when = _date.fromisoformat(str(order_date)[:10])
+    except ValueError:
+        return json.dumps({"template": "PROCUREMENT · Please give the order date as YYYY-MM-DD."})
+    if when < timezone.localdate():
+        return json.dumps({"template": f"PROCUREMENT · {when} is in the past. Choose today or a future date."})
+    repeat = repeat if repeat in ("none", "weekly", "monthly") else "none"
+
+    item = Item.objects.filter(name__icontains=item_name, company=company, category="raw_material").first()
+    if not item:
+        return json.dumps({"template": (
+            f"PROCUREMENT · Item not found\nNo raw material matching '{item_name}' exists for {company}."
+        )})
+    vendor = None
+    if vendor_name:
+        vendor = Vendor.objects.filter(name__icontains=vendor_name, company=company).first()
+        if not vendor:
+            return json.dumps({"template": f"PROCUREMENT · Vendor '{vendor_name}' not found for {company}."})
+    try:
+        chosen_vendor, unit_price = resolve_vendor_price(company, item, vendor)
+    except ValidationError as e:
+        return json.dumps({"template": "PROCUREMENT · " + " ".join(e.messages)})
+
+    schedule = ScheduledPurchaseOrder.objects.create(
+        company=company, item=item, quantity=qty, vendor=vendor,
+        scheduled_date=when, repeat=repeat, created_by=user,
+    )
+    repeat_text = {"none": "Once", "weekly": "Every week", "monthly": "Every month"}[repeat]
+    vendor_text = vendor.name if vendor else f"Best price on the day (currently {chosen_vendor.name})"
+    return json.dumps({"template": (
+        f"PURCHASE ORDER SCHEDULED · #{schedule.id}\n"
+        f"Item        : {item.name}\n"
+        f"Quantity    : {qty:g} {item.unit}\n"
+        f"Order date  : {when:%d %b %Y}\n"
+        f"Repeat      : {repeat_text}\n"
+        f"Vendor      : {vendor_text}\n"
+        f"Est. total  : {unit_price * Decimal(str(qty)):.2f} at today's price\n\n"
+        f"The order will be placed automatically on that date. "
+        f"Manage it under AI Automation → Scheduled Orders."
+    )})
+
+
+def list_scheduled_procurements(user):
+    """Upcoming and recent scheduled purchase orders. Returns a fixed template string."""
+    from procurement.models import ScheduledPurchaseOrder
+
+    schedules = list(
+        ScheduledPurchaseOrder.objects.filter(company=user.company)
+        .exclude(status="cancelled").select_related("item", "vendor").order_by("scheduled_date")[:20]
+    )
+    if not schedules:
+        return json.dumps({"template": 'SCHEDULED ORDERS · None yet. Say e.g. "order 500 kg sugar on 2026-10-01".'})
+    lines = [
+        f"#{s.id}  {s.scheduled_date:%d %b %Y}  {s.quantity:g} {s.item.unit} {s.item.name}"
+        f"  · {s.vendor.name if s.vendor else 'best price'} · {s.get_repeat_display()} · {s.get_status_display()}"
+        for s in schedules
+    ]
+    return json.dumps({"template": "SCHEDULED ORDERS\n" + "\n".join(lines)})
+
+
 AGENT_TOOL_MAP = {
     "procure_item": procure_item,
+    "schedule_procurement": schedule_procurement,
+    "list_scheduled_procurements": list_scheduled_procurements,
     "receive_procurement": receive_procurement,
     "add_vendor_price": add_vendor_price,
     "predict_equipment_failure": predict_equipment_failure,
@@ -762,6 +842,32 @@ AGENT_TOOL_MAP = {
 }
 
 AGENT_TOOLS_DEFINITION = [
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_procurement",
+            "description": "Schedule a purchase order to be placed AUTOMATICALLY on a future date (optionally repeating weekly or monthly). Use when the user wants to order on/at/from a specific date rather than now. Convert relative dates (tomorrow, next Monday, 1st of next month) to YYYY-MM-DD using today's date. Relay the returned 'template' text verbatim.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {"type": "string", "description": "Raw material to order"},
+                    "quantity": {"type": "number", "description": "Quantity to order"},
+                    "order_date": {"type": "string", "description": "Date to place the order, YYYY-MM-DD"},
+                    "vendor_name": {"type": "string", "description": "Optional vendor; omit to use the best vendor price on the day"},
+                    "repeat": {"type": "string", "enum": ["none", "weekly", "monthly"], "description": "Repeat the order (default none)"},
+                },
+                "required": ["item_name", "quantity", "order_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_scheduled_procurements",
+            "description": "List upcoming and recent scheduled (automatic) purchase orders. Relay the returned 'template' text verbatim.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
     {
         "type": "function",
         "function": {

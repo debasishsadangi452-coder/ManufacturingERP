@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt,
-    Bill, BillLine, VendorEmail, VendorEmailAttachment,
+    Bill, BillLine, VendorEmail, VendorEmailAttachment, ScheduledPurchaseOrder,
 )
 from inventory.models import Item
 
@@ -151,3 +151,49 @@ class BillSerializer(serializers.ModelSerializer):
             "bill_date", "due_date", "total_amount", "status",
             "quickbooks_id", "quickbooks_last_synced_at", "created_at", "lines",
         ]
+
+
+class ScheduledPurchaseOrderSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source="item.name", read_only=True)
+    item_unit = serializers.CharField(source="item.unit", read_only=True)
+    vendor_name = serializers.CharField(source="vendor.name", read_only=True, default=None)
+    purchase_order_status = serializers.CharField(source="purchase_order.status", read_only=True, default=None)
+    created_by_name = serializers.CharField(source="created_by.username", read_only=True, default=None)
+
+    class Meta:
+        model = ScheduledPurchaseOrder
+        fields = [
+            "id", "item", "item_name", "item_unit", "quantity", "vendor", "vendor_name",
+            "scheduled_date", "repeat", "status", "notes", "purchase_order", "purchase_order_status",
+            "runs_count", "last_run_at", "last_message", "created_by_name", "created_at",
+        ]
+        read_only_fields = [
+            "status", "purchase_order", "runs_count", "last_run_at", "last_message", "created_at",
+        ]
+
+    def validate_quantity(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError("Quantity must be greater than zero.")
+        return value
+
+    def validate_scheduled_date(self, value):
+        from django.utils import timezone
+        if value < timezone.localdate():
+            raise serializers.ValidationError("Choose today or a future date.")
+        return value
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        company = getattr(getattr(request, "user", None), "company", None)
+        item = attrs.get("item", getattr(self.instance, "item", None))
+        vendor = attrs.get("vendor", getattr(self.instance, "vendor", None))
+        if company is not None:
+            if item is not None and item.company_id != company.id:
+                raise serializers.ValidationError({"item": "Item not found."})
+            if vendor is not None and vendor.company_id != company.id:
+                raise serializers.ValidationError({"vendor": "Vendor not found."})
+        if item is not None and item.category != "raw_material":
+            raise serializers.ValidationError({"item": "Only raw materials can be purchased from vendors."})
+        if self.instance is not None and self.instance.status not in ("scheduled", "failed"):
+            raise serializers.ValidationError(f"A {self.instance.status} schedule can no longer be changed.")
+        return attrs

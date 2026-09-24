@@ -60,9 +60,11 @@ AGENTS = {
             "Order 5000 Amber Glass Bottles",
             "What do we need to reorder?",
             "Receive PO 12",
+            "Order 500 kg sugar on the 1st of next month",
         ],
         "tools": [
             "procure_item", "receive_procurement", "add_vendor_price",
+            "schedule_procurement", "list_scheduled_procurements",
             "get_inventory_summary", "detect_reorder_needs", "recommend_suppliers",
             "list_vendors", "list_items", "list_warehouses",
         ],
@@ -76,6 +78,9 @@ AGENTS = {
             "2. If (and only if) procure_item's template reports a missing vendor/coupon price, ask the user "
             "for the vendor name and coupon price, then call add_vendor_price, then call procure_item again.\n"
             "3. To receive/confirm a PO -> call receive_procurement(po_id).\n"
+            "4. To order on a future date ('order X on <date>', 'every month') -> call "
+            "schedule_procurement(item_name, quantity, order_date as YYYY-MM-DD, vendor_name if given, repeat). "
+            "It is placed automatically on that date. To see schedules -> call list_scheduled_procurements.\n"
             "The tools return a fixed 'template' that is shown to the user directly — do all work via the tools."
         ),
     },
@@ -211,8 +216,9 @@ def get_agent_tools(slug):
 
 
 def build_system_prompt(slug):
+    from django.utils import timezone
     agent = get_agent(slug)
-    return agent["persona"] + BASE_RULES
+    return agent["persona"] + BASE_RULES + f"\n\nToday's date is {timezone.localdate():%A, %Y-%m-%d}."
 
 
 def agents_public_list():

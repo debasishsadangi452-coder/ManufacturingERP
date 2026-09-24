@@ -14,3 +14,8 @@ from django.core.wsgi import get_wsgi_application
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "freshfizz_erp.settings")
 
 application = get_wsgi_application()
+
+# Places scheduled purchase orders on their date (see procurement/scheduler.py).
+from procurement.scheduler import start_scheduler  # noqa: E402
+
+start_scheduler()

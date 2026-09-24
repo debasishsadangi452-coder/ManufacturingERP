@@ -264,3 +264,63 @@ class VendorPayment(models.Model):
 
     def __str__(self):
         return f"VPMT-{self.id} (${self.amount}) to {self.vendor.name}"
+
+
+class ScheduledPurchaseOrder(models.Model):
+    """A purchase the user wants placed automatically on a future date.
+
+    On `scheduled_date` the runner (procurement/scheduled.py) raises a real
+    PurchaseOrder at the vendor's price and places it — or sends it for admin
+    approval when the scheduler's approval limit doesn't cover it. Repeating
+    schedules then roll forward to their next date.
+    """
+
+    REPEAT_CHOICES = [
+        ("none", "Once"),
+        ("weekly", "Every week"),
+        ("monthly", "Every month"),
+    ]
+    STATUS_CHOICES = [
+        ("scheduled", "Scheduled"),
+        ("processing", "Processing"),
+        ("placed", "Placed"),
+        ("failed", "Failed"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    company = models.ForeignKey("accounts.Company", on_delete=models.CASCADE, related_name="+")
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name="scheduled_purchases")
+    quantity = models.FloatField()
+    # Null = use the cheapest active vendor price on file when the order is placed.
+    vendor = models.ForeignKey(
+        Vendor, null=True, blank=True, on_delete=models.SET_NULL, related_name="scheduled_purchases"
+    )
+    scheduled_date = models.DateField(db_index=True)
+    repeat = models.CharField(max_length=10, choices=REPEAT_CHOICES, default="none")
+    # Day of month monthly repeats return to (e.g. 31 -> 30 Apr, 31 May).
+    anchor_day = models.PositiveSmallIntegerField(null=True, blank=True)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default="scheduled", db_index=True)
+    notes = models.TextField(blank=True, default="")
+    # Most recent purchase order this schedule raised.
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    runs_count = models.PositiveIntegerField(default=0)
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    last_message = models.TextField(blank=True, default="")
+    created_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["scheduled_date", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.anchor_day is None and self.scheduled_date:
+            self.anchor_day = self.scheduled_date.day
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Scheduled {self.quantity:g} x {self.item.name} on {self.scheduled_date} ({self.status})"

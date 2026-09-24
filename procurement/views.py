@@ -8,12 +8,12 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import (
     Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt,
-    Bill, BillLine, VendorEmail,
+    Bill, BillLine, VendorEmail, ScheduledPurchaseOrder,
 )
 from .serializers import (
     VendorSerializer, VendorPriceListSerializer,
     PurchaseOrderSerializer, PurchaseOrderItemSerializer, GoodsReceiptSerializer,
-    BillSerializer, VendorEmailSerializer,
+    BillSerializer, VendorEmailSerializer, ScheduledPurchaseOrderSerializer,
 )
 from inventory.models import Item
 from inventory.serializers import ItemSerializer
@@ -573,3 +573,53 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             logging.getLogger(__name__).warning(
                 "Could not notify production for PO #%s", po.id, exc_info=True
             )
+
+
+class ScheduledPurchaseOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """Purchase orders to place automatically on a date (AI Procurement).
+
+    Deleting cancels the schedule (kept for history). Editing a failed schedule
+    re-arms it. `place_now` places it immediately instead of waiting."""
+    company_field = "company"
+    queryset = ScheduledPurchaseOrder.objects.select_related("item", "vendor", "purchase_order", "created_by")
+    serializer_class = ScheduledPurchaseOrderSerializer
+    permission_classes = [IsStore | IsAdmin]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["status", "item", "vendor"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def perform_create(self, serializer):
+        schedule = serializer.save(company=self.request.user.company, created_by=self.request.user)
+        log_activity(
+            self.request.user, "Procurement", "Schedule Purchase Order",
+            f"Scheduled {schedule.quantity:g} x {schedule.item.name} for {schedule.scheduled_date} ({schedule.get_repeat_display()})",
+        )
+
+    def perform_update(self, serializer):
+        extra = {"status": "scheduled"}
+        if "scheduled_date" in serializer.validated_data:
+            extra["anchor_day"] = serializer.validated_data["scheduled_date"].day
+        schedule = serializer.save(**extra)
+        log_activity(self.request.user, "Procurement", "Edit Scheduled Order",
+                     f"Scheduled order #{schedule.id} now {schedule.quantity:g} x {schedule.item.name} on {schedule.scheduled_date}")
+
+    def destroy(self, request, *args, **kwargs):
+        schedule = self.get_object()
+        if schedule.status not in ("scheduled", "failed"):
+            return Response({"error": f"A {schedule.status} schedule cannot be cancelled."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        schedule.status = "cancelled"
+        schedule.save(update_fields=["status", "updated_at"])
+        log_activity(request.user, "Procurement", "Cancel Scheduled Order", f"Cancelled scheduled order #{schedule.id}")
+        return Response(self.get_serializer(schedule).data)
+
+    @action(detail=True, methods=["post"])
+    def place_now(self, request, pk=None):
+        from .scheduled import claim, place_scheduled_order
+
+        schedule = self.get_object()
+        if not claim(schedule.id, from_statuses=("scheduled", "failed")):
+            return Response({"error": f"This schedule is {schedule.status} and cannot be placed now."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        schedule = place_scheduled_order(ScheduledPurchaseOrder.objects.get(pk=schedule.id))
+        return Response(self.get_serializer(schedule).data)

@@ -7,6 +7,7 @@ from .views import (
     GoodsReceiptViewSet,
     BillViewSet,
     VendorEmailViewSet,
+    ScheduledPurchaseOrderViewSet,
 )
 
 router = DefaultRouter()
@@ -17,5 +18,6 @@ router.register(r'purchase-order-items', PurchaseOrderItemViewSet)
 router.register(r'goods-receipts', GoodsReceiptViewSet)
 router.register(r'bills', BillViewSet)
 router.register(r'emails', VendorEmailViewSet)
+router.register(r'scheduled-orders', ScheduledPurchaseOrderViewSet)
 
 urlpatterns = router.urls

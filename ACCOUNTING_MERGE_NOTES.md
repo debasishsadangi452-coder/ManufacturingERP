@@ -117,3 +117,21 @@ Costing uses standard material cost: `Item.purchase_cost`, and for manufactured 
 - **Assigning ingredients to vendors.** This uses the existing `VendorPriceList` model and API: vendor + raw material + quoted unit price, minimum order and lead time, with one entry per vendor per ingredient. `procurement/serializers.py` now checks that the vendor and item belong to the requesting user's company. Before this, another company's IDs were accepted. Tests are in `procurement/test_vendor_prices.py` (2).
 - **Setting selling prices.** Previously a finished good's selling price could only be set when the item was created, and Sales users had no permission to edit items. The new `GET /api/sales/price-list/` returns every finished good with its selling price and standard cost. `PATCH /api/sales/price-list/{item_id}/` updates the **selling price only**. Sales, Finance and Admin can use it, and every change is written to the activity log. The item save pushes the new price to QuickBooks through the existing item sync. Tests are in `sales/test_price_list.py` (3).
 - There are no migrations.
+
+## Follow-up: Scheduled purchase orders (AI Procurement)
+
+Users can set an ingredient, a quantity and a date, and the purchase order is placed automatically on that date. A schedule can also repeat weekly or monthly.
+
+- **Model:** `procurement.ScheduledPurchaseOrder`, created by migration `procurement.0011` (one new table; existing tables are untouched).
+- **Placing** (`procurement/scheduled.py`):
+  - On the date, a real PO is raised at the chosen vendor's quoted price. If no vendor is chosen, the cheapest vendor quote on file that day is used.
+  - The PO is set to `ordered` and the vendor email is drafted, exactly like ordering by hand, when the person who scheduled it may approve that amount (an admin, or anyone within their `auto_approve_limit`). Otherwise the PO is raised as `pending` and admins are notified, so scheduling can't bypass approvals.
+  - Repeating schedules move on to their next date. Monthly repeats keep their day of the month (for example the 31st becomes the 30th in April). If the server was down for a while, only one catch-up order is placed.
+  - Failures, such as no vendor price on file, mark the schedule `failed` with the reason and notify the store. The user can fix the problem and click "place now", or edit the schedule to re-arm it.
+- **Runner:** `procurement/scheduler.py` is a background thread started from `wsgi.py`, so it only runs inside the web server (never in tests or management commands). It checks every `SCHEDULED_ORDERS_POLL_SECONDS` (default 300).
+  - Each schedule is claimed with an atomic UPDATE, so multiple gunicorn workers can never place it twice.
+  - Setting the variable to `0` disables the thread. You can then run `python manage.py place_scheduled_orders` from cron instead.
+  - The date follows `TIME_ZONE = "UTC"`, so orders are placed from 00:00 UTC (05:30 IST) on their date.
+- **API:** `/api/procurement/scheduled-orders/` supports list, create and edit, DELETE (which cancels and keeps history), and `POST {id}/place_now/`. It is open to Store and Admin users and scoped to the company.
+- **AI Procurement:** new tools `schedule_procurement` (for requests like "order 500 kg sugar on the 1st of next month", optionally weekly or monthly) and `list_scheduled_procurements`. Today's date is now added to every AI agent's system prompt, so relative dates resolve correctly.
+- **Tests:** `procurement/test_scheduled_orders.py` (8). I also verified it live: a server started against a copy of the DB placed a due schedule by itself (PO-0071, `ordered`, 40 × $2.00).
