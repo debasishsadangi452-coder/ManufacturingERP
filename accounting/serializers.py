@@ -196,6 +196,16 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
     inventory_adjustment_account_name = serializers.ReadOnlyField(source="inventory_adjustment_account.name")
     inventory_write_off_account_code = serializers.ReadOnlyField(source="inventory_write_off_account.code")
     inventory_write_off_account_name = serializers.ReadOnlyField(source="inventory_write_off_account.name")
+    manufacturing_wip_account_code = serializers.ReadOnlyField(source="manufacturing_wip_account.code")
+    manufacturing_wip_account_name = serializers.ReadOnlyField(source="manufacturing_wip_account.name")
+    manufacturing_labor_account_code = serializers.ReadOnlyField(source="manufacturing_labor_account.code")
+    manufacturing_labor_account_name = serializers.ReadOnlyField(source="manufacturing_labor_account.name")
+    manufacturing_overhead_account_code = serializers.ReadOnlyField(source="manufacturing_overhead_account.code")
+    manufacturing_overhead_account_name = serializers.ReadOnlyField(source="manufacturing_overhead_account.name")
+    manufacturing_scrap_account_code = serializers.ReadOnlyField(source="manufacturing_scrap_account.code")
+    manufacturing_scrap_account_name = serializers.ReadOnlyField(source="manufacturing_scrap_account.name")
+    manufacturing_variance_account_code = serializers.ReadOnlyField(source="manufacturing_variance_account.code")
+    manufacturing_variance_account_name = serializers.ReadOnlyField(source="manufacturing_variance_account.name")
 
     class Meta:
         model = AccountingSettings
@@ -229,6 +239,29 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "inventory_write_off_account",
             "inventory_write_off_account_code",
             "inventory_write_off_account_name",
+            "manufacturing_accounting_enabled",
+            "wip_accounting_enabled",
+            "labor_accounting_enabled",
+            "overhead_accounting_enabled",
+            "scrap_accounting_enabled",
+            "variance_accounting_enabled",
+            "labor_rate_per_unit",
+            "overhead_rate_per_unit",
+            "manufacturing_wip_account",
+            "manufacturing_wip_account_code",
+            "manufacturing_wip_account_name",
+            "manufacturing_labor_account",
+            "manufacturing_labor_account_code",
+            "manufacturing_labor_account_name",
+            "manufacturing_overhead_account",
+            "manufacturing_overhead_account_code",
+            "manufacturing_overhead_account_name",
+            "manufacturing_scrap_account",
+            "manufacturing_scrap_account_code",
+            "manufacturing_scrap_account_name",
+            "manufacturing_variance_account",
+            "manufacturing_variance_account_code",
+            "manufacturing_variance_account_name",
             "created_at",
             "updated_at",
         ]
@@ -249,6 +282,16 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "inventory_adjustment_account_name",
             "inventory_write_off_account_code",
             "inventory_write_off_account_name",
+            "manufacturing_wip_account_code",
+            "manufacturing_wip_account_name",
+            "manufacturing_labor_account_code",
+            "manufacturing_labor_account_name",
+            "manufacturing_overhead_account_code",
+            "manufacturing_overhead_account_name",
+            "manufacturing_scrap_account_code",
+            "manufacturing_scrap_account_name",
+            "manufacturing_variance_account_code",
+            "manufacturing_variance_account_name",
             "created_at",
             "updated_at",
         ]

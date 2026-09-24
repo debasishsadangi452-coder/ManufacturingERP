@@ -1,3 +1,4 @@
+from decimal import Decimal
 from django.db import models
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
@@ -315,6 +316,83 @@ class AccountingSettings(models.Model):
         related_name="+",
         help_text="Expense account for damaged/expired inventory write-offs (e.g. 6520 Inventory Write-off)"
     )
+    # Section #15 — Manufacturing Accounting Policy Configuration
+    manufacturing_accounting_enabled = models.BooleanField(
+        default=True,
+        help_text="Enable or disable automated/subledger manufacturing accounting."
+    )
+    wip_accounting_enabled = models.BooleanField(
+        default=True,
+        help_text="Track Work-In-Process (WIP) asset balance during active production."
+    )
+    labor_accounting_enabled = models.BooleanField(
+        default=False,
+        help_text="Capitalize direct labor into WIP costs."
+    )
+    overhead_accounting_enabled = models.BooleanField(
+        default=False,
+        help_text="Apply manufacturing overhead into WIP costs."
+    )
+    scrap_accounting_enabled = models.BooleanField(
+        default=True,
+        help_text="Account for production scrap and rejected batches."
+    )
+    variance_accounting_enabled = models.BooleanField(
+        default=True,
+        help_text="Calculate and record manufacturing variances upon order completion."
+    )
+    labor_rate_per_unit = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Standard direct labor cost per finished unit produced."
+    )
+    overhead_rate_per_unit = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Standard applied manufacturing overhead per finished unit produced."
+    )
+    manufacturing_wip_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Asset account for Work-In-Progress (e.g. 1220 WIP)"
+    )
+    manufacturing_labor_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Clearing or expense account for direct labor (e.g. 2100 Accrued Payroll or 5100 Direct Labor)"
+    )
+    manufacturing_overhead_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Clearing or applied account for factory overhead (e.g. 5040 Overhead Applied or 5200 Factory Utilities)"
+    )
+    manufacturing_scrap_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Expense account for production scrap and defectives (e.g. 5080 Scrap Loss or 6520 Inventory Loss)"
+    )
+    manufacturing_variance_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Account for manufacturing cost variances (e.g. 5090 Manufacturing Variance)"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -337,6 +415,11 @@ class AccountingSettings(models.Model):
             ("inventory_cogs_account", self.inventory_cogs_account),
             ("inventory_adjustment_account", self.inventory_adjustment_account),
             ("inventory_write_off_account", self.inventory_write_off_account),
+            ("manufacturing_wip_account", self.manufacturing_wip_account),
+            ("manufacturing_labor_account", self.manufacturing_labor_account),
+            ("manufacturing_overhead_account", self.manufacturing_overhead_account),
+            ("manufacturing_scrap_account", self.manufacturing_scrap_account),
+            ("manufacturing_variance_account", self.manufacturing_variance_account),
         ]
         for field_name, acc in inv_account_fields:
             if acc and self.company_id and acc.company_id != self.company_id:

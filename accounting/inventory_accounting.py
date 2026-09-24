@@ -423,6 +423,21 @@ def determine_movement_accounting_requirement(movement, company):
     if ref.startswith("transfer to") or ref.startswith("transfer from") or "transfer #" in ref:
         return False, "Internal warehouse transfer preserves total inventory asset valuation - no redundant GL entry required.", "transfer_internal"
 
+    # Production Orders: If this movement is part of a Production Order that has already been accounted
+    # under Manufacturing-to-Accounting (Section #15), prevent duplicate GL entries.
+    if "production #" in ref:
+        import re
+        m = re.search(r"production #(\d+)", ref)
+        if m:
+            order_id = int(m.group(1))
+            if JournalEntry.objects.filter(
+                company=company,
+                source_module="manufacturing",
+                source_id=order_id,
+                status="posted",
+            ).exists():
+                return False, f"Already accounted under Manufacturing-to-Accounting for Production Order #{order_id} to prevent duplicate GL impact.", "production_order"
+
     # Write-off: Scrapped / expired / damaged stock
     if "write-off" in ref or "write off" in ref or "scrap" in ref or "damaged" in ref or "expired" in ref:
         return True, "Inventory write-off / scrap loss", "write_off"

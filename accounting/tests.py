@@ -3,6 +3,7 @@ from django.core.exceptions import ValidationError
 from rest_framework.test import APIClient, APITestCase
 from rest_framework import status
 from datetime import date
+from django.db.models import Sum
 from accounts.models import Company, User
 from .models import FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings
 from .seeds import (
@@ -10,6 +11,7 @@ from .seeds import (
     seed_standard_chart_of_accounts,
     seed_standard_fiscal_year,
 )
+from production.models import Recipe, RecipeIngredient, ProductionOrder
 
 
 class AccountingModelTests(TestCase):
@@ -2741,6 +2743,425 @@ class InventoryAccountingAPITests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
         self.assertEqual(res.data["delta_amount"], 60.0)
         self.assertEqual(res.data["new_unit_cost"], 18.0)
+
+
+# ==============================================================================
+# SECTION #15: MANUFACTURING-TO-ACCOUNTING INTEGRATION TESTS
+# ==============================================================================
+
+class ManufacturingAccountingTests(TestCase):
+    """
+    Unit & integration tests for Blueprint Section No. 15 (Manufacturing-to-Accounting).
+    Tests production order cost calculation, BOM material consumption, direct labor,
+    applied overhead, WIP asset accumulation, finished goods completion, scrap loss,
+    cost variance adjustments, idempotency, and audit traceability.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="BrewCraft Manufacturing Corp", slug="brewcraft-mfg")
+        ensure_account_types()
+        self.user = User.objects.create_user(
+            username="mfg_accountant",
+            email="mfg@brewcraft.com",
+            password="password123",
+            company=self.company,
+        )
+        self.fy = seed_standard_fiscal_year(self.company, 2026)
+        seed_standard_chart_of_accounts(self.company)
+
+        self.settings = AccountingSettings.objects.get(company=self.company)
+        self.settings.manufacturing_accounting_enabled = True
+        self.settings.wip_accounting_enabled = True
+        self.settings.labor_accounting_enabled = True
+        self.settings.overhead_accounting_enabled = True
+        self.settings.labor_rate_per_unit = Decimal("2.00")
+        self.settings.overhead_rate_per_unit = Decimal("1.50")
+        self.settings.save()
+
+        self.warehouse = Warehouse.objects.create(company=self.company, name="Mount Kisco Production Facility")
+        
+        # Raw materials
+        self.malt = Item.objects.create(
+            name="Organic Barley Malt",
+            sku="RAW-MALT-01",
+            category="raw_material",
+            purchase_cost=Decimal("4.00"),
+            company=self.company,
+        )
+        self.hops = Item.objects.create(
+            name="Cascade Hops",
+            sku="RAW-HOPS-01",
+            category="raw_material",
+            purchase_cost=Decimal("10.00"),
+            company=self.company,
+        )
+        # Finished Good
+        self.beer = Item.objects.create(
+            name="Craft Amber Ale 24pk",
+            sku="FG-ALE-24",
+            category="finished_good",
+            selling_price=Decimal("45.00"),
+            company=self.company,
+        )
+
+        # Recipe: 1 batch = 50 units
+        # Consumes 20 kg malt and 2 kg hops per batch
+        self.recipe = Recipe.objects.create(product=self.beer, batch_size=50)
+        self.ing1 = RecipeIngredient.objects.create(recipe=self.recipe, item=self.malt, quantity=20.0)
+        self.ing2 = RecipeIngredient.objects.create(recipe=self.recipe, item=self.hops, quantity=2.0)
+
+        # Production Order: 100 units (2 batches)
+        # Required: 40 kg malt ($160.00) + 4 kg hops ($40.00) = $200.00 Material Cost
+        # Labor: 100 * $2.00 = $200.00
+        # Overhead: 100 * $1.50 = $150.00
+        # Total Production Cost: $550.00 ($5.50/unit)
+        self.order = ProductionOrder.objects.create(
+            recipe=self.recipe,
+            quantity=100.0,
+            warehouse=self.warehouse,
+            status="completed",
+        )
+
+    def test_manufacturing_accounting_policy_resolution(self):
+        from accounting.manufacturing_accounting import (
+            get_manufacturing_policy,
+            resolve_manufacturing_wip_account,
+            resolve_manufacturing_raw_material_account,
+            resolve_manufacturing_finished_goods_account,
+            resolve_manufacturing_labor_account,
+            resolve_manufacturing_overhead_account,
+            resolve_manufacturing_scrap_account,
+            resolve_manufacturing_variance_account,
+        )
+        policy = get_manufacturing_policy(self.company)
+        self.assertTrue(policy["enabled"])
+        self.assertTrue(policy["wip_enabled"])
+        self.assertTrue(policy["labor_enabled"])
+        self.assertTrue(policy["overhead_enabled"])
+        self.assertEqual(policy["labor_rate_per_unit"], Decimal("2.00"))
+        self.assertEqual(policy["overhead_rate_per_unit"], Decimal("1.50"))
+
+        wip = resolve_manufacturing_wip_account(self.company)
+        self.assertEqual(wip.code, "1220")
+        self.assertFalse(wip.is_header)
+
+        raw = resolve_manufacturing_raw_material_account(self.malt, self.company)
+        self.assertEqual(raw.code, "1210")
+
+        fg = resolve_manufacturing_finished_goods_account(self.beer, self.company)
+        self.assertEqual(fg.code, "1230")
+
+        labor = resolve_manufacturing_labor_account(self.company)
+        self.assertIn(labor.code, ["2100", "5100"])
+
+        overhead = resolve_manufacturing_overhead_account(self.company)
+        self.assertIn(overhead.code, ["5040", "5200"])
+
+        scrap = resolve_manufacturing_scrap_account(self.company)
+        self.assertIn(scrap.code, ["5080", "6520"])
+
+        var = resolve_manufacturing_variance_account(self.company)
+        self.assertEqual(var.code, "5090")
+
+    def test_cost_calculation_from_bom_and_valuation(self):
+        from accounting.manufacturing_accounting import calculate_production_order_costs
+
+        costs = calculate_production_order_costs(self.order, self.company)
+        self.assertEqual(costs["planned_quantity"], 100.0)
+        self.assertEqual(costs["batches"], 2)
+        self.assertEqual(costs["total_material_cost"], Decimal("200.00"))
+        self.assertEqual(costs["labor_cost"], Decimal("200.00"))
+        self.assertEqual(costs["overhead_cost"], Decimal("150.00"))
+        self.assertEqual(costs["total_production_cost"], Decimal("550.00"))
+        self.assertEqual(costs["unit_production_cost"], Decimal("5.5000"))
+
+    def test_manufacturing_preview_and_posting_full_completion(self):
+        from accounting.manufacturing_accounting import (
+            get_manufacturing_accounting_preview,
+            post_manufacturing_accounting,
+        )
+
+        preview = get_manufacturing_accounting_preview(self.order.id, self.company)
+        self.assertTrue(preview["is_balanced"])
+        self.assertEqual(preview["costs"]["total_production_cost"], 550.0)
+        self.assertEqual(preview["costs"]["finished_goods_value"], 550.0)
+        self.assertEqual(preview["costs"]["remaining_wip_balance"], 0.0)
+
+        # Post to accounting
+        je, created = post_manufacturing_accounting(
+            self.order.id,
+            self.company,
+            user=self.user,
+            notes="Full batch run posted",
+        )
+        self.assertTrue(created)
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.source_module, "manufacturing")
+        self.assertEqual(je.source_id, self.order.id)
+        self.assertEqual(je.reference, f"MFG-PO-{self.order.id}")
+
+        # Check GL lines
+        lines = je.lines.all()
+        # Finished Goods Inventory (1230) debited for $550.00
+        fg_line = lines.filter(account__code="1230", debit__gt=0).first()
+        self.assertIsNotNone(fg_line)
+        self.assertEqual(fg_line.debit, Decimal("550.00"))
+
+        # Raw Material Inventory (1210) credited for $200.00
+        raw_lines_credit = lines.filter(account__code="1210").aggregate(s=Sum("credit"))["s"]
+        self.assertEqual(raw_lines_credit, Decimal("200.00"))
+
+        # Labor clearing credited for $200.00
+        labor_cr = lines.filter(account__code__in=["2100", "5100"], credit__gt=0).first()
+        self.assertIsNotNone(labor_cr)
+        self.assertEqual(labor_cr.credit, Decimal("200.00"))
+
+        # Overhead clearing credited for $150.00
+        oh_cr = lines.filter(account__code__in=["5040", "5200"], credit__gt=0).first()
+        self.assertIsNotNone(oh_cr)
+        self.assertEqual(oh_cr.credit, Decimal("150.00"))
+
+        # WIP lines: DR $550 (materials $200 + labor $200 + overhead $150) and CR $550 (to FG)
+        wip_dr = lines.filter(account__code="1220").aggregate(s=Sum("debit"))["s"]
+        wip_cr = lines.filter(account__code="1220").aggregate(s=Sum("credit"))["s"]
+        self.assertEqual(wip_dr, Decimal("550.00"))
+        self.assertEqual(wip_cr, Decimal("550.00"))
+
+    def test_partial_production_completion_preserves_remaining_wip(self):
+        from accounting.manufacturing_accounting import (
+            get_manufacturing_accounting_preview,
+            post_manufacturing_accounting,
+        )
+
+        # Complete only 60 units out of 100 planned
+        # 60 units * $5.50/unit = $330.00 transferred to FG
+        # Remaining 40 units * $5.50/unit = $220.00 preserved in WIP
+        preview = get_manufacturing_accounting_preview(
+            self.order.id,
+            self.company,
+            completed_qty=60.0,
+        )
+        self.assertTrue(preview["is_balanced"])
+        self.assertEqual(preview["costs"]["finished_goods_value"], 330.0)
+        self.assertEqual(preview["costs"]["remaining_wip_balance"], 220.0)
+
+        je, created = post_manufacturing_accounting(
+            self.order.id,
+            self.company,
+            user=self.user,
+            completed_qty=60.0,
+        )
+        self.assertTrue(created)
+
+        # FG debited for $330.00
+        fg_line = je.lines.filter(account__code="1230", debit__gt=0).first()
+        self.assertEqual(fg_line.debit, Decimal("330.00"))
+
+        # WIP debited for full cost ($550.00) and credited only for completed portion ($330.00)
+        wip_dr = je.lines.filter(account__code="1220").aggregate(s=Sum("debit"))["s"]
+        wip_cr = je.lines.filter(account__code="1220").aggregate(s=Sum("credit"))["s"]
+        self.assertEqual(wip_dr, Decimal("550.00"))
+        self.assertEqual(wip_cr, Decimal("330.00"))
+        # Net balance remaining in WIP = $220.00
+        self.assertEqual(wip_dr - wip_cr, Decimal("220.00"))
+
+    def test_production_scrap_loss_accounting(self):
+        from accounting.manufacturing_accounting import (
+            get_manufacturing_accounting_preview,
+            post_manufacturing_accounting,
+        )
+
+        # 90 completed, 10 scrapped = 100 total
+        # FG = 90 * $5.50 = $495.00
+        # Scrap Loss = 10 * $5.50 = $55.00
+        preview = get_manufacturing_accounting_preview(
+            self.order.id,
+            self.company,
+            completed_qty=90.0,
+            scrap_qty=10.0,
+        )
+        self.assertTrue(preview["is_balanced"])
+        self.assertEqual(preview["costs"]["finished_goods_value"], 495.0)
+        self.assertEqual(preview["costs"]["scrap_value"], 55.0)
+
+        je, created = post_manufacturing_accounting(
+            self.order.id,
+            self.company,
+            user=self.user,
+            completed_qty=90.0,
+            scrap_qty=10.0,
+        )
+        self.assertTrue(created)
+
+        scrap_line = je.lines.filter(account__code__in=["5080", "6520"], debit__gt=0).first()
+        self.assertIsNotNone(scrap_line)
+        self.assertEqual(scrap_line.debit, Decimal("55.00"))
+
+    def test_manufacturing_variance_adjustment(self):
+        from accounting.manufacturing_accounting import post_manufacturing_variance_adjustment
+
+        # Unfavorable variance of $25.00
+        var_je = post_manufacturing_variance_adjustment(
+            self.order.id,
+            self.company,
+            user=self.user,
+            variance_amount="25.00",
+            reason="Unfavorable malt price variance",
+        )
+        self.assertEqual(var_je.status, "posted")
+        var_dr = var_je.lines.filter(account__code="5090", debit__gt=0).first()
+        wip_cr = var_je.lines.filter(account__code="1220", credit__gt=0).first()
+        self.assertEqual(var_dr.debit, Decimal("25.00"))
+        self.assertEqual(wip_cr.credit, Decimal("25.00"))
+
+    def test_manufacturing_accounting_idempotency(self):
+        from accounting.manufacturing_accounting import post_manufacturing_accounting
+
+        je1, created1 = post_manufacturing_accounting(self.order.id, self.company, user=self.user)
+        self.assertTrue(created1)
+
+        # Repeated post should not create another journal entry
+        je2, created2 = post_manufacturing_accounting(self.order.id, self.company, user=self.user)
+        self.assertFalse(created2)
+        self.assertEqual(je1.id, je2.id)
+
+    def test_manufacturing_accounting_reversal(self):
+        from accounting.manufacturing_accounting import (
+            post_manufacturing_accounting,
+            reverse_manufacturing_accounting,
+        )
+
+        je, _ = post_manufacturing_accounting(self.order.id, self.company, user=self.user)
+        self.assertEqual(je.status, "posted")
+
+        rev_je = reverse_manufacturing_accounting(
+            self.order.id,
+            self.company,
+            user=self.user,
+            reason="Order cancelled after QA audit",
+        )
+        self.assertEqual(rev_je.status, "posted")
+        self.assertEqual(rev_je.reversal_of, je)
+        je.refresh_from_db()
+        self.assertEqual(je.status, "reversed")
+
+    def test_no_duplicate_gl_from_inventory_out_movement(self):
+        from inventory.services import increase_stock, decrease_stock
+        from accounting.manufacturing_accounting import post_manufacturing_accounting
+        from accounting.inventory_accounting import determine_movement_accounting_requirement
+
+        # Post manufacturing entry for order
+        post_manufacturing_accounting(self.order.id, self.company, user=self.user)
+
+        # Inventory movement created for this production order with stock available
+        increase_stock(self.malt, self.warehouse, 100, user=self.user, reference="Initial Malt Stock")
+        decrease_stock(self.malt, self.warehouse, 40, user=self.user, reference=f"Production #{self.order.id}")
+        mov = StockMovement.objects.filter(reference=f"Production #{self.order.id}").latest("created_at")
+
+        # Inventory requirement check detects order is already accounted in manufacturing
+        req, reason, subtype = determine_movement_accounting_requirement(mov, self.company)
+        self.assertFalse(req)
+        self.assertEqual(subtype, "production_order")
+        self.assertIn("already accounted under manufacturing", reason.lower())
+
+
+class ManufacturingAccountingAPITests(APITestCase):
+    """
+    REST API tests for /api/accounting/manufacturing/ endpoints.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="BrewCraft API Corp", slug="brewcraft-api")
+        ensure_account_types()
+        self.user = User.objects.create_user(
+            username="mfg_api_user",
+            email="mfg_api@brewcraft.com",
+            password="password123",
+            company=self.company,
+        )
+        self.client.force_authenticate(user=self.user)
+
+        seed_standard_fiscal_year(self.company, 2026)
+        seed_standard_chart_of_accounts(self.company)
+
+        self.settings = AccountingSettings.objects.get_or_create(
+            company=self.company,
+            defaults={"manufacturing_accounting_enabled": True, "wip_accounting_enabled": True},
+        )[0]
+        self.settings.manufacturing_accounting_enabled = True
+        self.settings.wip_accounting_enabled = True
+        self.settings.save()
+
+        self.warehouse = Warehouse.objects.create(company=self.company, name="Central Warehouse")
+        self.barley = Item.objects.create(
+            name="Roasted Barley",
+            sku="RAW-BARLEY",
+            category="raw_material",
+            purchase_cost=Decimal("5.00"),
+            company=self.company,
+        )
+        self.stout = Item.objects.create(
+            name="Imperial Stout 12pk",
+            sku="FG-STOUT-12",
+            category="finished_good",
+            selling_price=Decimal("40.00"),
+            company=self.company,
+        )
+        self.recipe = Recipe.objects.create(product=self.stout, batch_size=25)
+        RecipeIngredient.objects.create(recipe=self.recipe, item=self.barley, quantity=10.0)
+
+        self.order = ProductionOrder.objects.create(
+            recipe=self.recipe,
+            quantity=50.0,
+            warehouse=self.warehouse,
+            status="completed",
+        )
+
+    def test_manufacturing_summary_endpoint(self):
+        res = self.client.get("/api/accounting/manufacturing/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("active_wip_balance", res.data)
+        self.assertIn("finished_goods_value", res.data)
+        self.assertEqual(res.data["total_orders_count"], 1)
+
+    def test_manufacturing_orders_list_endpoint(self):
+        res = self.client.get("/api/accounting/manufacturing/orders/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["count"], 1)
+        first = res.data["results"][0]
+        self.assertEqual(first["id"], self.order.id)
+        self.assertEqual(first["product_name"], "Imperial Stout 12pk")
+        self.assertEqual(first["accounting_status"], "PENDING")
+
+    def test_manufacturing_preview_and_post_flow(self):
+        # 1. Preview
+        prev_res = self.client.post(f"/api/accounting/manufacturing/{self.order.id}/preview/")
+        self.assertEqual(prev_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(prev_res.data["is_balanced"])
+        self.assertEqual(prev_res.data["planned_quantity"], 50.0)
+
+        # 2. Post
+        post_res = self.client.post(f"/api/accounting/manufacturing/{self.order.id}/post/", {
+            "notes": "Posted batch via API",
+        })
+        self.assertEqual(post_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(post_res.data["status"], "posted")
+        je_id = post_res.data["journal_entry_id"]
+
+        # 3. Check updated status
+        orders_res = self.client.get("/api/accounting/manufacturing/orders/")
+        self.assertEqual(orders_res.status_code, status.HTTP_200_OK)
+        order_data = orders_res.data["results"][0]
+        self.assertEqual(order_data["accounting_status"], "POSTED")
+        self.assertEqual(order_data["journal_entry_id"], je_id)
+
+        # 4. Reverse
+        rev_res = self.client.post(f"/api/accounting/manufacturing/{self.order.id}/reverse/", {
+            "reason": "Test reversal API",
+        })
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "posted")
+
 
 
 

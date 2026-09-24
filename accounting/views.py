@@ -1328,6 +1328,273 @@ class InventoryAccountingViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+from .manufacturing_accounting import (
+    get_manufacturing_policy,
+    resolve_manufacturing_wip_account,
+    resolve_manufacturing_raw_material_account,
+    resolve_manufacturing_finished_goods_account,
+    resolve_manufacturing_labor_account,
+    resolve_manufacturing_overhead_account,
+    resolve_manufacturing_scrap_account,
+    resolve_manufacturing_variance_account,
+    calculate_production_order_costs,
+    get_manufacturing_accounting_preview,
+    post_manufacturing_accounting,
+    reverse_manufacturing_accounting,
+    post_manufacturing_variance_adjustment,
+    get_manufacturing_accounting_summary,
+    get_manufacturing_accounting_orders,
+)
+from production.models import ProductionOrder
+
+
+class ManufacturingAccountingViewSet(viewsets.ViewSet):
+    """
+    Manufacturing-to-Accounting Subledger API (Blueprint Section No. 15).
+    Connects production orders, BOM material consumption, direct labor, applied overhead,
+    WIP asset accumulation, finished goods completion, scrap loss, and cost variances
+    directly to the Double-Entry Engine (#8) and General Ledger (#9).
+    """
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/manufacturing/summary/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_manufacturing_accounting_summary(company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="orders")
+    def orders(self, request):
+        """GET /api/accounting/manufacturing/orders/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        status_filter = request.query_params.get("status")
+        accounting_status = request.query_params.get("accounting_status")
+        search = request.query_params.get("search")
+        try:
+            page = int(request.query_params.get("page", 1))
+            page_size = int(request.query_params.get("page_size", 20))
+        except ValueError:
+            page = 1
+            page_size = 20
+        try:
+            data = get_manufacturing_accounting_orders(
+                company=company,
+                status=status_filter,
+                accounting_status=accounting_status,
+                search=search,
+                page=page,
+                page_size=page_size,
+            )
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["get"], url_path="detail")
+    def detail_order(self, request, pk=None):
+        """GET /api/accounting/manufacturing/{id}/detail/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            order = ProductionOrder.objects.select_related("recipe__product", "warehouse", "line").get(
+                pk=pk,
+                recipe__product__company=company,
+            )
+            costs = calculate_production_order_costs(order, company)
+            je = JournalEntry.objects.filter(
+                company=company,
+                source_module="manufacturing",
+                source_id=order.id,
+            ).first()
+            return Response({
+                "id": order.id,
+                "product_id": order.recipe.product.id,
+                "product_name": order.recipe.product.name,
+                "sku": getattr(order.recipe.product, "sku", ""),
+                "warehouse_name": order.warehouse.name,
+                "line_name": order.line.name if order.line else None,
+                "status": order.status,
+                "planned_quantity": float(order.quantity),
+                "costs": {
+                    "total_material_cost": float(costs["total_material_cost"]),
+                    "labor_cost": float(costs["labor_cost"]),
+                    "overhead_cost": float(costs["overhead_cost"]),
+                    "total_production_cost": float(costs["total_production_cost"]),
+                    "unit_production_cost": float(costs["unit_production_cost"]),
+                    "materials": costs["materials"],
+                },
+                "journal_entry_id": je.id if je else None,
+                "journal_entry_number": je.entry_number if je else None,
+                "accounting_status": "POSTED" if (je and je.status == "posted") else ("REVERSED" if (je and je.status == "reversed") else "PENDING"),
+            }, status=status.HTTP_200_OK)
+        except ProductionOrder.DoesNotExist:
+            return Response({"error": f"Production order #{pk} not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="preview")
+    def preview(self, request, pk=None):
+        """POST /api/accounting/manufacturing/{id}/preview/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        completed_qty = request.data.get("completed_quantity")
+        scrap_qty = request.data.get("scrap_quantity")
+        labor_cost_override = request.data.get("labor_cost")
+        overhead_cost_override = request.data.get("overhead_cost")
+        try:
+            preview_data = get_manufacturing_accounting_preview(
+                order_id=pk,
+                company=company,
+                completed_qty=completed_qty,
+                scrap_qty=scrap_qty,
+                labor_cost_override=labor_cost_override,
+                overhead_cost_override=overhead_cost_override,
+            )
+            return Response(preview_data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="post")
+    def post_accounting(self, request, pk=None):
+        """POST /api/accounting/manufacturing/{id}/post/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        notes = request.data.get("notes")
+        completed_qty = request.data.get("completed_quantity")
+        scrap_qty = request.data.get("scrap_quantity")
+        labor_cost_override = request.data.get("labor_cost")
+        overhead_cost_override = request.data.get("overhead_cost")
+        accounting_date = request.data.get("accounting_date")
+        try:
+            posted_je, created = post_manufacturing_accounting(
+                order_id=pk,
+                company=company,
+                user=request.user,
+                notes=notes,
+                completed_qty=completed_qty,
+                scrap_qty=scrap_qty,
+                labor_cost_override=labor_cost_override,
+                overhead_cost_override=overhead_cost_override,
+                accounting_date=accounting_date,
+            )
+            return Response({
+                "message": "Manufacturing accounting posted successfully." if created else "Order already posted to accounting.",
+                "created": created,
+                "order_id": pk,
+                "journal_entry_id": posted_je.id,
+                "journal_entry_number": posted_je.entry_number,
+                "total_amount": float(posted_je.total_debit),
+                "status": posted_je.status,
+            }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reverse")
+    def reverse_accounting(self, request, pk=None):
+        """POST /api/accounting/manufacturing/{id}/reverse/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        reason = request.data.get("reason", "")
+        try:
+            reversal_je = reverse_manufacturing_accounting(
+                order_id=pk,
+                company=company,
+                user=request.user,
+                reason=reason,
+            )
+            return Response({
+                "message": "Manufacturing accounting reversed successfully.",
+                "order_id": pk,
+                "reversal_journal_entry_id": reversal_je.id,
+                "reversal_journal_entry_number": reversal_je.entry_number,
+                "status": reversal_je.status,
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="variance")
+    def variance(self, request, pk=None):
+        """POST /api/accounting/manufacturing/{id}/variance/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        variance_amount = request.data.get("variance_amount")
+        reason = request.data.get("reason", "")
+        if variance_amount is None:
+            return Response({"error": "variance_amount is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            var_je = post_manufacturing_variance_adjustment(
+                order_id=pk,
+                company=company,
+                user=request.user,
+                variance_amount=variance_amount,
+                reason=reason,
+            )
+            return Response({
+                "message": "Manufacturing variance adjustment posted successfully.",
+                "order_id": pk,
+                "journal_entry_id": var_je.id,
+                "journal_entry_number": var_je.entry_number,
+                "status": var_je.status,
+            }, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="settings")
+    def policy_settings(self, request):
+        """GET /api/accounting/manufacturing/settings/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            policy = get_manufacturing_policy(company)
+            wip_acc = resolve_manufacturing_wip_account(company)
+            raw_acc = resolve_manufacturing_raw_material_account(Item(category="raw_material"), company)
+            fg_acc = resolve_manufacturing_finished_goods_account(Item(category="finished_good"), company)
+            labor_acc = resolve_manufacturing_labor_account(company)
+            overhead_acc = resolve_manufacturing_overhead_account(company)
+            scrap_acc = resolve_manufacturing_scrap_account(company)
+            var_acc = resolve_manufacturing_variance_account(company)
+            return Response({
+                "policy": policy,
+                "resolved_accounts": {
+                    "wip": {"id": wip_acc.id, "code": wip_acc.code, "name": wip_acc.name},
+                    "raw_material": {"id": raw_acc.id, "code": raw_acc.code, "name": raw_acc.name},
+                    "finished_goods": {"id": fg_acc.id, "code": fg_acc.code, "name": fg_acc.name},
+                    "labor": {"id": labor_acc.id, "code": labor_acc.code, "name": labor_acc.name},
+                    "overhead": {"id": overhead_acc.id, "code": overhead_acc.code, "name": overhead_acc.name},
+                    "scrap": {"id": scrap_acc.id, "code": scrap_acc.code, "name": scrap_acc.name},
+                    "variance": {"id": var_acc.id, "code": var_acc.code, "name": var_acc.name},
+                }
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
 
 
 
