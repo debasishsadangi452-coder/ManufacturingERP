@@ -137,6 +137,7 @@ INSTALLED_APPS = [
     'logistics',
     'workforce',
     'finance',
+    'accounting',
     'django_filters',
     'ai_assistant',
     'quickbooks',
