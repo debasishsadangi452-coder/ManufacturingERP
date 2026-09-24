@@ -393,6 +393,55 @@ class AccountingSettings(models.Model):
         related_name="+",
         help_text="Account for manufacturing cost variances (e.g. 5090 Manufacturing Variance)"
     )
+    # Section #16 — Expenses Accounting Policy Configuration
+    expenses_accounting_enabled = models.BooleanField(
+        default=True,
+        help_text="Enable or disable automated/subledger expenses accounting."
+    )
+    expenses_require_approval = models.BooleanField(
+        default=True,
+        help_text="Require approval before expenses can be posted to the General Ledger."
+    )
+    expenses_default_cash_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf cash account for cash expenses (e.g. 1030 Petty Cash)"
+    )
+    expenses_default_bank_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf bank account for bank expenses (e.g. 1010 Operating Bank Account)"
+    )
+    expenses_default_payable_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf AP account for vendor expenses (e.g. 2010 Accounts Payable)"
+    )
+    expenses_default_employee_payable_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf payable account for employee reimbursements (e.g. 2100 Accrued Payroll/Reimbursements)"
+    )
+    expenses_default_tax_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf input tax recoverable account for expense taxes (e.g. 1310 Input Tax Recoverable)"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -407,7 +456,7 @@ class AccountingSettings(models.Model):
         if self.retained_earnings_account and self.company_id:
             if self.retained_earnings_account.company_id != self.company_id:
                 raise ValidationError({"retained_earnings_account": _("Retained earnings account must belong to this company.")})
-        # Validate inventory account company consistency
+        # Validate inventory and manufacturing account company consistency
         inv_account_fields = [
             ("inventory_raw_material_account", self.inventory_raw_material_account),
             ("inventory_finished_goods_account", self.inventory_finished_goods_account),
@@ -420,6 +469,11 @@ class AccountingSettings(models.Model):
             ("manufacturing_overhead_account", self.manufacturing_overhead_account),
             ("manufacturing_scrap_account", self.manufacturing_scrap_account),
             ("manufacturing_variance_account", self.manufacturing_variance_account),
+            ("expenses_default_cash_account", self.expenses_default_cash_account),
+            ("expenses_default_bank_account", self.expenses_default_bank_account),
+            ("expenses_default_payable_account", self.expenses_default_payable_account),
+            ("expenses_default_employee_payable_account", self.expenses_default_employee_payable_account),
+            ("expenses_default_tax_account", self.expenses_default_tax_account),
         ]
         for field_name, acc in inv_account_fields:
             if acc and self.company_id and acc.company_id != self.company_id:
@@ -736,4 +790,322 @@ class JournalEntryLine(models.Model):
     def __str__(self):
         side = f"DR {self.debit:.2f}" if self.debit > 0 else f"CR {self.credit:.2f}"
         return f"Line {self.line_number}: {self.account.code} - {side}"
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #16 — EXPENSES-TO-ACCOUNTING MODELS
+# ==============================================================================
+
+class ExpenseCategory(models.Model):
+    """
+    Configurable expense categories mapped to Chart of Accounts leaf expense accounts.
+    Enables automatic categorization and GL account resolution for operational expenses.
+    """
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="expense_categories",
+        help_text="Tenant company owning this expense category."
+    )
+    code = models.CharField(max_length=50, help_text="Unique category identifier, e.g. TRAVEL, MEALS, SOFTWARE")
+    name = models.CharField(max_length=150, help_text="Descriptive category name")
+    description = models.TextField(blank=True, default="")
+    expense_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="categorized_expenses",
+        help_text="Default leaf expense account mapped to this category (e.g. 6020 Sales/Travel, 6040 Software)"
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        unique_together = [("company", "code")]
+        verbose_name_plural = "Expense Categories"
+
+    def clean(self):
+        super().clean()
+        if self.expense_account_id and self.company_id:
+            if self.expense_account.company_id != self.company_id:
+                raise ValidationError({"expense_account": _("Expense account must belong to the same company.")})
+            if not self.expense_account.is_active:
+                raise ValidationError({"expense_account": _("Expense account must be active.")})
+            if self.expense_account.is_header:
+                raise ValidationError({"expense_account": _("Expense account must be a leaf account, not a header.")})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+
+class Expense(models.Model):
+    """
+    Controlled operational source document for employee reimbursements and vendor expenses.
+    Integrates receipt attachments, approval workflows, tax handling, payment sources,
+    and double-entry journal postings into the General Ledger.
+    """
+    EXPENSE_TYPE_CHOICES = [
+        ("employee", "Employee Expense"),
+        ("vendor", "Vendor Expense"),
+    ]
+    PAYMENT_SOURCE_CHOICES = [
+        ("cash", "Cash"),
+        ("bank", "Bank Transfer / Card"),
+        ("payable", "Payable / Reimbursement"),
+    ]
+    APPROVAL_STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("submitted", "Submitted"),
+        ("approved", "Approved"),
+        ("rejected", "Rejected"),
+        ("cancelled", "Cancelled"),
+    ]
+    ACCOUNTING_STATUS_CHOICES = [
+        ("not_ready", "Not Ready"),
+        ("ready", "Ready for GL"),
+        ("posted", "Posted to GL"),
+        ("reversed", "Reversed"),
+        ("failed", "Failed"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="accounting_expenses",
+        help_text="Tenant company context."
+    )
+    expense_number = models.CharField(max_length=64, db_index=True)
+    expense_type = models.CharField(max_length=20, choices=EXPENSE_TYPE_CHOICES, default="employee")
+    employee = models.ForeignKey(
+        "workforce.Employee",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="expenses",
+        help_text="Employee claiming reimbursement (for employee expenses)"
+    )
+    vendor = models.ForeignKey(
+        "procurement.Vendor",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="expenses",
+        help_text="Registered supplier (for vendor expenses)"
+    )
+    vendor_name_raw = models.CharField(max_length=255, blank=True, default="", help_text="Unregistered vendor name memo")
+    category = models.ForeignKey(
+        ExpenseCategory,
+        on_delete=models.PROTECT,
+        related_name="expenses",
+        help_text="Configured expense category defining default GL account mapping"
+    )
+    title = models.CharField(max_length=255, help_text="Summary title of the expense")
+    description = models.TextField(blank=True, default="")
+    expense_date = models.DateField(default=timezone.now)
+    accounting_date = models.DateField(null=True, blank=True, help_text="Accounting/posting date for GL recognition")
+    amount_before_tax = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    tax_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    currency = models.CharField(max_length=10, default="USD")
+
+    payment_source = models.CharField(max_length=20, choices=PAYMENT_SOURCE_CHOICES, default="payable")
+    expense_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Specific leaf expense account overriding category default"
+    )
+    tax_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Specific leaf input tax recoverable account"
+    )
+    payment_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Specific leaf cash, bank, or payable account"
+    )
+
+    approval_status = models.CharField(max_length=20, choices=APPROVAL_STATUS_CHOICES, default="draft")
+    accounting_status = models.CharField(max_length=20, choices=ACCOUNTING_STATUS_CHOICES, default="not_ready")
+
+    receipt = models.FileField(upload_to="expense_receipts/", null=True, blank=True)
+    receipt_name = models.CharField(max_length=255, blank=True, default="")
+    receipt_size = models.IntegerField(null=True, blank=True)
+    receipt_content_type = models.CharField(max_length=100, blank=True, default="")
+
+    notes = models.TextField(blank=True, default="")
+    rejection_reason = models.TextField(blank=True, default="")
+
+    journal_entry = models.ForeignKey(
+        JournalEntry,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="expenses",
+        help_text="Posted double-entry general ledger journal entry"
+    )
+    reversal_journal_entry = models.ForeignKey(
+        JournalEntry,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reversed_expenses",
+        help_text="Offsetting reversal journal entry if reversed"
+    )
+
+    created_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_expenses"
+    )
+    submitted_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="submitted_expenses"
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approved_expenses"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    posted_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="posted_expenses"
+    )
+    posted_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-expense_date", "-created_at"]
+        unique_together = [("company", "expense_number")]
+        indexes = [
+            models.Index(fields=["company", "expense_number"]),
+            models.Index(fields=["company", "approval_status"]),
+            models.Index(fields=["company", "accounting_status"]),
+            models.Index(fields=["company", "expense_date"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.amount_before_tax < Decimal("0.00"):
+            raise ValidationError({"amount_before_tax": _("Amount before tax cannot be negative.")})
+        if self.tax_amount < Decimal("0.00"):
+            raise ValidationError({"tax_amount": _("Tax amount cannot be negative.")})
+
+        # Company Tenancy validations
+        if self.employee_id and self.company_id and self.employee.company_id != self.company_id:
+            raise ValidationError({"employee": _("Employee belongs to a different company.")})
+        if self.vendor_id and self.company_id and self.vendor.company_id != self.company_id:
+            raise ValidationError({"vendor": _("Vendor belongs to a different company.")})
+        if self.category_id and self.company_id and self.category.company_id != self.company_id:
+            raise ValidationError({"category": _("Expense category belongs to a different company.")})
+        if self.expense_account_id and self.company_id and self.expense_account.company_id != self.company_id:
+            raise ValidationError({"expense_account": _("Expense account belongs to a different company.")})
+        if self.tax_account_id and self.company_id and self.tax_account.company_id != self.company_id:
+            raise ValidationError({"tax_account": _("Tax account belongs to a different company.")})
+        if self.payment_account_id and self.company_id and self.payment_account.company_id != self.company_id:
+            raise ValidationError({"payment_account": _("Payment account belongs to a different company.")})
+
+        # Leaf account validations
+        if self.expense_account:
+            if self.expense_account.is_header:
+                raise ValidationError({"expense_account": _("Expense account must be a leaf account, not a header.")})
+            if not self.expense_account.is_active:
+                raise ValidationError({"expense_account": _("Expense account is inactive.")})
+
+        if self.tax_account:
+            if self.tax_account.is_header:
+                raise ValidationError({"tax_account": _("Tax account must be a leaf account, not a header.")})
+            if not self.tax_account.is_active:
+                raise ValidationError({"tax_account": _("Tax account is inactive.")})
+
+        if self.payment_account:
+            if self.payment_account.is_header:
+                raise ValidationError({"payment_account": _("Payment account must be a leaf account, not a header.")})
+            if not self.payment_account.is_active:
+                raise ValidationError({"payment_account": _("Payment account is inactive.")})
+
+    def save(self, *args, **kwargs):
+        # Synchronize total_amount
+        before_tax = Decimal(str(self.amount_before_tax or 0))
+        tax = Decimal(str(self.tax_amount or 0))
+        self.total_amount = before_tax + tax
+
+        # Auto-generate expense_number if missing
+        if not self.expense_number:
+            company_id = self.company_id or 1
+            last = Expense.objects.filter(company_id=company_id).order_by("-id").first()
+            seq = (last.id + 1) if last else 1
+            self.expense_number = f"EXP-{company_id}-{seq:05d}"
+
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.expense_number} - {self.title} (${self.total_amount:.2f})"
+
+
+class ExpenseAuditLog(models.Model):
+    """
+    Immutable audit log tracking all operational and accounting events for an expense,
+    including creation, receipt attachments, approval transitions, prospective previews,
+    GL journal postings, and reversals.
+    """
+    expense = models.ForeignKey(
+        Expense,
+        on_delete=models.CASCADE,
+        related_name="audit_logs",
+        help_text="Parent expense record."
+    )
+    action = models.CharField(
+        max_length=50,
+        help_text="Action code, e.g. created, receipt_attached, submitted, approved, rejected, previewed, posted, reversed, cancelled"
+    )
+    actor = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="User executing the action"
+    )
+    details = models.JSONField(default=dict, blank=True, help_text="Structured event telemetry / state diff")
+    notes = models.TextField(blank=True, default="", help_text="User comments, approval remarks, or rejection reason")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Audit: {self.expense.expense_number} - {self.action} at {self.created_at}"
+
 

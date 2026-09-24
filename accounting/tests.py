@@ -3163,6 +3163,620 @@ class ManufacturingAccountingAPITests(APITestCase):
         self.assertEqual(rev_res.data["status"], "posted")
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #16 — EXPENSES-TO-ACCOUNTING TEST SUITE
+# ==============================================================================
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from workforce.models import Employee, Department
+from procurement.models import Vendor
+from accounting.models import Expense, ExpenseCategory, ExpenseAuditLog
+from accounting.expenses_accounting import (
+    seed_default_expense_categories,
+    get_expenses_policy,
+    resolve_expense_account,
+    resolve_tax_account,
+    resolve_payment_account,
+    submit_expense,
+    approve_expense,
+    reject_expense,
+    cancel_expense,
+    attach_receipt_to_expense,
+    get_expense_accounting_preview,
+    post_expense_accounting,
+    reverse_expense_accounting,
+    get_expenses_summary,
+)
+
+
+class ExpenseAccountingTests(TestCase):
+    """
+    Comprehensive unit tests for Section #16 Expenses-to-Accounting subledger:
+    Categories, account mapping, approval workflows, receipt handling, tax accounting,
+    payment sources, double-entry GL posting, idempotency, reversal, and period controls.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Stout Craft Breweries", slug="stoutcraft")
+        self.user = User.objects.create_user(
+            username="finance_auditor",
+            email="auditor@stoutcraft.com",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            expenses_accounting_enabled=True,
+            expenses_require_approval=True,
+        )
+        seed_standard_chart_of_accounts(self.company)
+        self.fy = seed_standard_fiscal_year(self.company, year=2026)
+        self.today = date(2026, 3, 15)
+
+        # Seed categories
+        seed_default_expense_categories(self.company)
+        self.travel_category = ExpenseCategory.objects.get(company=self.company, code="TRAVEL")
+        self.software_category = ExpenseCategory.objects.get(company=self.company, code="SOFTWARE")
+        self.office_category = ExpenseCategory.objects.get(company=self.company, code="OFFICE")
+
+        # Create workforce employee
+        self.department = Department.objects.create(company=self.company, name="Field Operations")
+        self.employee = Employee.objects.create(
+            company=self.company,
+            first_name="Marcus",
+            last_name="Vance",
+            email="marcus.vance@stoutcraft.com",
+            department=self.department,
+        )
+
+        # Create procurement vendor
+        self.vendor = Vendor.objects.create(
+            company=self.company,
+            name="Apex Cloud Services LLC",
+            email="billing@apexcloud.com",
+        )
+
+    def test_seed_default_categories(self):
+        """Verifies default categories are provisioned and mapped to leaf accounts."""
+        cats = ExpenseCategory.objects.filter(company=self.company)
+        self.assertGreaterEqual(cats.count(), 10)
+        travel = cats.filter(code="TRAVEL").first()
+        self.assertIsNotNone(travel)
+        self.assertIsNotNone(travel.expense_account)
+        self.assertFalse(travel.expense_account.is_header)
+
+    def test_employee_expense_creation_and_total_calculation(self):
+        """Tests that total_amount is automatically synchronized from pre-tax + tax."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Flight to Craft Beer Expo",
+            expense_date=self.today,
+            amount_before_tax=Decimal("450.00"),
+            tax_amount=Decimal("36.00"),
+            payment_source="payable",
+            created_by=self.user,
+        )
+        self.assertEqual(exp.total_amount, Decimal("486.00"))
+        self.assertTrue(exp.expense_number.startswith("EXP-"))
+        self.assertEqual(exp.approval_status, "draft")
+        self.assertEqual(exp.accounting_status, "not_ready")
+
+    def test_vendor_expense_creation(self):
+        """Tests vendor expense logging with custom raw vendor fallback."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="vendor",
+            vendor=self.vendor,
+            category=self.software_category,
+            title="Monthly ERP Server Hosting",
+            expense_date=self.today,
+            amount_before_tax=Decimal("1200.00"),
+            tax_amount=Decimal("0.00"),
+            payment_source="bank",
+            created_by=self.user,
+        )
+        self.assertEqual(exp.total_amount, Decimal("1200.00"))
+        self.assertEqual(exp.payment_source, "bank")
+
+    def test_approval_lifecycle_enforcement(self):
+        """
+        Draft and submitted expenses cannot be posted when approval is required.
+        Only approved expenses are eligible.
+        """
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Hotel Stay",
+            expense_date=self.today,
+            amount_before_tax=Decimal("300.00"),
+            tax_amount=Decimal("0.00"),
+            payment_source="payable",
+            created_by=self.user,
+        )
+
+        # 1. Draft cannot post
+        with self.assertRaises(ValidationError) as ctx:
+            post_expense_accounting(exp, user=self.user)
+        self.assertIn("cannot be posted in 'draft'", str(ctx.exception))
+
+        # 2. Submit for review
+        submit_expense(exp, user=self.user)
+        self.assertEqual(exp.approval_status, "submitted")
+
+        # 3. Submitted cannot post
+        with self.assertRaises(ValidationError) as ctx:
+            post_expense_accounting(exp, user=self.user)
+        self.assertIn("cannot be posted in 'submitted'", str(ctx.exception))
+
+        # 4. Reject
+        reject_expense(exp, user=self.user, reason="Missing receipt itemization")
+        self.assertEqual(exp.approval_status, "rejected")
+        self.assertEqual(exp.rejection_reason, "Missing receipt itemization")
+
+        # 5. Rejected cannot post
+        with self.assertRaises(ValidationError):
+            post_expense_accounting(exp, user=self.user)
+
+        # 6. Re-submit and Approve
+        submit_expense(exp, user=self.user)
+        approve_expense(exp, user=self.user, notes="Receipt verified")
+        self.assertEqual(exp.approval_status, "approved")
+        self.assertEqual(exp.approved_by, self.user)
+        self.assertEqual(exp.accounting_status, "ready")
+
+        # 7. Approved can post successfully
+        je = post_expense_accounting(exp, user=self.user)
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(exp.accounting_status, "posted")
+
+    def test_receipt_attachment_validation(self):
+        """Validates receipt file upload extension and size checks."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.office_category,
+            title="Printer Paper & Ink",
+            expense_date=self.today,
+            amount_before_tax=Decimal("75.00"),
+            payment_source="cash",
+            created_by=self.user,
+        )
+
+        # Valid PDF receipt
+        valid_file = SimpleUploadedFile("receipt_invoice.pdf", b"%PDF-1.4 test receipt content", content_type="application/pdf")
+        attach_receipt_to_expense(exp, valid_file, user=self.user)
+        self.assertTrue(bool(exp.receipt))
+        self.assertEqual(exp.receipt_name, "receipt_invoice.pdf")
+        self.assertGreater(exp.receipt_size, 0)
+
+        # Audit log created
+        log = ExpenseAuditLog.objects.filter(expense=exp, action="receipt_attached").first()
+        self.assertIsNotNone(log)
+
+        # Invalid file format (e.g. .exe)
+        invalid_file = SimpleUploadedFile("malicious.exe", b"binary content", content_type="application/octet-stream")
+        with self.assertRaises(ValidationError) as ctx:
+            attach_receipt_to_expense(exp, invalid_file, user=self.user)
+        self.assertIn("Unsupported file format", str(ctx.exception))
+
+    def test_payment_source_account_resolution(self):
+        """Verifies correct leaf accounts are credited for CASH, BANK, and PAYABLE."""
+        exp_cash = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.office_category,
+            title="Local Hardware Store Petty Cash",
+            expense_date=self.today,
+            amount_before_tax=Decimal("40.00"),
+            payment_source="cash",
+        )
+        cash_acc = resolve_payment_account(exp_cash)
+        self.assertEqual(cash_acc.code, "1030")
+
+        exp_bank = Expense.objects.create(
+            company=self.company,
+            expense_type="vendor",
+            vendor=self.vendor,
+            category=self.software_category,
+            title="Wire Transfer for IT Consulting",
+            expense_date=self.today,
+            amount_before_tax=Decimal("1500.00"),
+            payment_source="bank",
+        )
+        bank_acc = resolve_payment_account(exp_bank)
+        self.assertEqual(bank_acc.code, "1010")
+
+        exp_emp_payable = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Mileage Reimbursement",
+            expense_date=self.today,
+            amount_before_tax=Decimal("120.00"),
+            payment_source="payable",
+        )
+        emp_pay_acc = resolve_payment_account(exp_emp_payable)
+        self.assertEqual(emp_pay_acc.code, "2100")
+
+        exp_vendor_payable = Expense.objects.create(
+            company=self.company,
+            expense_type="vendor",
+            vendor=self.vendor,
+            category=self.software_category,
+            title="Invoiced Software Annual License",
+            expense_date=self.today,
+            amount_before_tax=Decimal("5000.00"),
+            payment_source="payable",
+        )
+        vendor_pay_acc = resolve_payment_account(exp_vendor_payable)
+        self.assertEqual(vendor_pay_acc.code, "2010")
+
+    def test_tax_accounting_and_equilibrium(self):
+        """
+        Verifies tax calculation and double-entry equilibrium:
+        DR Expense (pre-tax) + DR Input Tax Recoverable (tax) == CR Payment Source (total)
+        """
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Car Rental + VAT",
+            expense_date=self.today,
+            amount_before_tax=Decimal("500.00"),
+            tax_amount=Decimal("90.00"),
+            payment_source="bank",
+            approval_status="approved",
+            created_by=self.user,
+        )
+        self.assertEqual(exp.total_amount, Decimal("590.00"))
+
+        # Preview check
+        prev = get_expense_accounting_preview(exp)
+        self.assertTrue(prev["balanced"])
+        self.assertEqual(prev["total_debit"], 590.0)
+        self.assertEqual(prev["total_credit"], 590.0)
+        self.assertEqual(len(prev["prospective_lines"]), 3)
+
+        # Post
+        je = post_expense_accounting(exp, user=self.user)
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+        self.assertEqual(je.total_debit, Decimal("590.00"))
+        self.assertEqual(je.total_credit, Decimal("590.00"))
+
+        # Inspect lines
+        lines = list(je.lines.all())
+        self.assertEqual(len(lines), 3)
+        debit_lines = [l for l in lines if l.debit > 0]
+        credit_lines = [l for l in lines if l.credit > 0]
+        self.assertEqual(len(debit_lines), 2)
+        self.assertEqual(len(credit_lines), 1)
+
+        # One debit is tax account 1310
+        tax_line = next(l for l in debit_lines if l.account.code == "1310")
+        self.assertEqual(tax_line.debit, Decimal("90.00"))
+
+        # Credit is bank account 1010
+        self.assertEqual(credit_lines[0].account.code, "1010")
+        self.assertEqual(credit_lines[0].credit, Decimal("590.00"))
+
+    def test_idempotency_prevents_duplicate_posting(self):
+        """Repeated posting attempts must be rejected with explicit error and create no extra journals."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Conference Registration",
+            expense_date=self.today,
+            amount_before_tax=Decimal("250.00"),
+            payment_source="bank",
+            approval_status="approved",
+            created_by=self.user,
+        )
+
+        je1 = post_expense_accounting(exp, user=self.user)
+        self.assertEqual(je1.status, "posted")
+
+        # Second attempt raises ValidationError
+        with self.assertRaises(ValidationError) as ctx:
+            post_expense_accounting(exp, user=self.user)
+        self.assertIn("has already been posted", str(ctx.exception))
+
+        # Only 1 journal entry exists
+        count = JournalEntry.objects.filter(company=self.company, source_module="expenses", source_id=str(exp.id)).count()
+        self.assertEqual(count, 1)
+
+    def test_reversal_creates_mirrored_journal_entry(self):
+        """Tests that reversing a posted expense creates a balanced reversal journal."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Train Ticket to Client",
+            expense_date=self.today,
+            amount_before_tax=Decimal("80.00"),
+            payment_source="cash",
+            approval_status="approved",
+            created_by=self.user,
+        )
+        je = post_expense_accounting(exp, user=self.user)
+        self.assertEqual(exp.accounting_status, "posted")
+
+        rev_je = reverse_expense_accounting(exp, user=self.user, reason="Trip rescheduled")
+        self.assertEqual(exp.accounting_status, "reversed")
+        self.assertEqual(rev_je.status, "posted")
+        self.assertEqual(rev_je.reversal_of, je)
+
+        # Check reversal lines invert original lines
+        orig_debit = je.lines.filter(debit__gt=0).first()
+        orig_credit = je.lines.filter(credit__gt=0).first()
+
+        rev_credit = rev_je.lines.filter(account=orig_debit.account).first()
+        rev_debit = rev_je.lines.filter(account=orig_credit.account).first()
+
+        self.assertEqual(rev_credit.credit, orig_debit.debit)
+        self.assertEqual(rev_debit.debit, orig_credit.credit)
+
+    def test_closed_period_and_lock_date_rejection(self):
+        """Posting to a locked date or closed period must fail."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Prior Year Expense",
+            expense_date=date(2025, 1, 1),
+            amount_before_tax=Decimal("100.00"),
+            approval_status="approved",
+            created_by=self.user,
+        )
+
+        # No open period exists for 2025-01-01
+        with self.assertRaises(ValidationError):
+            post_expense_accounting(exp, user=self.user)
+
+        # Lock date test
+        self.settings.lock_date = date(2026, 3, 20)
+        self.settings.save()
+
+        exp_locked = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Locked Period Expense",
+            expense_date=date(2026, 3, 10),
+            amount_before_tax=Decimal("150.00"),
+            approval_status="approved",
+            created_by=self.user,
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            post_expense_accounting(exp_locked, user=self.user)
+        self.assertIn("period is locked", str(ctx.exception))
+
+    def test_company_isolation(self):
+        """Ensures cross-company accounts and records are strictly rejected."""
+        company_b = Company.objects.create(name="Competitor Brewing", slug="competitor")
+        seed_standard_chart_of_accounts(company_b)
+
+        foreign_cat = ExpenseCategory.objects.create(
+            company=company_b,
+            code="COMP_TRAVEL",
+            name="Competitor Travel",
+        )
+
+        exp = Expense(
+            company=self.company,
+            expense_type="employee",
+            category=foreign_cat,
+            title="Cross Company Test",
+            expense_date=self.today,
+            amount_before_tax=Decimal("100.00"),
+        )
+        with self.assertRaises(ValidationError):
+            exp.full_clean()
+
+    def test_expenses_summary_aggregation(self):
+        """Verifies get_expenses_summary calculates counts, totals, tax, and payables."""
+        # 1. Draft
+        Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Draft Exp",
+            expense_date=self.today,
+            amount_before_tax=Decimal("100.00"),
+            approval_status="draft",
+        )
+        # 2. Submitted
+        Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Submitted Exp",
+            expense_date=self.today,
+            amount_before_tax=Decimal("200.00"),
+            approval_status="submitted",
+        )
+        # 3. Approved & Posted
+        exp_posted = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Posted Exp",
+            expense_date=self.today,
+            amount_before_tax=Decimal("300.00"),
+            tax_amount=Decimal("30.00"),
+            payment_source="payable",
+            approval_status="approved",
+        )
+        post_expense_accounting(exp_posted, user=self.user)
+
+        summary = get_expenses_summary(self.company)
+        self.assertEqual(summary["total_expenses_count"], 3)
+        self.assertEqual(summary["pending_approval_count"], 1)
+        self.assertEqual(summary["pending_approval_amount"], 200.0)
+        self.assertEqual(summary["posted_count"], 1)
+        self.assertEqual(summary["posted_amount"], 330.0)
+        self.assertEqual(summary["posted_tax_amount"], 30.0)
+        self.assertEqual(summary["employee_reimbursements_amount"], 330.0)
+
+
+class ExpenseAccountingAPITests(APITestCase):
+    """
+    Integration tests for Section #16 REST endpoints:
+    /api/accounting/expenses/ and /api/accounting/expense-categories/.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Highland Brewing", slug="highland")
+        self.user = User.objects.create_user(
+            username="finance_admin",
+            email="finance@highland.com",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            expenses_accounting_enabled=True,
+            expenses_require_approval=True,
+        )
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+        seed_default_expense_categories(self.company)
+        self.travel_category = ExpenseCategory.objects.get(company=self.company, code="TRAVEL")
+
+        self.department = Department.objects.create(company=self.company, name="Sales")
+        self.employee = Employee.objects.create(
+            company=self.company,
+            first_name="Sarah",
+            last_name="Connor",
+            email="sarah.connor@highland.com",
+            department=self.department,
+        )
+
+    def test_expense_crud_api(self):
+        """Tests expense creation, retrieval, and listing via REST API."""
+        # Create
+        res = self.client.post("/api/accounting/expenses/", {
+            "expense_type": "employee",
+            "employee": self.employee.id,
+            "category": self.travel_category.id,
+            "title": "Client Lunch in Chicago",
+            "expense_date": "2026-03-15",
+            "amount_before_tax": "150.00",
+            "tax_amount": "15.00",
+            "payment_source": "payable",
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        exp_id = res.data["id"]
+        self.assertEqual(res.data["total_amount"], "165.00")
+
+        # List
+        list_res = self.client.get("/api/accounting/expenses/")
+        self.assertEqual(list_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(list_res.data), 1)
+
+        # Retrieve detail
+        det_res = self.client.get(f"/api/accounting/expenses/{exp_id}/")
+        self.assertEqual(det_res.status_code, status.HTTP_200_OK)
+        self.assertIn("audit_logs", det_res.data)
+
+    def test_expense_workflow_actions_api(self):
+        """Tests submit, approve, preview, post, and reverse via REST API."""
+        create_res = self.client.post("/api/accounting/expenses/", {
+            "expense_type": "employee",
+            "employee": self.employee.id,
+            "category": self.travel_category.id,
+            "title": "Taxi to Airport",
+            "expense_date": "2026-03-15",
+            "amount_before_tax": "60.00",
+            "tax_amount": "0.00",
+            "payment_source": "cash",
+        })
+        exp_id = create_res.data["id"]
+
+        # 1. Submit
+        sub_res = self.client.post(f"/api/accounting/expenses/{exp_id}/submit/")
+        self.assertEqual(sub_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(sub_res.data["approval_status"], "submitted")
+
+        # 2. Approve
+        app_res = self.client.post(f"/api/accounting/expenses/{exp_id}/approve/", {"notes": "Approved by manager"})
+        self.assertEqual(app_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(app_res.data["approval_status"], "approved")
+
+        # 3. Preview
+        prev_res = self.client.post(f"/api/accounting/expenses/{exp_id}/preview/")
+        self.assertEqual(prev_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(prev_res.data["balanced"])
+        self.assertEqual(prev_res.data["total_debit"], 60.0)
+
+        # 4. Post
+        post_res = self.client.post(f"/api/accounting/expenses/{exp_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(post_res.data["status"], "posted")
+        je_num = post_res.data["journal_entry_number"]
+        self.assertTrue(bool(je_num))
+
+        # 5. Reverse
+        rev_res = self.client.post(f"/api/accounting/expenses/{exp_id}/reverse/", {"reason": "Duplicate claim"})
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "posted")
+
+    def test_expense_receipt_upload_api(self):
+        """Tests multipart receipt file upload via REST API."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Subway Pass",
+            expense_date=date(2026, 3, 15),
+            amount_before_tax=Decimal("25.00"),
+        )
+        sample_file = SimpleUploadedFile("subway_receipt.png", b"fake image bytes", content_type="image/png")
+        res = self.client.post(
+            f"/api/accounting/expenses/{exp.id}/receipt/",
+            {"file": sample_file},
+            format="multipart",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["receipt_name"], "subway_receipt.png")
+
+    def test_expense_summary_api(self):
+        """Tests the summary KPI endpoint."""
+        res = self.client.get("/api/accounting/expenses/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("total_expenses_count", res.data)
+        self.assertIn("gl_operating_expense_net", res.data)
+
+    def test_expense_categories_seed_api(self):
+        """Tests the seed-defaults endpoint for expense categories."""
+        res = self.client.post("/api/accounting/expense-categories/seed-defaults/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("Successfully seeded", res.data["message"])
+
+
+
 
 
 

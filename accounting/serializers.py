@@ -206,6 +206,16 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
     manufacturing_scrap_account_name = serializers.ReadOnlyField(source="manufacturing_scrap_account.name")
     manufacturing_variance_account_code = serializers.ReadOnlyField(source="manufacturing_variance_account.code")
     manufacturing_variance_account_name = serializers.ReadOnlyField(source="manufacturing_variance_account.name")
+    expenses_default_cash_account_code = serializers.ReadOnlyField(source="expenses_default_cash_account.code")
+    expenses_default_cash_account_name = serializers.ReadOnlyField(source="expenses_default_cash_account.name")
+    expenses_default_bank_account_code = serializers.ReadOnlyField(source="expenses_default_bank_account.code")
+    expenses_default_bank_account_name = serializers.ReadOnlyField(source="expenses_default_bank_account.name")
+    expenses_default_payable_account_code = serializers.ReadOnlyField(source="expenses_default_payable_account.code")
+    expenses_default_payable_account_name = serializers.ReadOnlyField(source="expenses_default_payable_account.name")
+    expenses_default_employee_payable_account_code = serializers.ReadOnlyField(source="expenses_default_employee_payable_account.code")
+    expenses_default_employee_payable_account_name = serializers.ReadOnlyField(source="expenses_default_employee_payable_account.name")
+    expenses_default_tax_account_code = serializers.ReadOnlyField(source="expenses_default_tax_account.code")
+    expenses_default_tax_account_name = serializers.ReadOnlyField(source="expenses_default_tax_account.name")
 
     class Meta:
         model = AccountingSettings
@@ -262,6 +272,23 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "manufacturing_variance_account",
             "manufacturing_variance_account_code",
             "manufacturing_variance_account_name",
+            "expenses_accounting_enabled",
+            "expenses_require_approval",
+            "expenses_default_cash_account",
+            "expenses_default_cash_account_code",
+            "expenses_default_cash_account_name",
+            "expenses_default_bank_account",
+            "expenses_default_bank_account_code",
+            "expenses_default_bank_account_name",
+            "expenses_default_payable_account",
+            "expenses_default_payable_account_code",
+            "expenses_default_payable_account_name",
+            "expenses_default_employee_payable_account",
+            "expenses_default_employee_payable_account_code",
+            "expenses_default_employee_payable_account_name",
+            "expenses_default_tax_account",
+            "expenses_default_tax_account_code",
+            "expenses_default_tax_account_name",
             "created_at",
             "updated_at",
         ]
@@ -292,6 +319,16 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "manufacturing_scrap_account_name",
             "manufacturing_variance_account_code",
             "manufacturing_variance_account_name",
+            "expenses_default_cash_account_code",
+            "expenses_default_cash_account_name",
+            "expenses_default_bank_account_code",
+            "expenses_default_bank_account_name",
+            "expenses_default_payable_account_code",
+            "expenses_default_payable_account_name",
+            "expenses_default_employee_payable_account_code",
+            "expenses_default_employee_payable_account_name",
+            "expenses_default_tax_account_code",
+            "expenses_default_tax_account_name",
             "created_at",
             "updated_at",
         ]
@@ -442,5 +479,270 @@ class JournalEntrySerializer(serializers.ModelSerializer):
         except DjangoValidationError as e:
             msg = e.message_dict if hasattr(e, "message_dict") else e.messages
             raise serializers.ValidationError(msg)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #16 — EXPENSES SERIALIZERS
+# ==============================================================================
+
+from .models import Expense, ExpenseCategory, ExpenseAuditLog
+
+
+class ExpenseCategorySerializer(serializers.ModelSerializer):
+    expense_account_code = serializers.ReadOnlyField(source="expense_account.code")
+    expense_account_name = serializers.ReadOnlyField(source="expense_account.name")
+    expenses_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ExpenseCategory
+        fields = [
+            "id",
+            "code",
+            "name",
+            "description",
+            "expense_account",
+            "expense_account_code",
+            "expense_account_name",
+            "is_active",
+            "expenses_count",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "expense_account_code",
+            "expense_account_name",
+            "expenses_count",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_expenses_count(self, obj):
+        return obj.expenses.count()
+
+
+class ExpenseAuditLogSerializer(serializers.ModelSerializer):
+    actor_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ExpenseAuditLog
+        fields = [
+            "id",
+            "action",
+            "actor",
+            "actor_name",
+            "details",
+            "notes",
+            "created_at",
+        ]
+        read_only_fields = ["id", "actor_name", "created_at"]
+
+    def get_actor_name(self, obj):
+        if obj.actor:
+            return obj.actor.get_full_name() or obj.actor.username
+        return None
+
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    category_name = serializers.ReadOnlyField(source="category.name")
+    category_code = serializers.ReadOnlyField(source="category.code")
+    employee_name = serializers.SerializerMethodField()
+    vendor_name = serializers.SerializerMethodField()
+    expense_account_code = serializers.ReadOnlyField(source="expense_account.code")
+    expense_account_name = serializers.ReadOnlyField(source="expense_account.name")
+    tax_account_code = serializers.ReadOnlyField(source="tax_account.code")
+    tax_account_name = serializers.ReadOnlyField(source="tax_account.name")
+    payment_account_code = serializers.ReadOnlyField(source="payment_account.code")
+    payment_account_name = serializers.ReadOnlyField(source="payment_account.name")
+    journal_entry_number = serializers.ReadOnlyField(source="journal_entry.entry_number")
+    reversal_journal_entry_number = serializers.ReadOnlyField(source="reversal_journal_entry.entry_number")
+    created_by_name = serializers.SerializerMethodField()
+    submitted_by_name = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
+    posted_by_name = serializers.SerializerMethodField()
+    receipt_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Expense
+        fields = [
+            "id",
+            "expense_number",
+            "expense_type",
+            "employee",
+            "employee_name",
+            "vendor",
+            "vendor_name",
+            "vendor_name_raw",
+            "category",
+            "category_name",
+            "category_code",
+            "title",
+            "description",
+            "expense_date",
+            "accounting_date",
+            "amount_before_tax",
+            "tax_amount",
+            "total_amount",
+            "currency",
+            "payment_source",
+            "expense_account",
+            "expense_account_code",
+            "expense_account_name",
+            "tax_account",
+            "tax_account_code",
+            "tax_account_name",
+            "payment_account",
+            "payment_account_code",
+            "payment_account_name",
+            "approval_status",
+            "accounting_status",
+            "receipt",
+            "receipt_name",
+            "receipt_size",
+            "receipt_content_type",
+            "receipt_url",
+            "notes",
+            "rejection_reason",
+            "journal_entry",
+            "journal_entry_number",
+            "reversal_journal_entry",
+            "reversal_journal_entry_number",
+            "created_by",
+            "created_by_name",
+            "submitted_by",
+            "submitted_by_name",
+            "submitted_at",
+            "approved_by",
+            "approved_by_name",
+            "approved_at",
+            "posted_by",
+            "posted_by_name",
+            "posted_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "expense_number",
+            "total_amount",
+            "category_name",
+            "category_code",
+            "employee_name",
+            "vendor_name",
+            "expense_account_code",
+            "expense_account_name",
+            "tax_account_code",
+            "tax_account_name",
+            "payment_account_code",
+            "payment_account_name",
+            "journal_entry_number",
+            "reversal_journal_entry_number",
+            "created_by_name",
+            "submitted_by_name",
+            "submitted_at",
+            "approved_by_name",
+            "approved_at",
+            "posted_by_name",
+            "posted_at",
+            "receipt_url",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_employee_name(self, obj):
+        if not obj.employee:
+            return None
+        return f"{obj.employee.first_name} {obj.employee.last_name}".strip() or str(obj.employee)
+
+    def get_vendor_name(self, obj):
+        if obj.vendor:
+            return obj.vendor.name
+        return obj.vendor_name_raw or None
+
+    def get_created_by_name(self, obj):
+        return (obj.created_by.get_full_name() or obj.created_by.username) if obj.created_by else None
+
+    def get_submitted_by_name(self, obj):
+        return (obj.submitted_by.get_full_name() or obj.submitted_by.username) if obj.submitted_by else None
+
+    def get_approved_by_name(self, obj):
+        return (obj.approved_by.get_full_name() or obj.approved_by.username) if obj.approved_by else None
+
+    def get_posted_by_name(self, obj):
+        return (obj.posted_by.get_full_name() or obj.posted_by.username) if obj.posted_by else None
+
+    def get_receipt_url(self, obj):
+        if obj.receipt:
+            try:
+                return obj.receipt.url
+            except Exception:
+                return None
+        return None
+
+
+class ExpenseDetailSerializer(ExpenseSerializer):
+    audit_logs = ExpenseAuditLogSerializer(many=True, read_only=True)
+    journal_lines = serializers.SerializerMethodField()
+
+    class Meta(ExpenseSerializer.Meta):
+        fields = ExpenseSerializer.Meta.fields + ["audit_logs", "journal_lines"]
+
+    def get_journal_lines(self, obj):
+        if obj.journal_entry:
+            return [
+                {
+                    "line_number": line.line_number,
+                    "account_code": line.account.code,
+                    "account_name": line.account.name,
+                    "category": line.account.account_type.category,
+                    "debit": float(line.debit),
+                    "credit": float(line.credit),
+                    "description": line.description,
+                }
+                for line in obj.journal_entry.lines.select_related("account", "account__account_type").all()
+            ]
+        return []
+
+
+class ExpenseCreateUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Expense
+        fields = [
+            "id",
+            "expense_number",
+            "expense_type",
+            "employee",
+            "vendor",
+            "vendor_name_raw",
+            "category",
+            "title",
+            "description",
+            "expense_date",
+            "amount_before_tax",
+            "tax_amount",
+            "total_amount",
+            "currency",
+            "payment_source",
+            "expense_account",
+            "tax_account",
+            "payment_account",
+            "approval_status",
+            "accounting_status",
+            "receipt",
+            "notes",
+        ]
+        read_only_fields = ["id", "expense_number", "total_amount", "approval_status", "accounting_status"]
+
+    def validate(self, attrs):
+        amount_before_tax = attrs.get("amount_before_tax") or getattr(self.instance, "amount_before_tax", Decimal("0.00"))
+        tax_amount = attrs.get("tax_amount") or getattr(self.instance, "tax_amount", Decimal("0.00"))
+
+        if amount_before_tax < Decimal("0.00"):
+            raise serializers.ValidationError({"amount_before_tax": "Amount before tax cannot be negative."})
+        if tax_amount < Decimal("0.00"):
+            raise serializers.ValidationError({"tax_amount": "Tax amount cannot be negative."})
+
+        return attrs
+
 
 

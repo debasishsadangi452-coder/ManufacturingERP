@@ -1594,6 +1594,299 @@ class ManufacturingAccountingViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #16 — EXPENSES-TO-ACCOUNTING VIEWSETS
+# ==============================================================================
+
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from .models import Expense, ExpenseCategory, ExpenseAuditLog
+from .serializers import (
+    ExpenseCategorySerializer,
+    ExpenseSerializer,
+    ExpenseDetailSerializer,
+    ExpenseCreateUpdateSerializer,
+)
+from .expenses_accounting import (
+    seed_default_expense_categories,
+    get_expenses_policy,
+    resolve_expense_account,
+    resolve_tax_account,
+    resolve_payment_account,
+    submit_expense,
+    approve_expense,
+    reject_expense,
+    cancel_expense,
+    attach_receipt_to_expense,
+    get_expense_accounting_preview,
+    post_expense_accounting,
+    reverse_expense_accounting,
+    get_expenses_summary,
+)
+
+
+class ExpenseCategoryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    CRUD operations and seeding for configurable Expense Categories.
+    """
+    company_field = "company"
+    queryset = ExpenseCategory.objects.select_related("expense_account", "expense_account__account_type").all()
+    serializer_class = ExpenseCategorySerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["is_active"]
+    search_fields = ["name", "code", "description"]
+    ordering_fields = ["name", "code", "created_at"]
+    ordering = ["name"]
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company)
+
+    @action(detail=False, methods=["post"], url_path="seed-defaults")
+    def seed_defaults(self, request):
+        """POST /api/accounting/expense-categories/seed-defaults/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        cats = seed_default_expense_categories(company)
+        return Response({
+            "message": f"Successfully seeded {len(cats)} default expense categories.",
+            "categories": ExpenseCategorySerializer(cats, many=True).data,
+        }, status=status.HTTP_200_OK)
+
+
+class ExpenseViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    CRUD and accounting integration operations for operational expenses.
+    Supports employee & vendor expense logging, receipt uploads, approval workflows,
+    tax handling, payment source selection, and double-entry General Ledger postings.
+    """
+    company_field = "company"
+    queryset = (
+        Expense.objects
+        .select_related(
+            "category",
+            "employee",
+            "vendor",
+            "expense_account",
+            "tax_account",
+            "payment_account",
+            "journal_entry",
+            "reversal_journal_entry",
+            "created_by",
+            "submitted_by",
+            "approved_by",
+            "posted_by",
+        )
+        .prefetch_related("audit_logs", "journal_entry__lines")
+        .all()
+    )
+    permission_classes = [IsFinanceOrAdmin]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["expense_type", "approval_status", "accounting_status", "payment_source", "category"]
+    search_fields = ["expense_number", "title", "description", "vendor_name_raw", "employee__first_name", "employee__last_name", "vendor__name"]
+    ordering_fields = ["expense_date", "created_at", "total_amount", "expense_number"]
+    ordering = ["-expense_date", "-created_at"]
+
+    def get_serializer_class(self):
+        if self.action in ["create", "update", "partial_update"]:
+            return ExpenseCreateUpdateSerializer
+        if self.action == "retrieve":
+            return ExpenseDetailSerializer
+        return ExpenseSerializer
+
+    def perform_create(self, serializer):
+        company = self.request.user.company
+        user = self.request.user if self.request.user.is_authenticated else None
+        expense = serializer.save(company=company, created_by=user)
+        ExpenseAuditLog.objects.create(
+            expense=expense,
+            action="created",
+            actor=user,
+            details={
+                "title": expense.title,
+                "amount": float(expense.total_amount),
+                "type": expense.expense_type,
+                "payment_source": expense.payment_source,
+            },
+            notes="Expense created in draft status",
+        )
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.accounting_status == "posted":
+            raise ValidationError(_("Cannot modify an expense that has already been posted to the General Ledger."))
+        expense = serializer.save()
+        user = self.request.user if self.request.user.is_authenticated else None
+        ExpenseAuditLog.objects.create(
+            expense=expense,
+            action="updated",
+            actor=user,
+            details={
+                "title": expense.title,
+                "amount": float(expense.total_amount),
+                "approval_status": expense.approval_status,
+            },
+            notes="Expense details updated",
+        )
+
+    def perform_destroy(self, instance):
+        if instance.accounting_status == "posted":
+            raise ValidationError(_("Cannot delete an expense that has been posted to the General Ledger. Reverse it instead."))
+        instance.delete()
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/expenses/summary/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_expenses_summary(company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="submit")
+    def submit(self, request, pk=None):
+        """POST /api/accounting/expenses/{id}/submit/"""
+        expense = self.get_object()
+        try:
+            updated = submit_expense(expense, user=request.user)
+            return Response(ExpenseDetailSerializer(updated, context={"request": request}).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="approve")
+    def approve(self, request, pk=None):
+        """POST /api/accounting/expenses/{id}/approve/"""
+        expense = self.get_object()
+        notes = request.data.get("notes", "")
+        try:
+            updated = approve_expense(expense, user=request.user, notes=notes)
+            return Response(ExpenseDetailSerializer(updated, context={"request": request}).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reject")
+    def reject(self, request, pk=None):
+        """POST /api/accounting/expenses/{id}/reject/"""
+        expense = self.get_object()
+        reason = request.data.get("reason", "")
+        try:
+            updated = reject_expense(expense, user=request.user, reason=reason)
+            return Response(ExpenseDetailSerializer(updated, context={"request": request}).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="cancel")
+    def cancel(self, request, pk=None):
+        """POST /api/accounting/expenses/{id}/cancel/"""
+        expense = self.get_object()
+        try:
+            updated = cancel_expense(expense, user=request.user)
+            return Response(ExpenseDetailSerializer(updated, context={"request": request}).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="receipt", parser_classes=[MultiPartParser, FormParser])
+    def upload_receipt(self, request, pk=None):
+        """POST /api/accounting/expenses/{id}/receipt/"""
+        expense = self.get_object()
+        file_obj = request.FILES.get("file") or request.FILES.get("receipt")
+        if not file_obj:
+            return Response({"error": "No file uploaded. Key 'file' or 'receipt' required in form-data."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            updated = attach_receipt_to_expense(expense, file_obj=file_obj, user=request.user)
+            return Response(ExpenseDetailSerializer(updated, context={"request": request}).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="preview")
+    def preview(self, request, pk=None):
+        """POST /api/accounting/expenses/{id}/preview/"""
+        expense = self.get_object()
+        try:
+            preview_data = get_expense_accounting_preview(
+                expense,
+                expense_account_id=request.data.get("expense_account_id"),
+                tax_account_id=request.data.get("tax_account_id"),
+                payment_account_id=request.data.get("payment_account_id"),
+                payment_source_override=request.data.get("payment_source"),
+                amount_before_tax_override=request.data.get("amount_before_tax"),
+                tax_amount_override=request.data.get("tax_amount"),
+            )
+            return Response(preview_data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="post")
+    def post_accounting(self, request, pk=None):
+        """POST /api/accounting/expenses/{id}/post/"""
+        expense = self.get_object()
+        try:
+            posted_je = post_expense_accounting(
+                expense=expense,
+                user=request.user,
+                transaction_date=request.data.get("transaction_date"),
+                expense_account_id=request.data.get("expense_account_id"),
+                tax_account_id=request.data.get("tax_account_id"),
+                payment_account_id=request.data.get("payment_account_id"),
+                notes=request.data.get("notes"),
+            )
+            return Response({
+                "message": f"Expense #{expense.expense_number} successfully posted to General Ledger.",
+                "expense_id": expense.id,
+                "expense_number": expense.expense_number,
+                "journal_entry_id": posted_je.id,
+                "journal_entry_number": posted_je.entry_number,
+                "total_amount": float(posted_je.total_debit),
+                "status": posted_je.status,
+            }, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reverse")
+    def reverse_accounting(self, request, pk=None):
+        """POST /api/accounting/expenses/{id}/reverse/"""
+        expense = self.get_object()
+        reason = request.data.get("reason", "")
+        reversal_date = request.data.get("reversal_date")
+        try:
+            reversal_je = reverse_expense_accounting(
+                expense=expense,
+                user=request.user,
+                reason=reason,
+                reversal_date=reversal_date,
+            )
+            return Response({
+                "message": f"Expense #{expense.expense_number} accounting reversed successfully.",
+                "expense_id": expense.id,
+                "reversal_journal_entry_id": reversal_je.id,
+                "reversal_journal_entry_number": reversal_je.entry_number,
+                "status": reversal_je.status,
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
 
 
 
