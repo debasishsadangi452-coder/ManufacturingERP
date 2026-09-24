@@ -98,3 +98,16 @@ Costing uses standard material cost: `Item.purchase_cost`, and for manufactured 
 - Purchase price variance (the bill total differing from the PO/receipt value) isn't split out.
 - Items with no `purchase_cost` post nothing for cost-of-goods and production, and are logged as "skipped".
 - Events from before this change are not back-posted. Use the manual AR/AP/Sales tabs for those.
+
+## Follow-up: Fiscal year lifecycle
+
+- **The current year is the default.** The first time a company lists its fiscal years (or seeds its chart of accounts), the current calendar year is opened automatically with its 12 monthly periods and set as the current fiscal year.
+- **Only one open year at a time.** Creating a fiscal year while another is open is refused, and so is reopening an old year while a later one is open. Both return a clear error.
+- **The next year is only available after closing.** The new `POST /api/accounting/fiscal-years/start_next_year/` opens the 12-month year that starts the day after the latest year ends. It handles both calendar years (`FY 2027`) and Apr–Mar style years (`FY 2026-2027`). It creates the periods and makes the new year current.
+- A company's first year can still be created with custom dates (for example Apr–Mar). Any later year must start the day after the previous one ends.
+- Files: `accounting/seeds.py` (lifecycle helpers; `generate_monthly_periods` is shared with the existing `generate_periods` action), `accounting/views.py`, `accounting/test_fiscal_year_lifecycle.py` (5 tests).
+- There are no migrations or model changes. The rules are enforced in the API, so fiscal years that already exist are not altered.
+
+## Follow-up: Add Client from Sales
+
+- The backend already supported creating customers. This adds `sales/test_customers.py` (2 tests), which confirms that a new client is always assigned to the user's own company and that a name is required.

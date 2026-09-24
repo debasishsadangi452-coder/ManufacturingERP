@@ -1,6 +1,9 @@
 from .models import AccountType, Account, FiscalYear, AccountingPeriod, AccountingSettings
-from datetime import date
+from datetime import date, timedelta
 import calendar
+
+from django.core.exceptions import ValidationError
+from django.db import transaction
 
 
 DEFAULT_ACCOUNT_TYPES = [
@@ -208,4 +211,95 @@ def seed_standard_fiscal_year(company, year: int = None):
         settings.current_fiscal_year = fy
         settings.save()
 
+    return fy
+
+
+# ---------------------------------------------------------------------------
+# Fiscal year lifecycle: one open year at a time, next year only after closing
+# ---------------------------------------------------------------------------
+
+def fiscal_year_name(start_date, end_date):
+    """'FY 2026' for calendar years, 'FY 2026-2027' otherwise."""
+    if start_date.year == end_date.year:
+        return f"FY {start_date.year}"
+    return f"FY {start_date.year}-{end_date.year}"
+
+
+def generate_monthly_periods(fy):
+    """Create the monthly periods of `fy` (idempotent). Returns how many were created."""
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    created = 0
+    curr = fy.start_date
+    period_num = 1
+    while curr <= fy.end_date and period_num <= 12:
+        last_day = calendar.monthrange(curr.year, curr.month)[1]
+        p_end = min(date(curr.year, curr.month, last_day), fy.end_date)
+        _, was_created = AccountingPeriod.objects.get_or_create(
+            company=fy.company,
+            fiscal_year=fy,
+            period_number=period_num,
+            defaults={
+                "name": f"{month_names[curr.month - 1]} {curr.year}",
+                "start_date": curr,
+                "end_date": p_end,
+                "status": "open",
+            }
+        )
+        created += int(was_created)
+        curr = p_end + timedelta(days=1)
+        period_num += 1
+    return created
+
+
+def get_open_fiscal_year(company):
+    return FiscalYear.objects.filter(company=company, is_closed=False).order_by("start_date").first()
+
+
+def ensure_current_fiscal_year(company):
+    """Default for a company with no fiscal years: open the current calendar year."""
+    if company is None or FiscalYear.objects.filter(company=company).exists():
+        return None
+    return seed_standard_fiscal_year(company)
+
+
+def validate_new_fiscal_year(company, start_date):
+    """A new fiscal year may only begin once the previous one is closed, and
+    must start the day after the latest year ends."""
+    open_fy = get_open_fiscal_year(company)
+    if open_fy:
+        raise ValidationError(
+            f"{open_fy.name} is still open. Close it before starting the next fiscal year."
+        )
+    latest = FiscalYear.objects.filter(company=company).order_by("-end_date").first()
+    if latest and start_date != latest.end_date + timedelta(days=1):
+        raise ValidationError(
+            f"The next fiscal year must start on {latest.end_date + timedelta(days=1)}, "
+            f"the day after {latest.name} ends."
+        )
+
+
+@transaction.atomic
+def start_next_fiscal_year(company):
+    """Open the 12-month fiscal year that follows the latest (closed) one, with
+    its monthly periods, and make it the current fiscal year."""
+    latest = FiscalYear.objects.filter(company=company).order_by("-end_date").first()
+    if latest is None:
+        return seed_standard_fiscal_year(company)
+
+    start = latest.end_date + timedelta(days=1)
+    validate_new_fiscal_year(company, start)
+    end_month_start = date(start.year + (start.month + 10) // 12, (start.month + 10) % 12 + 1, 1)
+    end = date(end_month_start.year, end_month_start.month,
+               calendar.monthrange(end_month_start.year, end_month_start.month)[1])
+    if start.day != 1:
+        end = date(start.year + 1, start.month, start.day) - timedelta(days=1)
+
+    fy = FiscalYear.objects.create(
+        company=company, name=fiscal_year_name(start, end), start_date=start, end_date=end,
+    )
+    generate_monthly_periods(fy)
+
+    settings_obj, _ = AccountingSettings.objects.get_or_create(company=company)
+    settings_obj.current_fiscal_year = fy
+    settings_obj.save()
     return fy

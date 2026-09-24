@@ -22,7 +22,13 @@ from .seeds import (
     ensure_account_types,
     seed_standard_chart_of_accounts,
     seed_standard_fiscal_year,
+    ensure_current_fiscal_year,
+    generate_monthly_periods,
+    get_open_fiscal_year,
+    start_next_fiscal_year,
+    validate_new_fiscal_year,
 )
+from django.core.exceptions import ValidationError as DjangoValidationError
 
 
 class FiscalYearViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
@@ -36,36 +42,36 @@ class FiscalYearViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     ordering_fields = ["start_date", "end_date", "name"]
     ordering = ["-start_date"]
 
+    def list(self, request, *args, **kwargs):
+        # By default every company works in the current calendar year.
+        ensure_current_fiscal_year(getattr(request.user, "company", None))
+        return super().list(request, *args, **kwargs)
+
+    def create(self, request, *args, **kwargs):
+        start = request.data.get("start_date")
+        try:
+            if start:
+                validate_new_fiscal_year(request.user.company, date.fromisoformat(str(start)))
+        except ValueError:
+            return Response({"start_date": ["Use YYYY-MM-DD."]}, status=status.HTTP_400_BAD_REQUEST)
+        except DjangoValidationError as e:
+            return Response({"error": " ".join(e.messages)}, status=status.HTTP_400_BAD_REQUEST)
+        return super().create(request, *args, **kwargs)
+
+    @action(detail=False, methods=["post"])
+    def start_next_year(self, request):
+        """Opens the fiscal year after the latest one. Only allowed once it is closed."""
+        try:
+            fy = start_next_fiscal_year(request.user.company)
+        except DjangoValidationError as e:
+            return Response({"error": " ".join(e.messages)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(fy).data, status=status.HTTP_201_CREATED)
+
     @action(detail=True, methods=["post"])
     def generate_periods(self, request, pk=None):
         """Generates standard monthly periods for this fiscal year."""
         fy = self.get_object()
-        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        created = 0
-        curr = fy.start_date
-        period_num = 1
-
-        while curr <= fy.end_date and period_num <= 12:
-            last_day = calendar.monthrange(curr.year, curr.month)[1]
-            p_end = min(date(curr.year, curr.month, last_day), fy.end_date)
-            p_name = f"{month_names[curr.month - 1]} {curr.year}"
-            
-            _, was_created = AccountingPeriod.objects.get_or_create(
-                company=fy.company,
-                fiscal_year=fy,
-                period_number=period_num,
-                defaults={
-                    "name": p_name,
-                    "start_date": curr,
-                    "end_date": p_end,
-                    "status": "open",
-                }
-            )
-            if was_created:
-                created += 1
-            curr = p_end + timedelta(days=1)
-            period_num += 1
-
+        created = generate_monthly_periods(fy)
         return Response({
             "status": "success",
             "message": f"Generated {created} periods for fiscal year {fy.name}.",
@@ -86,6 +92,12 @@ class FiscalYearViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     def reopen_year(self, request, pk=None):
         """Reopens a closed fiscal year."""
         fy = self.get_object()
+        open_fy = get_open_fiscal_year(fy.company)
+        if open_fy and open_fy.pk != fy.pk:
+            return Response(
+                {"error": f"{open_fy.name} is open. Only one fiscal year can be open at a time; close it first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         fy.is_closed = False
         fy.save()
         return Response({"status": "success", "message": f"Fiscal year {fy.name} has been reopened."})
@@ -168,6 +180,7 @@ class AccountViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         created_count = seed_standard_chart_of_accounts(company)
+        ensure_current_fiscal_year(company)
         return Response({
             "status": "success",
             "message": f"Successfully seeded {created_count} standard manufacturing accounts.",
