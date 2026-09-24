@@ -1571,6 +1571,367 @@ class AccountsPayableTests(APITestCase):
         self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class SalesAccountingTests(APITestCase):
+    """
+    Test suite for Master Accounting Blueprint Section #12: Sales-to-Accounting.
+    Covers operational sales invoice posting, preview calculation, revenue recognition,
+    tax liability posting, reversal/cancellation, GL integration, and security controls.
+    """
+
+    def setUp(self):
+        # 1. Tenants
+        self.comp1 = Company.objects.create(name="Brewing Master Co", slug="brewmaster")
+        self.comp2 = Company.objects.create(name="Competitor Distilling", slug="compdist")
+
+        # 2. Users
+        self.finance_user = User.objects.create_user(
+            username="salesfin",
+            email="fin@salesmaster.com",
+            role="finance",
+            company=self.comp1,
+            password="pass"
+        )
+        self.store_user = User.objects.create_user(
+            username="salesstore",
+            email="store@salesmaster.com",
+            role="store_manager",
+            company=self.comp1,
+            password="pass"
+        )
+        self.comp2_user = User.objects.create_user(
+            username="comp2salesfin",
+            email="fin@compdist.com",
+            role="finance",
+            company=self.comp2,
+            password="pass"
+        )
+
+        # 3. Seed Accounts & Fiscal Year
+        seed_standard_chart_of_accounts(self.comp1)
+        seed_standard_fiscal_year(self.comp1, 2026)
+        seed_standard_chart_of_accounts(self.comp2)
+        seed_standard_fiscal_year(self.comp2, 2026)
+
+        self.acc_ar = Account.objects.get(company=self.comp1, code="1100")
+        self.acc_sales = Account.objects.get(company=self.comp1, code="4010")
+        self.acc_bank = Account.objects.get(company=self.comp1, code="1010")
+
+        # 4. Customers
+        self.customer1 = Customer.objects.create(
+            company=self.comp1,
+            name="The Hoppy Tavern",
+            email="hoppy@tavern.com",
+            payment_terms="Net 30",
+        )
+        self.customer_comp2 = Customer.objects.create(
+            company=self.comp2,
+            name="Other Tavern",
+            email="other@tavern.com",
+        )
+
+        self.client.force_authenticate(user=self.finance_user)
+
+    def test_sales_accounting_preview_endpoint(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 2, 10),
+            due_date=date(2026, 3, 12),
+            total_amount=Decimal("1200.00"),
+            status="open",
+        )
+
+        # Preview with tax
+        res = self.client.post(f"/api/accounting/sales/{inv.id}/preview/", {
+            "tax_amount": "120.00"
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+        self.assertTrue(data["is_balanced"])
+        self.assertEqual(data["total_debit"], 1200.00)
+        self.assertEqual(data["total_credit"], 1200.00)
+        self.assertEqual(data["net_sales"], 1080.00)
+        self.assertEqual(data["tax_amount"], 120.00)
+        self.assertEqual(len(data["lines"]), 3)
+
+    def test_post_sales_invoice_creates_balanced_journal_entry(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 2, 10),
+            total_amount=Decimal("1500.00"),
+            status="open",
+        )
+
+        res = self.client.post(f"/api/accounting/sales/{inv.id}/post/", {}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertIn("journal_entry_id", res.data)
+
+        je = JournalEntry.objects.get(pk=res.data["journal_entry_id"])
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.total_debit, Decimal("1500.00"))
+        self.assertEqual(je.total_credit, Decimal("1500.00"))
+
+        # Verify lines
+        lines = list(je.lines.order_by("line_number"))
+        self.assertEqual(len(lines), 2)
+        # Line 1: AR Debit
+        self.assertEqual(lines[0].account.code, "1100")
+        self.assertEqual(lines[0].debit, Decimal("1500.00"))
+        self.assertEqual(lines[0].credit, Decimal("0.00"))
+        # Line 2: Revenue Credit
+        self.assertEqual(lines[1].account.code, "4010")
+        self.assertEqual(lines[1].debit, Decimal("0.00"))
+        self.assertEqual(lines[1].credit, Decimal("1500.00"))
+
+        # Customer balance synced
+        self.customer1.refresh_from_db()
+        self.assertEqual(self.customer1.balance_due, Decimal("1500.00"))
+
+    def test_post_sales_invoice_with_tax(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 2, 15),
+            total_amount=Decimal("1100.00"),
+            status="open",
+        )
+
+        res = self.client.post(f"/api/accounting/sales/{inv.id}/post/", {
+            "tax_amount": "100.00"
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        je = JournalEntry.objects.get(pk=res.data["journal_entry_id"])
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.total_debit, Decimal("1100.00"))
+        self.assertEqual(je.total_credit, Decimal("1100.00"))
+
+        lines = list(je.lines.order_by("line_number"))
+        self.assertEqual(len(lines), 3)
+
+        # Line 1: AR Debit = 1100
+        self.assertEqual(lines[0].account.code, "1100")
+        self.assertEqual(lines[0].debit, Decimal("1100.00"))
+        self.assertEqual(lines[0].credit, Decimal("0.00"))
+
+        # Line 2: Revenue Credit = 1000
+        self.assertEqual(lines[1].account.code, "4010")
+        self.assertEqual(lines[1].debit, Decimal("0.00"))
+        self.assertEqual(lines[1].credit, Decimal("1000.00"))
+
+        # Line 3: Tax Payable Credit = 100
+        self.assertEqual(lines[2].account.code, "2200")
+        self.assertEqual(lines[2].debit, Decimal("0.00"))
+        self.assertEqual(lines[2].credit, Decimal("100.00"))
+
+    def test_duplicate_sales_invoice_posting_is_prevented(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 2, 12),
+            total_amount=Decimal("750.00"),
+            status="open",
+        )
+
+        res1 = self.client.post(f"/api/accounting/sales/{inv.id}/post/", {}, format="json")
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+
+        res2 = self.client.post(f"/api/accounting/sales/{inv.id}/post/", {}, format="json")
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been posted", str(res2.data).lower())
+
+    def test_posted_sales_invoice_flows_into_general_ledger(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 2, 18),
+            total_amount=Decimal("2000.00"),
+            status="open",
+        )
+
+        self.client.post(f"/api/accounting/sales/{inv.id}/post/", {
+            "tax_amount": "200.00"
+        }, format="json")
+
+        # 1. GL Summary
+        gl_res = self.client.get("/api/accounting/general-ledger/summary/")
+        self.assertEqual(gl_res.status_code, status.HTTP_200_OK)
+        balances = {item["code"]: item for item in gl_res.data["accounts"]}
+
+        # AR (1100): Debit 2000, closing balance 2000
+        self.assertEqual(Decimal(balances["1100"]["period_debit"]), Decimal("2000.00"))
+        self.assertEqual(Decimal(balances["1100"]["closing_balance"]), Decimal("2000.00"))
+
+        # Sales Revenue (4010): Credit 1800, closing balance 1800
+        self.assertEqual(Decimal(balances["4010"]["period_credit"]), Decimal("1800.00"))
+        self.assertEqual(Decimal(balances["4010"]["closing_balance"]), Decimal("1800.00"))
+
+        # Sales Tax Payable (2200): Credit 200, closing balance 200
+        self.assertEqual(Decimal(balances["2200"]["period_credit"]), Decimal("200.00"))
+        self.assertEqual(Decimal(balances["2200"]["closing_balance"]), Decimal("200.00"))
+
+    def test_draft_or_unposted_sales_invoice_does_not_affect_gl(self):
+        Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 2, 20),
+            total_amount=Decimal("3500.00"),
+            status="open",
+        )
+
+        gl_res = self.client.get("/api/accounting/general-ledger/summary/")
+        self.assertEqual(gl_res.status_code, status.HTTP_200_OK)
+        balances = {item["code"]: item for item in gl_res.data["accounts"]}
+        self.assertEqual(Decimal(balances["1100"]["closing_balance"]), Decimal("0.00"))
+        self.assertEqual(Decimal(balances["4010"]["closing_balance"]), Decimal("0.00"))
+
+    def test_reverse_sales_invoice_accounting(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 2, 22),
+            total_amount=Decimal("800.00"),
+            status="open",
+        )
+
+        post_res = self.client.post(f"/api/accounting/sales/{inv.id}/post/", {}, format="json")
+        self.assertEqual(post_res.status_code, status.HTTP_201_CREATED)
+
+        # Now reverse
+        rev_res = self.client.post(f"/api/accounting/sales/{inv.id}/reverse/", {
+            "reason": "Customer cancellation / order returned"
+        }, format="json")
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "cancelled")
+
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "cancelled")
+
+        # Check reversing journal entry
+        reversal_je_id = rev_res.data["reversal_journal_entry_id"]
+        reversal_je = JournalEntry.objects.get(pk=reversal_je_id)
+        self.assertEqual(reversal_je.status, "posted")
+        self.assertEqual(reversal_je.total_debit, Decimal("800.00"))
+        self.assertEqual(reversal_je.total_credit, Decimal("800.00"))
+
+        # GL Net Balance for AR and Sales should now be 0
+        gl_res = self.client.get("/api/accounting/general-ledger/summary/")
+        balances = {item["code"]: item for item in gl_res.data["accounts"]}
+        self.assertEqual(Decimal(balances["1100"]["closing_balance"]), Decimal("0.00"))
+        self.assertEqual(Decimal(balances["4010"]["closing_balance"]), Decimal("0.00"))
+
+        # Customer balance synced back to 0
+        self.customer1.refresh_from_db()
+        self.assertEqual(self.customer1.balance_due, Decimal("0.00"))
+
+    def test_reversal_blocked_if_payments_already_applied(self):
+        inv = Invoice.objects.create(
+            company=self.comp1,
+            customer=self.customer1,
+            invoice_date=date(2026, 2, 25),
+            total_amount=Decimal("1000.00"),
+            status="open",
+        )
+        self.client.post(f"/api/accounting/sales/{inv.id}/post/", {}, format="json")
+
+        # Apply a payment
+        inv.apply_payment(Decimal("300.00"))
+
+        rev_res = self.client.post(f"/api/accounting/sales/{inv.id}/reverse/", {
+            "reason": "Invalid attempt"
+        }, format="json")
+        self.assertEqual(rev_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("payments totaling", str(rev_res.data).lower())
+
+    def test_sales_accounting_summary_metrics(self):
+        # 1. Posted invoice
+        inv1 = Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 2, 1), total_amount=Decimal("1000.00"), status="open",
+        )
+        self.client.post(f"/api/accounting/sales/{inv1.id}/post/", {"tax_amount": "100.00"}, format="json")
+
+        # 2. Unposted invoice
+        Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 2, 5), total_amount=Decimal("500.00"), status="open",
+        )
+
+        res = self.client.get("/api/accounting/sales/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["total_invoices_count"], 2)
+        self.assertEqual(Decimal(str(data["total_invoices_amount"])), Decimal("1500.00"))
+        self.assertEqual(data["posted_invoices_count"], 1)
+        self.assertEqual(Decimal(str(data["posted_invoices_amount"])), Decimal("1000.00"))
+        self.assertEqual(data["unposted_invoices_count"], 1)
+        self.assertEqual(Decimal(str(data["unposted_invoices_amount"])), Decimal("500.00"))
+        self.assertEqual(Decimal(str(data["gl_sales_revenue"])), Decimal("900.00"))
+        self.assertEqual(Decimal(str(data["gl_tax_payable"])), Decimal("100.00"))
+        self.assertEqual(Decimal(str(data["gl_accounts_receivable"])), Decimal("1000.00"))
+
+    def test_sales_accounting_invoices_list(self):
+        inv1 = Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 2, 1), total_amount=Decimal("1000.00"), status="open",
+        )
+        self.client.post(f"/api/accounting/sales/{inv1.id}/post/", {}, format="json")
+
+        inv2 = Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 2, 5), total_amount=Decimal("500.00"), status="open",
+        )
+
+        res = self.client.get("/api/accounting/sales/invoices/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        items = {item["id"]: item for item in res.data}
+
+        self.assertEqual(items[inv1.id]["accounting_status"], "posted")
+        self.assertIsNotNone(items[inv1.id]["journal_entry"])
+        self.assertEqual(items[inv2.id]["accounting_status"], "not_posted")
+        self.assertIsNone(items[inv2.id]["journal_entry"])
+
+    def test_locked_period_blocks_sales_invoice_posting(self):
+        # Close Period 02 (February 2026)
+        p2 = AccountingPeriod.objects.get(fiscal_year__company=self.comp1, period_number=2)
+        p2.status = "closed"
+        p2.save()
+
+        inv = Invoice.objects.create(
+            company=self.comp1, customer=self.customer1,
+            invoice_date=date(2026, 2, 10), total_amount=Decimal("1000.00"), status="open",
+        )
+
+        res = self.client.post(f"/api/accounting/sales/{inv.id}/post/", {}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("closed", str(res.data).lower())
+
+    def test_multi_tenant_isolation_sales_accounting(self):
+        inv_comp2 = Invoice.objects.create(
+            company=self.comp2, customer=self.customer_comp2,
+            invoice_date=date(2026, 2, 10), total_amount=Decimal("900.00"), status="open",
+        )
+
+        # Company 1 finance user cannot post Company 2 invoice
+        res = self.client.post(f"/api/accounting/sales/{inv_comp2.id}/post/", {}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not found", str(res.data).lower())
+
+        # Company 1 list does not include Company 2 invoice
+        list_res = self.client.get("/api/accounting/sales/invoices/")
+        self.assertEqual(list_res.status_code, status.HTTP_200_OK)
+        comp1_inv_ids = [item["id"] for item in list_res.data]
+        self.assertNotIn(inv_comp2.id, comp1_inv_ids)
+
+    def test_unauthorized_user_forbidden(self):
+        self.client.force_authenticate(user=self.store_user)
+        res = self.client.get("/api/accounting/sales/summary/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+
 
 
 
