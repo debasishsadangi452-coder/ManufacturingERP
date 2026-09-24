@@ -33,6 +33,19 @@ class VendorPriceListSerializer(serializers.ModelSerializer):
             )
         return item
 
+    def validate(self, attrs):
+        # Vendor and item must both belong to the requesting user's company.
+        request = self.context.get("request")
+        company = getattr(getattr(request, "user", None), "company", None)
+        if company is not None:
+            vendor = attrs.get("vendor", getattr(self.instance, "vendor", None))
+            item = attrs.get("item", getattr(self.instance, "item", None))
+            if vendor is not None and vendor.company_id != company.id:
+                raise serializers.ValidationError({"vendor": "Vendor not found."})
+            if item is not None and item.company_id != company.id:
+                raise serializers.ValidationError({"item": "Item not found."})
+        return attrs
+
 
 class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.name", read_only=True)

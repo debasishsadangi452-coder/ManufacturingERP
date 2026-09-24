@@ -111,3 +111,9 @@ Costing uses standard material cost: `Item.purchase_cost`, and for manufactured 
 ## Follow-up: Add Client from Sales
 
 - The backend already supported creating customers. This adds `sales/test_customers.py` (2 tests), which confirms that a new client is always assigned to the user's own company and that a name is required.
+
+## Follow-up: Vendor assignment and finished-good selling prices
+
+- **Assigning ingredients to vendors.** This uses the existing `VendorPriceList` model and API: vendor + raw material + quoted unit price, minimum order and lead time, with one entry per vendor per ingredient. `procurement/serializers.py` now checks that the vendor and item belong to the requesting user's company. Before this, another company's IDs were accepted. Tests are in `procurement/test_vendor_prices.py` (2).
+- **Setting selling prices.** Previously a finished good's selling price could only be set when the item was created, and Sales users had no permission to edit items. The new `GET /api/sales/price-list/` returns every finished good with its selling price and standard cost. `PATCH /api/sales/price-list/{item_id}/` updates the **selling price only**. Sales, Finance and Admin can use it, and every change is written to the activity log. The item save pushes the new price to QuickBooks through the existing item sync. Tests are in `sales/test_price_list.py` (3).
+- There are no migrations.

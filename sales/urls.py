@@ -4,6 +4,7 @@ from .views import (
     CustomerPaymentViewSet,
     InboundOrderEmailViewSet,
     InvoiceViewSet,
+    PriceListViewSet,
     SalesOrderViewSet,
     SalesOrderItemViewSet,
     ShipmentViewSet,
@@ -18,5 +19,6 @@ router.register(r'shipments', ShipmentViewSet)
 router.register(r'invoices', InvoiceViewSet)
 router.register(r'payments', CustomerPaymentViewSet)
 router.register(r'inbound-orders', InboundOrderEmailViewSet)
+router.register(r'price-list', PriceListViewSet, basename='sales-price-list')
 
 urlpatterns = router.urls

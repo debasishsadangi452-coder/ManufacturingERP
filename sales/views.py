@@ -831,3 +831,52 @@ class InboundOrderEmailViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             f"Confirmed email order from {inbound.sender} → SO-{order.id}",
         )
         return Response(SalesOrderSerializer(order).data)
+
+
+class PriceListViewSet(viewsets.ViewSet):
+    """Selling prices of finished goods. Sales, Finance and Admin can change the
+    price only — the item itself stays managed from Inventory. The price drives
+    sales order totals and invoices, and is mirrored to QuickBooks with the item."""
+    permission_classes = [IsSales | IsAdmin | IsFinance]
+
+    def _items(self, request):
+        company = getattr(request.user, "company", None)
+        if company is None:
+            return Item.objects.none()
+        return (
+            Item.objects.filter(company=company, category="finished_good")
+            .exclude(erp_classification="out_of_scope")
+            .order_by("name")
+        )
+
+    def _row(self, item):
+        from accounting.auto_posting import standard_unit_cost
+        cost, _ = standard_unit_cost(item)
+        return {
+            "id": item.id,
+            "name": item.name,
+            "sku": item.sku,
+            "unit": item.unit,
+            "selling_price": str(item.selling_price),
+            "standard_cost": str(Decimal(cost).quantize(Decimal("0.01"))),
+        }
+
+    def list(self, request):
+        return Response([self._row(item) for item in self._items(request)])
+
+    def partial_update(self, request, pk=None):
+        item = self._items(request).filter(pk=pk).first()
+        if not item:
+            return Response({"error": "Finished good not found."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            price = Decimal(str(request.data.get("selling_price", "")))
+        except InvalidOperation:
+            return Response({"error": "selling_price must be a number."}, status=status.HTTP_400_BAD_REQUEST)
+        if price < 0:
+            return Response({"error": "selling_price cannot be negative."}, status=status.HTTP_400_BAD_REQUEST)
+
+        old_price = item.selling_price
+        item.selling_price = price.quantize(Decimal("0.01"))
+        item.save(update_fields=["selling_price"])
+        log_activity(request.user, "Sales", "Update Selling Price", f"'{item.name}' selling price {old_price} → {item.selling_price}")
+        return Response(self._row(item))
