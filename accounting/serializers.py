@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings
 
 
@@ -207,3 +208,152 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+
+from .models import JournalEntry, JournalEntryLine
+from decimal import Decimal
+
+
+class JournalEntryLineSerializer(serializers.ModelSerializer):
+    account_code = serializers.ReadOnlyField(source="account.code")
+    account_name = serializers.ReadOnlyField(source="account.name")
+    account_category = serializers.ReadOnlyField(source="account.account_type.category")
+
+    class Meta:
+        model = JournalEntryLine
+        fields = [
+            "id",
+            "account",
+            "account_code",
+            "account_name",
+            "account_category",
+            "line_number",
+            "debit",
+            "credit",
+            "description",
+            "created_at",
+        ]
+        read_only_fields = ["id", "account_code", "account_name", "account_category", "created_at"]
+
+    def validate(self, attrs):
+        debit = attrs.get("debit", Decimal("0.00"))
+        credit = attrs.get("credit", Decimal("0.00"))
+        if debit < 0 or credit < 0:
+            raise serializers.ValidationError("Debit and credit amounts cannot be negative.")
+        if debit == 0 and credit == 0:
+            raise serializers.ValidationError("A line must have either a non-zero debit or credit amount.")
+        if debit > 0 and credit > 0:
+            raise serializers.ValidationError("A line cannot contain both a debit and credit amount. Use separate lines.")
+        return attrs
+
+
+class JournalEntrySerializer(serializers.ModelSerializer):
+    lines = JournalEntryLineSerializer(many=True, required=False)
+    accounting_period_name = serializers.ReadOnlyField(source="accounting_period.name")
+    posted_by_name = serializers.ReadOnlyField(source="posted_by.username")
+    created_by_name = serializers.ReadOnlyField(source="created_by.username")
+    reversal_of_entry_number = serializers.ReadOnlyField(source="reversal_of.entry_number")
+    total_debit = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
+    total_credit = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
+    is_balanced = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = JournalEntry
+        fields = [
+            "id",
+            "entry_number",
+            "transaction_date",
+            "accounting_period",
+            "accounting_period_name",
+            "reference",
+            "description",
+            "source_module",
+            "source_id",
+            "status",
+            "posted_at",
+            "posted_by",
+            "posted_by_name",
+            "reversal_of",
+            "reversal_of_entry_number",
+            "created_by",
+            "created_by_name",
+            "total_debit",
+            "total_credit",
+            "is_balanced",
+            "lines",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "entry_number",
+            "accounting_period_name",
+            "status",
+            "posted_at",
+            "posted_by",
+            "posted_by_name",
+            "reversal_of",
+            "reversal_of_entry_number",
+            "created_by",
+            "created_by_name",
+            "total_debit",
+            "total_credit",
+            "is_balanced",
+            "created_at",
+            "updated_at",
+        ]
+
+    def create(self, validated_data):
+        lines_data = validated_data.pop("lines", [])
+        request = self.context.get("request")
+        company = request.user.company if request and hasattr(request.user, "company") else None
+        user = request.user if request and request.user.is_authenticated else None
+
+        if not company:
+            raise serializers.ValidationError("Company context is required to create a journal entry.")
+
+        validated_data["company"] = company
+        validated_data["created_by"] = user
+        validated_data["status"] = "draft"
+
+        try:
+            entry = JournalEntry.objects.create(**validated_data)
+
+            for idx, line_data in enumerate(lines_data, start=1):
+                line_data["company"] = company
+                line_data["journal_entry"] = entry
+                line_data["line_number"] = line_data.get("line_number") or idx
+                JournalEntryLine.objects.create(**line_data)
+
+            return entry
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            raise serializers.ValidationError(msg)
+
+    def update(self, instance, validated_data):
+        if instance.status != "draft":
+            raise serializers.ValidationError("Cannot modify a journal entry that is not in draft status.")
+
+        lines_data = validated_data.pop("lines", None)
+
+        try:
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            instance.save()
+
+            if lines_data is not None:
+                # Replace lines for draft entry
+                instance.lines.all().delete()
+                company = instance.company
+                for idx, line_data in enumerate(lines_data, start=1):
+                    line_data["company"] = company
+                    line_data["journal_entry"] = instance
+                    line_data["line_number"] = line_data.get("line_number") or idx
+                    JournalEntryLine.objects.create(**line_data)
+
+            return instance
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            raise serializers.ValidationError(msg)
+
+

@@ -8,6 +8,7 @@ from .views import (
     AccountingSettingsViewSet,
     AccountingFoundationSummaryViewSet,
     ERPContextViewSet,
+    JournalEntryViewSet,
 )
 
 router = DefaultRouter()
@@ -18,6 +19,7 @@ router.register(r'accounts', AccountViewSet, basename='accounting-accounts')
 router.register(r'settings', AccountingSettingsViewSet, basename='accounting-settings')
 router.register(r'summary', AccountingFoundationSummaryViewSet, basename='accounting-summary')
 router.register(r'erp-context', ERPContextViewSet, basename='accounting-erp-context')
+router.register(r'journal-entries', JournalEntryViewSet, basename='accounting-journal-entries')
 
 urlpatterns = [
     path('', include(router.urls)),

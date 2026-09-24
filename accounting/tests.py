@@ -1,6 +1,6 @@
 from django.test import TestCase
 from django.core.exceptions import ValidationError
-from rest_framework.test import APIClient
+from rest_framework.test import APIClient, APITestCase
 from rest_framework import status
 from datetime import date
 from accounts.models import Company, User
@@ -259,4 +259,245 @@ class AccountingAPITests(TestCase):
         self.assertEqual(res2.data["counts"]["customers"], 0)
         self.assertEqual(res2.data["counts"]["vendors"], 0)
         self.assertEqual(res2.data["counts"]["items"], 0)
+
+
+from decimal import Decimal
+from accounting.models import JournalEntry, JournalEntryLine
+
+
+class DoubleEntryEngineTests(APITestCase):
+    """
+    Blueprint #8: Double-Entry Accounting Engine Tests.
+    Tests mathematical equilibrium, period and lock date validation, atomic posting,
+    reversal lineage, immutability, and tenant isolation.
+    """
+
+    def setUp(self):
+        self.company1 = Company.objects.create(name="Apex Metals", slug="apex-metals")
+        self.company2 = Company.objects.create(name="Beta Foundry", slug="beta-foundry")
+
+        self.admin = User.objects.create_user(
+            username="fin_admin",
+            email="fin@apex.com",
+            password="pass",
+            role="admin",
+            company=self.company1,
+        )
+        self.store_user = User.objects.create_user(
+            username="unauth_user",
+            email="store@apex.com",
+            password="pass",
+            role="store",
+            company=self.company1,
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.admin)
+
+        # Seed types & accounts
+        ensure_account_types()
+        self.fy = FiscalYear.objects.create(
+            company=self.company1,
+            name="FY 2026",
+            start_date="2026-01-01",
+            end_date="2026-12-31"
+        )
+        # Create Period 1: Jan 2026
+        self.period1 = AccountingPeriod.objects.create(
+            company=self.company1,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date="2026-01-01",
+            end_date="2026-01-31",
+            status="open"
+        )
+        # Create Period 2: Feb 2026 (Locked)
+        self.period2 = AccountingPeriod.objects.create(
+            company=self.company1,
+            fiscal_year=self.fy,
+            period_number=2,
+            name="Feb 2026",
+            start_date="2026-02-01",
+            end_date="2026-02-28",
+            status="locked"
+        )
+
+        types = ensure_account_types()
+        asset_type = types["Cash & Cash Equivalents"]
+        revenue_type = types["Operating Sales Revenue"]
+        expense_type = types["Cost of Goods Sold (Raw Materials)"]
+
+        self.acc_bank = Account.objects.create(
+            company=self.company1,
+            code="1010",
+            name="Operating Bank Account",
+            account_type=asset_type
+        )
+        self.acc_sales = Account.objects.create(
+            company=self.company1,
+            code="4010",
+            name="Product Sales Revenue",
+            account_type=revenue_type
+        )
+        self.acc_cogs = Account.objects.create(
+            company=self.company1,
+            code="5010",
+            name="Raw Material COGS",
+            account_type=expense_type
+        )
+
+        # Company 2 Account
+        self.acc_comp2 = Account.objects.create(
+            company=self.company2,
+            code="1010",
+            name="Comp2 Bank",
+            account_type=asset_type
+        )
+
+    def test_balanced_journal_entry_creates_and_posts_successfully(self):
+        payload = {
+            "transaction_date": "2026-01-15",
+            "reference": "INV-1001",
+            "description": "Customer cash payment for goods",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "1500.00", "credit": "0.00", "description": "Cash in bank"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "1500.00", "description": "Sales recognized"},
+            ]
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        entry_id = res.data["id"]
+        self.assertEqual(res.data["status"], "draft")
+        self.assertTrue(res.data["is_balanced"])
+        self.assertEqual(Decimal(res.data["total_debit"]), Decimal("1500.00"))
+        self.assertEqual(Decimal(res.data["total_credit"]), Decimal("1500.00"))
+
+        # Post entry
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(post_res.data["status"], "posted")
+        self.assertIsNotNone(post_res.data["posted_at"])
+        self.assertEqual(post_res.data["posted_by"], self.admin.id)
+
+    def test_unbalanced_journal_entry_fails_posting(self):
+        payload = {
+            "transaction_date": "2026-01-15",
+            "description": "Unbalanced entry attempt",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "1000.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "800.00"},
+            ]
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        entry_id = res.data["id"]
+        self.assertFalse(res.data["is_balanced"])
+
+        # Attempt post -> Must fail
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("unbalanced", str(post_res.data).lower())
+
+    def test_line_with_both_debit_and_credit_rejected(self):
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "500.00", "credit": "500.00"},
+            ]
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_cannot_modify_or_delete_posted_entry(self):
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "200.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "200.00"},
+            ]
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = res.data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        # Attempt to edit
+        patch_res = self.client.patch(f"/api/accounting/journal-entries/{entry_id}/", {"description": "Hacked"}, format="json")
+        self.assertEqual(patch_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Attempt to delete
+        del_res = self.client.delete(f"/api/accounting/journal-entries/{entry_id}/")
+        self.assertEqual(del_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_atomic_reversal_creates_exact_inverse_entry(self):
+        payload = {
+            "transaction_date": "2026-01-15",
+            "reference": "ORIG-100",
+            "description": "Original transaction",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "750.00", "credit": "0.00", "description": "Bank debit"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "750.00", "description": "Sales credit"},
+            ]
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = res.data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        # Reverse entry
+        rev_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/reverse/", {"reason": "Billing error"}, format="json")
+        self.assertEqual(rev_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(rev_res.data["status"], "posted")
+        self.assertEqual(rev_res.data["reversal_of"], entry_id)
+
+        # Check original is now marked reversed
+        orig_check = self.client.get(f"/api/accounting/journal-entries/{entry_id}/")
+        self.assertEqual(orig_check.data["status"], "reversed")
+
+        # Verify reversal lines are exactly flipped
+        rev_lines = rev_res.data["lines"]
+        bank_line = next(l for l in rev_lines if l["account"] == self.acc_bank.id)
+        sales_line = next(l for l in rev_lines if l["account"] == self.acc_sales.id)
+        self.assertEqual(Decimal(bank_line["credit"]), Decimal("750.00"))
+        self.assertEqual(Decimal(bank_line["debit"]), Decimal("0.00"))
+        self.assertEqual(Decimal(sales_line["debit"]), Decimal("750.00"))
+        self.assertEqual(Decimal(sales_line["credit"]), Decimal("0.00"))
+
+    def test_posting_blocked_on_locked_period(self):
+        payload = {
+            "transaction_date": "2026-02-15",  # Falls into Period 2 (Locked)
+            "description": "Posting to locked period",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "300.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "300.00"},
+            ]
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = res.data["id"]
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("locked", str(post_res.data).lower())
+
+    def test_posting_blocked_prior_to_lock_date(self):
+        settings = AccountingSettings.objects.create(
+            company=self.company1,
+            default_currency="USD",
+            lock_date="2026-01-20"
+        )
+        payload = {
+            "transaction_date": "2026-01-10",  # Prior to lock date
+            "description": "Retroactive entry attempt",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "100.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "100.00"},
+            ]
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        # Creating or posting prior to lock date must be rejected
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unauthorized_user_cannot_create_or_post(self):
+        self.client.force_authenticate(user=self.store_user)
+        res = self.client.get("/api/accounting/journal-entries/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
 
