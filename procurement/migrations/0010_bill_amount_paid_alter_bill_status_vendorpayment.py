@@ -9,7 +9,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('accounts', '0009_alter_company_id_alter_companysubscription_id_and_more'),
+        ('accounts', '0008_alter_company_id_alter_companysubscription_id_and_more'),
         ('procurement', '0009_alter_bill_id_alter_billline_id_and_more'),
     ]
 

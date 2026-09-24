@@ -27,7 +27,9 @@ There were no merge conflicts. The two commits already on `main` (`core/views.py
 | `freshfizz_erp/settings.py` | `'accounting'` added to `INSTALLED_APPS` | None. It is a new app. |
 | `freshfizz_erp/urls.py` | `path('api/accounting/', ...)` added | None. It is a new URL prefix only. |
 | `procurement/models.py` | `Bill.amount_paid` (default `0.00`), a `"partial"` status choice, a `Bill.balance_due` property, `Bill.apply_payment()`, and a new `VendorPayment` model | Additive only. Existing bills get `amount_paid = 0`. No existing code path sets `"partial"`. |
-| `accounts/migrations/0009_...` | Changes `Company`/`CompanySubscription`/`User` `id` to `BigAutoField` | Brings migrations in line with Django 6.0.2, which is the version in `requirements.txt`. Without it, `accounts` has pending model changes. See the deployment notes below. |
+| `accounts/migrations/0009_...` (from the branch) | **Removed after the merge.** It changed the `Company`/`CompanySubscription`/`User` `id` columns to `BigAutoField`, which would rewrite and lock those tables. | Replaced by `default_auto_field = AutoField` in `accounts/apps.py`, which matches the existing integer columns. No schema change. |
+| `accounts/apps.py` | Pins `default_auto_field` to `AutoField` | Removes the `accounts` model drift under Django 6.0.2 without touching the DB. |
+| `accounting/migrations/0001`, `0002`, `procurement/migrations/0010` | Dependency changed from `accounts.0009` to `accounts.0008` | Needed because `0009` was removed. |
 | `procurement/migrations/0010_...` | Adds the `amount_paid` column, the status choices and the `procurement_vendorpayment` table | Additive. |
 
 **How existing processes are protected:**
@@ -38,17 +40,17 @@ There were no merge conflicts. The two commits already on `main` (`core/views.py
 ## Verification performed
 
 - `manage.py check` passed after **each** of the 7 merges. The only warning is `staticfiles.W004` (missing `static/` directory), which was already there before the merge.
-- `manage.py migrate` was run on a **copy** of the local dev database, which holds existing data. All 4 new migrations applied cleanly:
-  - `accounts.0009`
+- `manage.py migrate` was run on the local dev database, which holds existing data. A backup was saved as `db.sqlite3.bak-pre-accounting`. All 3 new migrations applied cleanly:
   - `accounting.0001`
   - `accounting.0002`
   - `procurement.0010`
 - Test suites for `accounting`, `procurement`, `sales`, `quickbooks`, `accounts` and `inventory`: **143 tests, all passed.**
-- `makemigrations --check`: the merge added no new drift and removed the `accounts` drift. The drift that remains in `core`, `finance`, `logistics`, `maintenance`, `quality` and `workforce` (PK `AutoField` → `BigAutoField`) was already on `main` and is out of scope.
+- `makemigrations --check`: the merge added no new drift, and `accounts` drift is resolved by the `apps.py` pin. The drift that remains in `core`, `finance`, `logistics`, `maintenance`, `quality` and `workforce` (PK `AutoField` → `BigAutoField`) was already on `main` and is out of scope.
 
 ## Deployment notes
 
-- Railway runs `python manage.py migrate --noinput` on start, so the 4 migrations apply automatically.
-- `accounts.0009` changes the `id` column type of `accounts_user`, `accounts_company` and `accounts_companysubscription` (plus the FKs that point at them) from `integer` to `bigint` on Postgres. This is a table rewrite. On a small or medium database it takes seconds, but it holds a lock while it runs. Deploy in a low-traffic window.
+- Railway runs `python manage.py migrate --noinput` on start, so the 3 migrations apply automatically.
+- All 3 migrations are **non-locking in practice**: two create new `accounting_*` tables, and one adds a column with a default to `procurement_bill` plus a new `procurement_vendorpayment` table. No existing table is rewritten, and the user and company tables are not touched.
+- Smoke-tested on localhost: the backend on `:8000` and the frontend on `:8080` both started. Existing `/api/sales/` and `/api/procurement/` return 200. `/api/accounting/*` returns 401 without a token, which is expected.
 - No new environment variables or Python dependencies are needed.
-- To roll back the code: `git reset --hard pre-accounting-merge`. If the migrations have already run, first run `migrate procurement 0009`, `migrate accounting zero` and `migrate accounts 0008`.
+- To roll back the code: `git reset --hard pre-accounting-merge`. If the migrations have already run, first run `migrate procurement 0009`, then `migrate accounting zero`.

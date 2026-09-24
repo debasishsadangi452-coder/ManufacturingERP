@@ -11,7 +11,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('accounting', '0001_initial'),
-        ('accounts', '0009_alter_company_id_alter_companysubscription_id_and_more'),
+        ('accounts', '0008_alter_company_id_alter_companysubscription_id_and_more'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
