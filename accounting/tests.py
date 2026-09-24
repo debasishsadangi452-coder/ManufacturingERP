@@ -501,3 +501,280 @@ class DoubleEntryEngineTests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class GeneralLedgerTests(TestCase):
+    """Test suite for Blueprint #9: General Ledger Layer."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.company1 = Company.objects.create(name="Brewery Alpha", slug="brewery-alpha")
+        self.company2 = Company.objects.create(name="Distillery Beta", slug="distillery-beta")
+
+        self.admin = User.objects.create_user(
+            username="finance_lead",
+            email="finance@alpha.com",
+            role="admin",
+            company=self.company1
+        )
+        self.store_user = User.objects.create_user(
+            username="storekeeper",
+            email="store@alpha.com",
+            role="store_manager",
+            company=self.company1
+        )
+        self.client.force_authenticate(user=self.admin)
+
+        # Ensure account types exist
+        ensure_account_types()
+        asset_type = AccountType.objects.get(name="Cash & Cash Equivalents")
+        sales_type = AccountType.objects.get(name="Operating Sales Revenue")
+        expense_type = AccountType.objects.get(name="Cost of Goods Sold (Raw Materials)")
+
+        # Fiscal Year & Periods for Company 1
+        self.fy = FiscalYear.objects.create(
+            company=self.company1,
+            name="FY 2026",
+            start_date="2026-01-01",
+            end_date="2026-12-31"
+        )
+        self.p1 = AccountingPeriod.objects.create(
+            company=self.company1,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date="2026-01-01",
+            end_date="2026-01-31",
+            status="open"
+        )
+        self.p2 = AccountingPeriod.objects.create(
+            company=self.company1,
+            fiscal_year=self.fy,
+            period_number=2,
+            name="Feb 2026",
+            start_date="2026-02-01",
+            end_date="2026-02-28",
+            status="open"
+        )
+
+        # Accounts
+        self.acc_bank = Account.objects.create(
+            company=self.company1,
+            code="1010",
+            name="Operating Bank Account",
+            account_type=asset_type
+        )
+        self.acc_sales = Account.objects.create(
+            company=self.company1,
+            code="4010",
+            name="Beer Sales",
+            account_type=sales_type
+        )
+        self.acc_expense = Account.objects.create(
+            company=self.company1,
+            code="5010",
+            name="Malt Expense",
+            account_type=expense_type
+        )
+
+        # Company 2 Account (for isolation test)
+        self.acc_comp2 = Account.objects.create(
+            company=self.company2,
+            code="1010",
+            name="Comp2 Bank",
+            account_type=asset_type
+        )
+
+    def test_posted_journal_entry_appears_in_account_ledger(self):
+        # Create and post entry
+        res = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-10",
+            "reference": "SALE-01",
+            "description": "Direct customer sale",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "500.00", "credit": "0.00", "description": "Cash receipt"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "500.00", "description": "Beer sale"},
+            ]
+        }, format="json")
+        entry_id = res.data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        # Query Bank ledger (Debit-normal asset)
+        gl_bank = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_bank.id}")
+        self.assertEqual(gl_bank.status_code, status.HTTP_200_OK)
+        bank_data = gl_bank.data
+        self.assertEqual(bank_data["summary"]["transaction_count"], 1)
+        self.assertEqual(Decimal(bank_data["summary"]["closing_balance"]), Decimal("500.00"))
+        self.assertEqual(bank_data["summary"]["closing_balance_side"], "DR")
+        self.assertEqual(Decimal(bank_data["transactions"][0]["debit"]), Decimal("500.00"))
+        self.assertEqual(Decimal(bank_data["transactions"][0]["running_balance"]), Decimal("500.00"))
+
+        # Query Sales ledger (Credit-normal revenue)
+        gl_sales = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_sales.id}")
+        self.assertEqual(gl_sales.status_code, status.HTTP_200_OK)
+        sales_data = gl_sales.data
+        self.assertEqual(sales_data["summary"]["transaction_count"], 1)
+        self.assertEqual(Decimal(sales_data["summary"]["closing_balance"]), Decimal("500.00"))
+        self.assertEqual(sales_data["summary"]["closing_balance_side"], "CR")
+        self.assertEqual(Decimal(sales_data["transactions"][0]["credit"]), Decimal("500.00"))
+        self.assertEqual(Decimal(sales_data["transactions"][0]["running_balance"]), Decimal("500.00"))
+
+    def test_draft_entry_does_not_appear_in_general_ledger(self):
+        # Create draft entry without posting
+        self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-10",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "999.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "999.00"},
+            ]
+        }, format="json")
+
+        gl_res = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_bank.id}")
+        self.assertEqual(gl_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(gl_res.data["summary"]["transaction_count"], 0)
+        self.assertEqual(Decimal(gl_res.data["summary"]["closing_balance"]), Decimal("0.00"))
+
+    def test_running_balance_and_multiple_entries_aggregation(self):
+        # Entry 1: Bank +1000, Sales +1000 (Jan 10)
+        e1 = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-10",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "1000.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "1000.00"},
+            ]
+        }, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{e1}/post/")
+
+        # Entry 2: Expense +400, Bank -400 (Jan 12)
+        e2 = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-12",
+            "lines": [
+                {"account": self.acc_expense.id, "debit": "400.00", "credit": "0.00"},
+                {"account": self.acc_bank.id, "debit": "0.00", "credit": "400.00"},
+            ]
+        }, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{e2}/post/")
+
+        # Entry 3: Bank +200, Sales +200 (Jan 14)
+        e3 = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-14",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "200.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "200.00"},
+            ]
+        }, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{e3}/post/")
+
+        gl_bank = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_bank.id}")
+        txs = gl_bank.data["transactions"]
+        self.assertEqual(len(txs), 3)
+
+        # Line 1: +1000 -> 1000.00
+        self.assertEqual(Decimal(txs[0]["running_balance"]), Decimal("1000.00"))
+        # Line 2: -400 -> 600.00
+        self.assertEqual(Decimal(txs[1]["running_balance"]), Decimal("600.00"))
+        # Line 3: +200 -> 800.00
+        self.assertEqual(Decimal(txs[2]["running_balance"]), Decimal("800.00"))
+
+        summary = gl_bank.data["summary"]
+        self.assertEqual(Decimal(summary["period_total_debit"]), Decimal("1200.00"))
+        self.assertEqual(Decimal(summary["period_total_credit"]), Decimal("400.00"))
+        self.assertEqual(Decimal(summary["closing_balance"]), Decimal("800.00"))
+        self.assertEqual(summary["closing_balance_side"], "DR")
+
+    def test_opening_balance_calculation_with_date_filter(self):
+        # Entry 1: Jan 10 (+1000)
+        e1 = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-10",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "1000.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "1000.00"},
+            ]
+        }, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{e1}/post/")
+
+        # Entry 2: Jan 12 (-400)
+        e2 = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-12",
+            "lines": [
+                {"account": self.acc_expense.id, "debit": "400.00", "credit": "0.00"},
+                {"account": self.acc_bank.id, "debit": "0.00", "credit": "400.00"},
+            ]
+        }, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{e2}/post/")
+
+        # Entry 3: Jan 15 (+300)
+        e3 = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "300.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "300.00"},
+            ]
+        }, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{e3}/post/")
+
+        # Query with start_date="2026-01-14":
+        # Prior balance = 1000 - 400 = 600.00 opening balance
+        gl_res = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_bank.id}&start_date=2026-01-14")
+        self.assertEqual(gl_res.status_code, status.HTTP_200_OK)
+        data = gl_res.data
+        self.assertEqual(Decimal(data["summary"]["opening_balance"]), Decimal("600.00"))
+        self.assertEqual(data["summary"]["opening_balance_side"], "DR")
+        self.assertEqual(len(data["transactions"]), 1)
+        self.assertEqual(Decimal(data["transactions"][0]["running_balance"]), Decimal("900.00"))
+        self.assertEqual(Decimal(data["summary"]["closing_balance"]), Decimal("900.00"))
+
+    def test_general_ledger_summary_endpoint(self):
+        # Post a transaction
+        e = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-10",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "250.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "250.00"},
+            ]
+        }, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{e}/post/")
+
+        # Request summary
+        res = self.client.get("/api/accounting/general-ledger/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data["totals"]["is_balanced"])
+        self.assertEqual(Decimal(res.data["totals"]["grand_total_debit"]), Decimal("250.00"))
+        self.assertEqual(Decimal(res.data["totals"]["grand_total_credit"]), Decimal("250.00"))
+
+    def test_reversal_entry_nets_to_zero_in_ledger(self):
+        # Post entry
+        e = self.client.post("/api/accounting/journal-entries/", {
+            "transaction_date": "2026-01-10",
+            "lines": [
+                {"account": self.acc_bank.id, "debit": "700.00", "credit": "0.00"},
+                {"account": self.acc_sales.id, "debit": "0.00", "credit": "700.00"},
+            ]
+        }, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{e}/post/")
+
+        # Reverse entry
+        self.client.post(f"/api/accounting/journal-entries/{e}/reverse/", {"reason": "Cancelled"}, format="json")
+
+        # Bank ledger must have both original and reversal, ending at 0.00
+        gl_bank = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_bank.id}")
+        self.assertEqual(len(gl_bank.data["transactions"]), 2)
+        self.assertEqual(Decimal(gl_bank.data["summary"]["closing_balance"]), Decimal("0.00"))
+
+    def test_tenant_isolation_in_general_ledger(self):
+        # Company 1 admin queries Company 2 account -> 400
+        res = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_comp2.id}")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unauthorized_user_denied_general_ledger(self):
+        self.client.force_authenticate(user=self.store_user)
+        res = self.client.get("/api/accounting/general-ledger/summary/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_empty_account_ledger_returns_clean_zero_state(self):
+        gl_res = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_expense.id}")
+        self.assertEqual(gl_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(gl_res.data["summary"]["transaction_count"], 0)
+        self.assertEqual(Decimal(gl_res.data["summary"]["opening_balance"]), Decimal("0.00"))
+        self.assertEqual(Decimal(gl_res.data["summary"]["closing_balance"]), Decimal("0.00"))
+
+
+

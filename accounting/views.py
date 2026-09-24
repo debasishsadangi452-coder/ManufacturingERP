@@ -403,3 +403,126 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             }, status=status.HTTP_200_OK)
 
 
+from .general_ledger import get_account_ledger, get_general_ledger_summary
+
+
+class GeneralLedgerViewSet(viewsets.ViewSet):
+    """
+    Blueprint #9: General Ledger Layer.
+    Derives account-level transaction ledgers, running balances, opening/closing
+    balances, and company-wide General Ledger summaries directly from posted
+    double-entry journal entries.
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        """
+        GET /api/accounting/general-ledger/
+        If `account` query parameter is provided, returns the detailed account ledger.
+        Otherwise returns the full company General Ledger summary.
+        """
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        account_id = request.query_params.get("account")
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        fiscal_year_id = request.query_params.get("fiscal_year")
+        accounting_period_id = request.query_params.get("accounting_period")
+        status_param = request.query_params.get("status")
+        search = request.query_params.get("search")
+        category = request.query_params.get("category")
+
+        try:
+            if account_id:
+                ledger = get_account_ledger(
+                    company=company,
+                    account_id=account_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    fiscal_year_id=fiscal_year_id,
+                    accounting_period_id=accounting_period_id,
+                    status=status_param,
+                    search=search,
+                )
+                return Response(ledger, status=status.HTTP_200_OK)
+            else:
+                summary = get_general_ledger_summary(
+                    company=company,
+                    fiscal_year_id=fiscal_year_id,
+                    accounting_period_id=accounting_period_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    category=category,
+                    search=search,
+                )
+                return Response(summary, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/general-ledger/summary/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        fiscal_year_id = request.query_params.get("fiscal_year")
+        accounting_period_id = request.query_params.get("accounting_period")
+        category = request.query_params.get("category")
+        search = request.query_params.get("search")
+
+        try:
+            res = get_general_ledger_summary(
+                company=company,
+                fiscal_year_id=fiscal_year_id,
+                accounting_period_id=accounting_period_id,
+                start_date=start_date,
+                end_date=end_date,
+                category=category,
+                search=search,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["get"], url_path="ledger")
+    def account_ledger(self, request, pk=None):
+        """GET /api/accounting/general-ledger/{account_id}/ledger/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        fiscal_year_id = request.query_params.get("fiscal_year")
+        accounting_period_id = request.query_params.get("accounting_period")
+        status_param = request.query_params.get("status")
+        search = request.query_params.get("search")
+
+        try:
+            res = get_account_ledger(
+                company=company,
+                account_id=pk,
+                start_date=start_date,
+                end_date=end_date,
+                fiscal_year_id=fiscal_year_id,
+                accounting_period_id=accounting_period_id,
+                status=status_param,
+                search=search,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
