@@ -252,6 +252,69 @@ class AccountingSettings(models.Model):
         default=False,
         help_text="If false, entries can only be posted to leaf (non-parent) accounts."
     )
+    # Section #14 — Inventory Accounting Policy Configuration
+    inventory_accounting_enabled = models.BooleanField(
+        default=True,
+        help_text="Enable or disable automated/subledger inventory accounting."
+    )
+    inventory_costing_method = models.CharField(
+        max_length=20,
+        default="fifo",
+        choices=[
+            ("fifo", "FIFO (First In, First Out)"),
+            ("standard", "Standard Cost"),
+            ("average", "Weighted Average"),
+        ],
+        help_text="Configured inventory costing valuation policy."
+    )
+    inventory_raw_material_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf asset account for Raw Materials inventory (e.g. 1210)"
+    )
+    inventory_finished_goods_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf asset account for Finished Goods inventory (e.g. 1230)"
+    )
+    inventory_clearing_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Clearing/offset account for vendor receipts (e.g. 2010 AP or 2020 GRNI)"
+    )
+    inventory_cogs_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Offset account for inventory issues/consumption (e.g. 5010 Direct Materials Consumed)"
+    )
+    inventory_adjustment_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Offset account for cycle count and manual inventory adjustments (e.g. 5090 Inventory Adjustments)"
+    )
+    inventory_write_off_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Expense account for damaged/expired inventory write-offs (e.g. 6520 Inventory Write-off)"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -266,6 +329,18 @@ class AccountingSettings(models.Model):
         if self.retained_earnings_account and self.company_id:
             if self.retained_earnings_account.company_id != self.company_id:
                 raise ValidationError({"retained_earnings_account": _("Retained earnings account must belong to this company.")})
+        # Validate inventory account company consistency
+        inv_account_fields = [
+            ("inventory_raw_material_account", self.inventory_raw_material_account),
+            ("inventory_finished_goods_account", self.inventory_finished_goods_account),
+            ("inventory_clearing_account", self.inventory_clearing_account),
+            ("inventory_cogs_account", self.inventory_cogs_account),
+            ("inventory_adjustment_account", self.inventory_adjustment_account),
+            ("inventory_write_off_account", self.inventory_write_off_account),
+        ]
+        for field_name, acc in inv_account_fields:
+            if acc and self.company_id and acc.company_id != self.company_id:
+                raise ValidationError({field_name: _(f"{field_name} must belong to this company.")})
 
     def save(self, *args, **kwargs):
         self.full_clean()

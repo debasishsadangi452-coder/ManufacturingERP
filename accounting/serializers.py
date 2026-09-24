@@ -184,6 +184,18 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
     current_fiscal_year_name = serializers.ReadOnlyField(source="current_fiscal_year.name")
     retained_earnings_account_code = serializers.ReadOnlyField(source="retained_earnings_account.code")
     retained_earnings_account_name = serializers.ReadOnlyField(source="retained_earnings_account.name")
+    inventory_raw_material_account_code = serializers.ReadOnlyField(source="inventory_raw_material_account.code")
+    inventory_raw_material_account_name = serializers.ReadOnlyField(source="inventory_raw_material_account.name")
+    inventory_finished_goods_account_code = serializers.ReadOnlyField(source="inventory_finished_goods_account.code")
+    inventory_finished_goods_account_name = serializers.ReadOnlyField(source="inventory_finished_goods_account.name")
+    inventory_clearing_account_code = serializers.ReadOnlyField(source="inventory_clearing_account.code")
+    inventory_clearing_account_name = serializers.ReadOnlyField(source="inventory_clearing_account.name")
+    inventory_cogs_account_code = serializers.ReadOnlyField(source="inventory_cogs_account.code")
+    inventory_cogs_account_name = serializers.ReadOnlyField(source="inventory_cogs_account.name")
+    inventory_adjustment_account_code = serializers.ReadOnlyField(source="inventory_adjustment_account.code")
+    inventory_adjustment_account_name = serializers.ReadOnlyField(source="inventory_adjustment_account.name")
+    inventory_write_off_account_code = serializers.ReadOnlyField(source="inventory_write_off_account.code")
+    inventory_write_off_account_name = serializers.ReadOnlyField(source="inventory_write_off_account.name")
 
     class Meta:
         model = AccountingSettings
@@ -197,6 +209,26 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "retained_earnings_account_name",
             "lock_date",
             "allow_direct_posting_to_parent_accounts",
+            "inventory_accounting_enabled",
+            "inventory_costing_method",
+            "inventory_raw_material_account",
+            "inventory_raw_material_account_code",
+            "inventory_raw_material_account_name",
+            "inventory_finished_goods_account",
+            "inventory_finished_goods_account_code",
+            "inventory_finished_goods_account_name",
+            "inventory_clearing_account",
+            "inventory_clearing_account_code",
+            "inventory_clearing_account_name",
+            "inventory_cogs_account",
+            "inventory_cogs_account_code",
+            "inventory_cogs_account_name",
+            "inventory_adjustment_account",
+            "inventory_adjustment_account_code",
+            "inventory_adjustment_account_name",
+            "inventory_write_off_account",
+            "inventory_write_off_account_code",
+            "inventory_write_off_account_name",
             "created_at",
             "updated_at",
         ]
@@ -205,6 +237,18 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "current_fiscal_year_name",
             "retained_earnings_account_code",
             "retained_earnings_account_name",
+            "inventory_raw_material_account_code",
+            "inventory_raw_material_account_name",
+            "inventory_finished_goods_account_code",
+            "inventory_finished_goods_account_name",
+            "inventory_clearing_account_code",
+            "inventory_clearing_account_name",
+            "inventory_cogs_account_code",
+            "inventory_cogs_account_name",
+            "inventory_adjustment_account_code",
+            "inventory_adjustment_account_name",
+            "inventory_write_off_account_code",
+            "inventory_write_off_account_name",
             "created_at",
             "updated_at",
         ]

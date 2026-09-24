@@ -1126,6 +1126,209 @@ class PurchaseAccountingViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+from .inventory_accounting import (
+    get_inventory_policy,
+    resolve_inventory_asset_account,
+    resolve_inventory_clearing_account,
+    resolve_inventory_cogs_account,
+    resolve_inventory_adjustment_account,
+    resolve_inventory_write_off_account,
+    get_inventory_accounting_preview,
+    post_inventory_movement_to_accounting,
+    reverse_inventory_accounting,
+    post_inventory_valuation_event,
+    get_inventory_accounting_summary,
+    get_inventory_accounting_movements,
+)
+
+
+class InventoryAccountingViewSet(viewsets.ViewSet):
+    """
+    Inventory-to-Accounting Subledger API (Blueprint Section No. 14).
+    Connects operational inventory movements (receipt, issue, transfer, adjustment,
+    write-off, and revaluation) directly to the Double-Entry Engine (#8) and General Ledger (#9).
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/inventory/summary/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        as_of_date = request.query_params.get("as_of_date")
+        try:
+            res = get_inventory_accounting_summary(company=company, as_of_date=as_of_date)
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="movements")
+    def movements(self, request):
+        """GET /api/accounting/inventory/movements/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        search = request.query_params.get("search")
+        movement_type = request.query_params.get("movement_type")
+        status_filter = request.query_params.get("status")
+        try:
+            res = get_inventory_accounting_movements(
+                company=company,
+                search=search,
+                movement_type=movement_type,
+                status_filter=status_filter,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="preview")
+    def preview(self, request, pk=None):
+        """POST /api/accounting/inventory/{id}/preview/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        inv_account_id = request.data.get("inventory_account_id")
+        offset_account_id = request.data.get("offset_account_id")
+        unit_cost = request.data.get("unit_cost_override")
+        try:
+            res = get_inventory_accounting_preview(
+                movement_id=pk,
+                company=company,
+                inventory_account_id=inv_account_id,
+                offset_account_id=offset_account_id,
+                unit_cost_override=unit_cost,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="post")
+    def post_movement(self, request, pk=None):
+        """POST /api/accounting/inventory/{id}/post/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        inv_account_id = request.data.get("inventory_account_id")
+        offset_account_id = request.data.get("offset_account_id")
+        unit_cost = request.data.get("unit_cost_override")
+        transaction_date = request.data.get("transaction_date")
+        try:
+            posted_je = post_inventory_movement_to_accounting(
+                movement_id=pk,
+                user=request.user,
+                company=company,
+                inventory_account_id=inv_account_id,
+                offset_account_id=offset_account_id,
+                unit_cost_override=unit_cost,
+                transaction_date=transaction_date,
+            )
+            return Response({
+                "message": f"Inventory movement #{pk} posted successfully to General Ledger.",
+                "journal_entry_id": posted_je.id,
+                "journal_entry_number": posted_je.entry_number,
+                "transaction_date": posted_je.transaction_date.isoformat(),
+                "status": posted_je.status,
+            }, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reverse")
+    def reverse_movement(self, request, pk=None):
+        """POST /api/accounting/inventory/{id}/reverse/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        reason = request.data.get("reason", "")
+        try:
+            res = reverse_inventory_accounting(
+                movement_id=pk,
+                user=request.user,
+                company=company,
+                reason=reason,
+            )
+            reversal_je = res.get("reversal_journal_entry")
+            return Response({
+                "message": f"Inventory movement #{pk} accounting reversed successfully.",
+                "movement_id": res["movement_id"],
+                "status": res["status"],
+                "reversal_journal_entry_id": reversal_je.id if reversal_je else None,
+                "reversal_journal_entry_number": reversal_je.entry_number if reversal_je else None,
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="revalue")
+    def revalue(self, request):
+        """POST /api/accounting/inventory/revalue/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        item_id = request.data.get("item_id")
+        warehouse_id = request.data.get("warehouse_id")
+        new_unit_cost = request.data.get("new_unit_cost")
+        reason = request.data.get("reason", "")
+        transaction_date = request.data.get("transaction_date")
+        if not item_id or new_unit_cost is None:
+            return Response({"error": "item_id and new_unit_cost are required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            res = post_inventory_valuation_event(
+                item_id=item_id,
+                warehouse_id=warehouse_id,
+                new_unit_cost=new_unit_cost,
+                user=request.user,
+                company=company,
+                reason=reason,
+                transaction_date=transaction_date,
+            )
+            return Response(res, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="settings")
+    def policy_settings(self, request):
+        """GET /api/accounting/inventory/settings/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            policy = get_inventory_policy(company)
+            # Add resolved leaf account metadata
+            raw_acc = resolve_inventory_asset_account(Item(category="raw_material"), company)
+            fg_acc = resolve_inventory_asset_account(Item(category="finished_good"), company)
+            clearing_acc = resolve_inventory_clearing_account(company)
+            cogs_acc = resolve_inventory_cogs_account(Item(category="raw_material"), company)
+            adj_acc = resolve_inventory_adjustment_account(company)
+            write_off_acc = resolve_inventory_write_off_account(company)
+            return Response({
+                "policy": policy,
+                "resolved_accounts": {
+                    "raw_material": {"id": raw_acc.id, "code": raw_acc.code, "name": raw_acc.name},
+                    "finished_goods": {"id": fg_acc.id, "code": fg_acc.code, "name": fg_acc.name},
+                    "clearing": {"id": clearing_acc.id, "code": clearing_acc.code, "name": clearing_acc.name},
+                    "cogs": {"id": cogs_acc.id, "code": cogs_acc.code, "name": cogs_acc.name},
+                    "adjustment": {"id": adj_acc.id, "code": adj_acc.code, "name": adj_acc.name},
+                    "write_off": {"id": write_off_acc.id, "code": write_off_acc.code, "name": write_off_acc.name},
+                }
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
 
 
 

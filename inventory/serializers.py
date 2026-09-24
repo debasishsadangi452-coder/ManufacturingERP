@@ -175,10 +175,48 @@ class StockMovementSerializer(serializers.ModelSerializer):
     item_name = serializers.ReadOnlyField(source='item.name')
     warehouse_name = serializers.ReadOnlyField(source='warehouse.name')
     created_by_name = serializers.ReadOnlyField(source='created_by.username')
+    accounting_status = serializers.SerializerMethodField()
+    journal_entry_id = serializers.SerializerMethodField()
+    journal_entry_number = serializers.SerializerMethodField()
+    valuation_amount = serializers.SerializerMethodField()
+
     class Meta:
         model = StockMovement
-        fields = ['id', 'item', 'item_name', 'warehouse', 'warehouse_name',
-                  'movement_type', 'quantity', 'reference', 'created_by_name', 'created_at']
+        fields = [
+            'id', 'item', 'item_name', 'warehouse', 'warehouse_name',
+            'movement_type', 'quantity', 'reference', 'created_by_name', 'created_at',
+            'accounting_status', 'journal_entry_id', 'journal_entry_number', 'valuation_amount',
+        ]
+
+    def _get_journal_entry(self, obj):
+        if not hasattr(obj, "_cached_je"):
+            from accounting.models import JournalEntry
+            obj._cached_je = JournalEntry.objects.filter(
+                source_module="inventory",
+                source_id=obj.id,
+            ).first()
+        return obj._cached_je
+
+    def get_accounting_status(self, obj):
+        je = self._get_journal_entry(obj)
+        if je:
+            return je.status
+        ref = (obj.reference or "").lower()
+        if ref.startswith("transfer to") or ref.startswith("transfer from") or "transfer #" in ref:
+            return "not_required"
+        return "pending"
+
+    def get_journal_entry_id(self, obj):
+        je = self._get_journal_entry(obj)
+        return je.id if je else None
+
+    def get_journal_entry_number(self, obj):
+        je = self._get_journal_entry(obj)
+        return je.entry_number if je else None
+
+    def get_valuation_amount(self, obj):
+        cost = getattr(obj.item, "purchase_cost", 0) or 0
+        return round(float(abs(obj.quantity)) * float(cost), 2)
 
 
 class QuickBooksOnboardingSerializer(serializers.ModelSerializer):

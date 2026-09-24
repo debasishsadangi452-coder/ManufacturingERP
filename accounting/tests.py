@@ -2351,6 +2351,399 @@ class PurchaseAccountingTests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
+from inventory.models import Item, Warehouse, Stock, StockMovement
+
+
+class InventoryAccountingTests(TestCase):
+    """
+    Automated Unit & Integration Tests for Blueprint Section #14: Inventory-to-Accounting.
+    Validates receipt, issue, transfer, adjustment, write-off, revaluation, idempotency,
+    reversals, and General Ledger posting.
+    """
+    def setUp(self):
+        self.company = Company.objects.create(name="Brew Craft Co", slug="brewcraft")
+        ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        self.fy = seed_standard_fiscal_year(self.company, 2026)
+
+        self.user = User.objects.create_user(
+            username="inventory_accountant",
+            email="inv@brewcraft.com",
+            role="finance",
+            company=self.company,
+        )
+
+        self.warehouse = Warehouse.objects.create(
+            company=self.company,
+            name="Main Plant Warehouse",
+            location="Building A",
+        )
+        self.secondary_warehouse = Warehouse.objects.create(
+            company=self.company,
+            name="Cold Storage Facility",
+            location="Building C",
+        )
+
+        self.raw_item = Item.objects.create(
+            company=self.company,
+            name="Organic Barley Malt",
+            category="raw_material",
+            unit="kg",
+            purchase_cost=Decimal("5.00"),
+            selling_price=Decimal("0.00"),
+        )
+        self.finished_item = Item.objects.create(
+            company=self.company,
+            name="Craft IPA 6-Pack",
+            category="finished_good",
+            unit="case",
+            purchase_cost=Decimal("12.00"),
+            selling_price=Decimal("24.00"),
+        )
+
+    def test_inventory_receipt_creates_balanced_journal(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import (
+            determine_movement_accounting_requirement,
+            post_inventory_movement_to_accounting,
+        )
+
+        # Operational receipt: 100 kg at $5.00 = $500.00
+        increase_stock(self.raw_item, self.warehouse, 100, user=self.user, reference="Vendor Delivery PO#1001")
+        movement = StockMovement.objects.filter(item=self.raw_item).latest("created_at")
+
+        requires, reason, event_subtype = determine_movement_accounting_requirement(movement, self.company)
+        self.assertTrue(requires)
+        self.assertEqual(event_subtype, "receipt")
+
+        je = post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.source_module, "inventory")
+        self.assertEqual(je.source_id, movement.id)
+        self.assertEqual(je.lines.count(), 2)
+
+        dr_line = je.lines.filter(debit__gt=0).first()
+        cr_line = je.lines.filter(credit__gt=0).first()
+
+        self.assertEqual(dr_line.account.code, "1210")  # Raw Materials Inventory Asset
+        self.assertEqual(dr_line.debit, Decimal("500.00"))
+        self.assertIn(cr_line.account.code, ["2010", "2020"])  # Clearing or AP Trade
+        self.assertEqual(cr_line.credit, Decimal("500.00"))
+
+    def test_finished_goods_receipt_uses_finished_goods_asset_account(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        # Production receipt: 50 cases of finished goods at $12.00 = $600.00
+        increase_stock(self.finished_item, self.warehouse, 50, user=self.user, reference="Finished Batch #B-101")
+        movement = StockMovement.objects.filter(item=self.finished_item).latest("created_at")
+
+        je = post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+
+        dr_line = je.lines.filter(debit__gt=0).first()
+        self.assertEqual(dr_line.account.code, "1230")  # Finished Goods Inventory
+        self.assertEqual(dr_line.debit, Decimal("600.00"))
+
+    def test_inventory_issue_consumption_creates_cogs_entry(self):
+        from inventory.services import increase_stock, decrease_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        # Inward stock first
+        increase_stock(self.raw_item, self.warehouse, 200, user=self.user, reference="Initial Stock")
+        # Issue for batch production: 40 kg at $5.00 = $200.00
+        decrease_stock(self.raw_item, self.warehouse, 40, user=self.user, reference="Batch Production #201")
+        out_movement = StockMovement.objects.filter(item=self.raw_item, movement_type="OUT").latest("created_at")
+
+        je = post_inventory_movement_to_accounting(out_movement.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+
+        dr_line = je.lines.filter(debit__gt=0).first()
+        cr_line = je.lines.filter(credit__gt=0).first()
+
+        self.assertEqual(dr_line.account.code, "5010")  # Direct Raw Materials Consumed (COGS)
+        self.assertEqual(dr_line.debit, Decimal("200.00"))
+        self.assertEqual(cr_line.account.code, "1210")  # Raw Materials Inventory Asset
+        self.assertEqual(cr_line.credit, Decimal("200.00"))
+
+    def test_internal_warehouse_transfer_does_not_create_redundant_gl_entry(self):
+        from inventory.services import increase_stock
+        from inventory.views import StockViewSet
+        from accounting.inventory_accounting import (
+            determine_movement_accounting_requirement,
+            post_inventory_movement_to_accounting,
+        )
+
+        increase_stock(self.raw_item, self.warehouse, 100, user=self.user, reference="Initial Stock")
+        # Simulate transfer out movement
+        transfer_out = StockMovement.objects.create(
+            item=self.raw_item,
+            warehouse=self.warehouse,
+            movement_type="OUT",
+            quantity=30,
+            reference=f"Transfer to {self.secondary_warehouse.name}",
+            created_by=self.user,
+        )
+
+        requires, reason, event_subtype = determine_movement_accounting_requirement(transfer_out, self.company)
+        self.assertFalse(requires)
+        self.assertEqual(event_subtype, "transfer_internal")
+
+        # Posting an internal transfer movement raises ValidationError
+        with self.assertRaises(ValidationError):
+            post_inventory_movement_to_accounting(transfer_out.id, user=self.user, company=self.company)
+
+    def test_positive_and_negative_inventory_adjustments(self):
+        from inventory.services import increase_stock, adjust_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        increase_stock(self.raw_item, self.warehouse, 50, user=self.user, reference="Initial Stock")
+
+        # 1. Positive adjustment (Found 10 extra: 50 -> 60, diff = +10 at $5 = $50 gain)
+        adjust_stock(self.raw_item, self.warehouse, 60, user=self.user, reference="Physical Count Variance Gain")
+        pos_mov = StockMovement.objects.filter(item=self.raw_item, movement_type="ADJUST").latest("created_at")
+
+        je_pos = post_inventory_movement_to_accounting(pos_mov.id, user=self.user, company=self.company)
+        self.assertEqual(je_pos.status, "posted")
+        dr_pos = je_pos.lines.filter(debit__gt=0).first()
+        cr_pos = je_pos.lines.filter(credit__gt=0).first()
+        self.assertEqual(dr_pos.account.code, "1210")  # DR Asset
+        self.assertEqual(dr_pos.debit, Decimal("50.00"))
+        self.assertEqual(cr_pos.account.code, "5090")  # CR Variance Gain
+        self.assertEqual(cr_pos.credit, Decimal("50.00"))
+
+        # 2. Negative adjustment (Shrinkage: 60 -> 45, diff = -15 at $5 = $75 loss)
+        adjust_stock(self.raw_item, self.warehouse, 45, user=self.user, reference="Physical Count Variance Loss")
+        neg_mov = StockMovement.objects.filter(item=self.raw_item, movement_type="ADJUST").latest("created_at")
+
+        je_neg = post_inventory_movement_to_accounting(neg_mov.id, user=self.user, company=self.company)
+        self.assertEqual(je_neg.status, "posted")
+        dr_neg = je_neg.lines.filter(debit__gt=0).first()
+        cr_neg = je_neg.lines.filter(credit__gt=0).first()
+        self.assertEqual(dr_neg.account.code, "5090")  # DR Adjustment Loss
+        self.assertEqual(dr_neg.debit, Decimal("75.00"))
+        self.assertEqual(cr_neg.account.code, "1210")  # CR Asset
+        self.assertEqual(cr_neg.credit, Decimal("75.00"))
+
+    def test_inventory_write_off_creates_loss_expense_entry(self):
+        from inventory.services import increase_stock, decrease_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        increase_stock(self.raw_item, self.warehouse, 50, user=self.user, reference="Initial Stock")
+        # Damaged stock write-off: 10 kg at $5.00 = $50.00
+        decrease_stock(self.raw_item, self.warehouse, 10, user=self.user, reference="Damaged moisture write-off")
+        write_off_mov = StockMovement.objects.filter(item=self.raw_item, movement_type="OUT").latest("created_at")
+
+        je = post_inventory_movement_to_accounting(write_off_mov.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+        dr_line = je.lines.filter(debit__gt=0).first()
+        cr_line = je.lines.filter(credit__gt=0).first()
+        self.assertEqual(dr_line.account.code, "6520")  # Inventory Loss & Write-off Expense
+        self.assertEqual(dr_line.debit, Decimal("50.00"))
+        self.assertEqual(cr_line.account.code, "1210")  # Inventory Asset
+        self.assertEqual(cr_line.credit, Decimal("50.00"))
+
+    def test_inventory_revaluation_event(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import post_inventory_valuation_event
+
+        # 100 kg on-hand at old cost $5.00 = $500.00
+        increase_stock(self.raw_item, self.warehouse, 100, user=self.user, reference="Initial Stock")
+
+        # Revalue to $6.50: New value = $650.00, Delta = +$150.00
+        res = post_inventory_valuation_event(
+            item_id=self.raw_item.id,
+            new_unit_cost=Decimal("6.50"),
+            user=self.user,
+            company=self.company,
+            reason="Market price index revaluation",
+        )
+        self.assertEqual(res["delta_amount"], 150.0)
+        self.raw_item.refresh_from_db()
+        self.assertEqual(self.raw_item.purchase_cost, Decimal("6.50"))
+
+        je = JournalEntry.objects.get(id=res["journal_entry_id"])
+        self.assertEqual(je.source_module, "inventory.valuation")
+        self.assertEqual(je.lines.count(), 2)
+        dr_line = je.lines.filter(debit__gt=0).first()
+        cr_line = je.lines.filter(credit__gt=0).first()
+        self.assertEqual(dr_line.account.code, "1210")
+        self.assertEqual(dr_line.debit, Decimal("150.00"))
+        self.assertEqual(cr_line.account.code, "5090")
+        self.assertEqual(cr_line.credit, Decimal("150.00"))
+
+        # Zero delta is rejected
+        with self.assertRaises(ValidationError):
+            post_inventory_valuation_event(
+                item_id=self.raw_item.id,
+                new_unit_cost=Decimal("6.50"),
+                user=self.user,
+                company=self.company,
+            )
+
+    def test_idempotency_prevents_duplicate_posting(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        increase_stock(self.raw_item, self.warehouse, 20, user=self.user, reference="Inward Batch")
+        movement = StockMovement.objects.filter(item=self.raw_item).latest("created_at")
+
+        # First post succeeds
+        je1 = post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+        self.assertEqual(je1.status, "posted")
+
+        # Second post must raise ValidationError
+        with self.assertRaises(ValidationError):
+            post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+
+        # Journal count for this movement is exactly 1
+        self.assertEqual(
+            JournalEntry.objects.filter(company=self.company, source_module="inventory", source_id=movement.id).count(),
+            1
+        )
+
+    def test_inventory_reversal_creates_mirrored_reversal_entry(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import (
+            post_inventory_movement_to_accounting,
+            reverse_inventory_accounting,
+        )
+
+        increase_stock(self.raw_item, self.warehouse, 30, user=self.user, reference="To Reverse")
+        movement = StockMovement.objects.filter(item=self.raw_item).latest("created_at")
+
+        je = post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+
+        res = reverse_inventory_accounting(movement.id, user=self.user, company=self.company, reason="Incorrect goods receipt")
+        self.assertEqual(res["status"], "reversed")
+        reversal_je = res["reversal_journal_entry"]
+        self.assertEqual(reversal_je.status, "posted")
+        self.assertEqual(reversal_je.reversal_of, je)
+
+        # Original journal marked reversed
+        je.refresh_from_db()
+        self.assertEqual(je.status, "reversed")
+
+    def test_accounting_disabled_policy(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import (
+            determine_movement_accounting_requirement,
+            post_inventory_movement_to_accounting,
+        )
+
+        # Disable inventory accounting in settings
+        settings = AccountingSettings.objects.get(company=self.company)
+        settings.inventory_accounting_enabled = False
+        settings.save()
+
+        increase_stock(self.raw_item, self.warehouse, 50, user=self.user, reference="When Disabled")
+        movement = StockMovement.objects.filter(item=self.raw_item).latest("created_at")
+
+        requires, reason, _ = determine_movement_accounting_requirement(movement, self.company)
+        self.assertFalse(requires)
+        self.assertIn("disabled", reason.lower())
+
+        with self.assertRaises(ValidationError):
+            post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+
+
+class InventoryAccountingAPITests(APITestCase):
+    """
+    Integration tests for Section #14 REST API endpoints.
+    """
+    def setUp(self):
+        self.client = APIClient()
+        self.company = Company.objects.create(name="Apex Brewing", slug="apexbrew")
+        ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        self.fy = seed_standard_fiscal_year(self.company, 2026)
+
+        self.user = User.objects.create_user(
+            username="finance_officer",
+            email="finance@apexbrew.com",
+            role="finance",
+            company=self.company,
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.warehouse = Warehouse.objects.create(
+            company=self.company,
+            name="Apex Main Warehouse",
+            location="Zone 1",
+        )
+        self.item = Item.objects.create(
+            company=self.company,
+            name="Crystal Hops",
+            category="raw_material",
+            unit="kg",
+            purchase_cost=Decimal("15.00"),
+        )
+
+        from inventory.services import increase_stock
+        increase_stock(self.item, self.warehouse, 20, user=self.user, reference="GRN-8801")
+        self.movement = StockMovement.objects.filter(item=self.item).latest("created_at")
+
+    def test_inventory_accounting_summary_endpoint(self):
+        res = self.client.get("/api/accounting/inventory/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("total_inventory_gl_value", res.data)
+        self.assertIn("total_movements_count", res.data)
+        self.assertIn("policy", res.data)
+
+    def test_inventory_movements_endpoint(self):
+        res = self.client.get("/api/accounting/inventory/movements/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(res.data) >= 1)
+        first = res.data[0]
+        self.assertEqual(first["id"], self.movement.id)
+        self.assertEqual(first["accounting_status"], "pending")
+        self.assertEqual(first["valuation_amount"], 300.0)
+
+    def test_inventory_preview_and_post_flow(self):
+        # 1. Preview
+        prev_res = self.client.post(f"/api/accounting/inventory/{self.movement.id}/preview/")
+        self.assertEqual(prev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(prev_res.data["valuation_amount"], 300.0)
+        self.assertTrue(prev_res.data["is_balanced"])
+        self.assertEqual(len(prev_res.data["lines"]), 2)
+
+        # 2. Post
+        post_res = self.client.post(f"/api/accounting/inventory/{self.movement.id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(post_res.data["status"], "posted")
+        je_id = post_res.data["journal_entry_id"]
+
+        # 3. Check movement status updated
+        mov_res = self.client.get("/api/accounting/inventory/movements/")
+        self.assertEqual(mov_res.status_code, status.HTTP_200_OK)
+        updated = next(m for m in mov_res.data if m["id"] == self.movement.id)
+        self.assertEqual(updated["accounting_status"], "posted")
+        self.assertEqual(updated["journal_entry_id"], je_id)
+
+        # 4. Duplicate post rejected
+        dup_res = self.client.post(f"/api/accounting/inventory/{self.movement.id}/post/")
+        self.assertEqual(dup_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been posted", str(dup_res.data).lower())
+
+        # 5. Reverse
+        rev_res = self.client.post(f"/api/accounting/inventory/{self.movement.id}/reverse/", {"reason": "Test reversal"})
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "reversed")
+
+    def test_inventory_revaluation_endpoint(self):
+        # On-hand is 20 kg at $15.00 = $300.00. Revalue to $18.00 = $360.00, Delta = $60.00
+        res = self.client.post("/api/accounting/inventory/revalue/", {
+            "item_id": self.item.id,
+            "new_unit_cost": "18.00",
+            "reason": "Quarterly market adjustment",
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data["delta_amount"], 60.0)
+        self.assertEqual(res.data["new_unit_cost"], 18.0)
+
+
+
 
 
 
