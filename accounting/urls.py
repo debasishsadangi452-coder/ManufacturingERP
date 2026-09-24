@@ -11,6 +11,7 @@ from .views import (
     JournalEntryViewSet,
     GeneralLedgerViewSet,
     AccountsReceivableViewSet,
+    AccountsPayableViewSet,
 )
 
 router = DefaultRouter()
@@ -24,6 +25,7 @@ router.register(r'erp-context', ERPContextViewSet, basename='accounting-erp-cont
 router.register(r'journal-entries', JournalEntryViewSet, basename='accounting-journal-entries')
 router.register(r'general-ledger', GeneralLedgerViewSet, basename='accounting-general-ledger')
 router.register(r'receivables', AccountsReceivableViewSet, basename='accounting-receivables')
+router.register(r'payables', AccountsPayableViewSet, basename='accounting-payables')
 
 urlpatterns = [
     path('', include(router.urls)),

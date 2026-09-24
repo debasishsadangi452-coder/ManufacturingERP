@@ -1,4 +1,5 @@
 from django.db import models
+from django.utils import timezone
 from inventory.models import Item, Warehouse
 from decimal import Decimal
 
@@ -187,6 +188,7 @@ class Bill(models.Model):
 
     STATUS_CHOICES = [
         ("open", "Open"),
+        ("partial", "Partially Paid"),
         ("paid", "Paid"),
         ("cancelled", "Cancelled"),
     ]
@@ -202,6 +204,7 @@ class Bill(models.Model):
     bill_date = models.DateField()
     due_date = models.DateField(null=True, blank=True)
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="open")
     quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True)
     quickbooks_sync_token = models.CharField(max_length=100, blank=True)
@@ -210,6 +213,15 @@ class Bill(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+    @property
+    def balance_due(self):
+        return max(Decimal("0.00"), self.total_amount - self.amount_paid)
+
+    def apply_payment(self, amount):
+        self.amount_paid += amount
+        self.status = "paid" if self.amount_paid >= self.total_amount else "partial"
+        self.save(update_fields=["amount_paid", "status"])
 
     def __str__(self):
         return f"Bill {self.bill_number or self.id} from {self.vendor.name}"
@@ -222,3 +234,33 @@ class BillLine(models.Model):
     quantity = models.FloatField()
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
     amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+
+class VendorPayment(models.Model):
+    METHOD_CHOICES = [
+        ("cash", "Cash"),
+        ("bank_transfer", "Bank Transfer"),
+        ("card", "Card"),
+        ("cheque", "Cheque"),
+        ("upi", "UPI"),
+        ("other", "Other"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name="payments")
+    bill = models.ForeignKey(
+        Bill, null=True, blank=True, on_delete=models.CASCADE, related_name="payments"
+    )
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    payment_date = models.DateField(default=timezone.localdate)
+    method = models.CharField(max_length=20, choices=METHOD_CHOICES, default="bank_transfer")
+    reference = models.CharField(max_length=100, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-payment_date", "-created_at"]
+
+    def __str__(self):
+        return f"VPMT-{self.id} (${self.amount}) to {self.vendor.name}"

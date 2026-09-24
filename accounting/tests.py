@@ -1157,5 +1157,420 @@ class AccountsReceivableTests(APITestCase):
         self.assertIn("exceeds balance due", str(res2.data).lower())
 
 
+from procurement.models import Vendor, Bill, VendorPayment
+
+
+class AccountsPayableTests(APITestCase):
+    """
+    Test suite for Master Accounting Blueprint Section #11: Accounts Payable (AP).
+    Covers vendor payables, bill posting, payment allocation, aging engine,
+    GL integration, tenant isolation, and period locking.
+    """
+
+    def setUp(self):
+        # 1. Tenants
+        self.comp1 = Company.objects.create(name="Brewing Co", slug="brewco")
+        self.comp2 = Company.objects.create(name="Distillery Co", slug="distco")
+
+        # 2. Users
+        self.finance_user = User.objects.create_user(
+            username="finuser_ap",
+            email="fin_ap@brew.com",
+            role="finance",
+            company=self.comp1,
+            password="pass"
+        )
+        self.store_user = User.objects.create_user(
+            username="storeuser_ap",
+            email="store_ap@brew.com",
+            role="store_manager",
+            company=self.comp1,
+            password="pass"
+        )
+        self.comp2_user = User.objects.create_user(
+            username="comp2fin_ap",
+            email="fin_ap@dist.com",
+            role="finance",
+            company=self.comp2,
+            password="pass"
+        )
+
+        # 3. Seed Accounts & Fiscal Year
+        seed_standard_chart_of_accounts(self.comp1)
+        seed_standard_fiscal_year(self.comp1, 2026)
+        seed_standard_chart_of_accounts(self.comp2)
+        seed_standard_fiscal_year(self.comp2, 2026)
+
+        self.acc_ap = Account.objects.get(company=self.comp1, code="2010")
+        self.acc_raw_inv = Account.objects.get(company=self.comp1, code="1210")
+        self.acc_bank = Account.objects.get(company=self.comp1, code="1010")
+
+        # 4. Vendors
+        self.vendor1 = Vendor.objects.create(
+            company=self.comp1,
+            name="Hop Supplier Co",
+            email="hops@supplier.com",
+            payment_terms="Net 30",
+        )
+        self.vendor_comp2 = Vendor.objects.create(
+            company=self.comp2,
+            name="Rival Grain Co",
+            email="grain@rival.com",
+        )
+
+        self.client.force_authenticate(user=self.finance_user)
+
+    def test_post_bill_to_ap_creates_balanced_journal_entry(self):
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-HOP-101",
+            bill_date=date(2026, 1, 15),
+            due_date=date(2026, 2, 14),
+            total_amount=Decimal("1200.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        res = self.client.post("/api/accounting/payables/post-bill/", {
+            "bill_id": bill.id
+        }, format="json")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        je_id = res.data["journal_entry_id"]
+
+        je = JournalEntry.objects.get(id=je_id)
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.company, self.comp1)
+        self.assertEqual(je.lines.count(), 2)
+
+        # Verify Debit Raw Materials Inventory 1210, Credit Accounts Payable 2010
+        debit_line = je.lines.get(account=self.acc_raw_inv)
+        credit_line = je.lines.get(account=self.acc_ap)
+        self.assertEqual(debit_line.debit, Decimal("1200.00"))
+        self.assertEqual(debit_line.credit, Decimal("0.00"))
+        self.assertEqual(credit_line.debit, Decimal("0.00"))
+        self.assertEqual(credit_line.credit, Decimal("1200.00"))
+
+        # Verify bill list endpoint shows is_posted_to_gl=True
+        bills_res = self.client.get("/api/accounting/payables/bills/")
+        self.assertEqual(bills_res.status_code, status.HTTP_200_OK)
+        item = [x for x in bills_res.data if x["id"] == bill.id][0]
+        self.assertTrue(item["is_posted_to_gl"])
+        self.assertEqual(item["journal_entry_id"], je.id)
+
+    def test_posted_ap_bill_flows_into_general_ledger(self):
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-HOP-102",
+            bill_date=date(2026, 1, 15),
+            due_date=date(2026, 2, 14),
+            total_amount=Decimal("2500.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        self.client.post("/api/accounting/payables/post-bill/", {"bill_id": bill.id}, format="json")
+
+        # Check Account 2010 (AP) in General Ledger (Normal balance is Credit)
+        gl_ap = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_ap.id}")
+        self.assertEqual(gl_ap.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(gl_ap.data["summary"]["period_total_credit"]), Decimal("2500.00"))
+        self.assertEqual(Decimal(gl_ap.data["summary"]["closing_balance"]), Decimal("2500.00"))
+        self.assertEqual(gl_ap.data["summary"]["closing_balance_side"], "CR")
+
+        # Check Account 1210 (Raw Materials Inventory) in General Ledger
+        gl_inv = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_raw_inv.id}")
+        self.assertEqual(gl_inv.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(gl_inv.data["summary"]["period_total_debit"]), Decimal("2500.00"))
+        self.assertEqual(Decimal(gl_inv.data["summary"]["closing_balance"]), Decimal("2500.00"))
+        self.assertEqual(gl_inv.data["summary"]["closing_balance_side"], "DR")
+
+    def test_draft_bill_does_not_affect_gl(self):
+        Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-DRAFT-1",
+            bill_date=date(2026, 1, 15),
+            total_amount=Decimal("3000.00"),
+            status="open",
+        )
+        # Verify GL has zero balance before posting
+        gl_ap = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_ap.id}")
+        self.assertEqual(gl_ap.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(gl_ap.data["summary"]["period_total_credit"]), Decimal("0.00"))
+        self.assertEqual(Decimal(gl_ap.data["summary"]["closing_balance"]), Decimal("0.00"))
+
+    def test_duplicate_bill_posting_is_prevented(self):
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-HOP-103",
+            bill_date=date(2026, 1, 15),
+            total_amount=Decimal("500.00"),
+            status="open",
+        )
+        # First post succeeds
+        res1 = self.client.post("/api/accounting/payables/post-bill/", {"bill_id": bill.id}, format="json")
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+
+        # Second post is rejected with duplicate error
+        res2 = self.client.post("/api/accounting/payables/post-bill/", {"bill_id": bill.id}, format="json")
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been posted", str(res2.data))
+
+    def test_partial_and_full_vendor_payment_allocation(self):
+        bill = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-HOP-104",
+            bill_date=date(2026, 1, 10),
+            due_date=date(2026, 2, 10),
+            total_amount=Decimal("1000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        self.client.post("/api/accounting/payables/post-bill/", {"bill_id": bill.id}, format="json")
+
+        # 1. Partial payment: $400
+        res1 = self.client.post("/api/accounting/payables/record-payment/", {
+            "vendor_id": self.vendor1.id,
+            "amount": "400.00",
+            "payment_date": "2026-01-20",
+            "method": "bank_transfer",
+            "reference": "VWIRE-400",
+            "allocations": [{"bill_id": bill.id, "amount": "400.00"}]
+        }, format="json")
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.status, "partial")
+        self.assertEqual(bill.amount_paid, Decimal("400.00"))
+        self.assertEqual(bill.balance_due, Decimal("600.00"))
+
+        # Verify AP GL closing credit balance is now $600
+        gl_ap = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_ap.id}")
+        self.assertEqual(Decimal(gl_ap.data["summary"]["closing_balance"]), Decimal("600.00"))
+
+        # 2. Full remaining payment: $600
+        res2 = self.client.post("/api/accounting/payables/record-payment/", {
+            "vendor_id": self.vendor1.id,
+            "amount": "600.00",
+            "payment_date": "2026-01-25",
+            "method": "bank_transfer",
+            "reference": "VWIRE-600",
+            "allocations": [{"bill_id": bill.id, "amount": "600.00"}]
+        }, format="json")
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+
+        bill.refresh_from_db()
+        self.assertEqual(bill.status, "paid")
+        self.assertEqual(bill.balance_due, Decimal("0.00"))
+
+        # AP GL is fully settled (closing balance 0.00)
+        gl_ap2 = self.client.get(f"/api/accounting/general-ledger/?account={self.acc_ap.id}")
+        self.assertEqual(Decimal(gl_ap2.data["summary"]["closing_balance"]), Decimal("0.00"))
+
+    def test_multiple_bill_payment_allocation(self):
+        bill1 = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-HOP-105A",
+            bill_date=date(2026, 1, 5),
+            total_amount=Decimal("350.00"),
+            status="open",
+        )
+        bill2 = Bill.objects.create(
+            company=self.comp1,
+            vendor=self.vendor1,
+            bill_number="BILL-HOP-105B",
+            bill_date=date(2026, 1, 8),
+            total_amount=Decimal("650.00"),
+            status="open",
+        )
+        self.client.post("/api/accounting/payables/post-bill/", {"bill_id": bill1.id}, format="json")
+        self.client.post("/api/accounting/payables/post-bill/", {"bill_id": bill2.id}, format="json")
+
+        # Allocate $1000 payment across both bills
+        res = self.client.post("/api/accounting/payables/record-payment/", {
+            "vendor_id": self.vendor1.id,
+            "amount": "1000.00",
+            "payment_date": "2026-01-22",
+            "method": "bank_transfer",
+            "reference": "VBULK-1000",
+            "allocations": [
+                {"bill_id": bill1.id, "amount": "350.00"},
+                {"bill_id": bill2.id, "amount": "650.00"},
+            ]
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        bill1.refresh_from_db()
+        bill2.refresh_from_db()
+        self.assertEqual(bill1.status, "paid")
+        self.assertEqual(bill2.status, "paid")
+
+    def test_ap_aging_buckets_calculation(self):
+        ref_date = date(2026, 4, 15)
+
+        # 1. Current (due in future)
+        Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="B-CURR",
+            bill_date=date(2026, 4, 1), due_date=date(2026, 4, 20),
+            total_amount=Decimal("100.00"), status="open",
+        )
+        # 2. 1-30 days overdue (due 14 days ago, April 01)
+        Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="B-1-30",
+            bill_date=date(2026, 3, 1), due_date=date(2026, 4, 1),
+            total_amount=Decimal("200.00"), status="open",
+        )
+        # 3. 31-60 days overdue (due 45 days ago, March 01)
+        Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="B-31-60",
+            bill_date=date(2026, 2, 1), due_date=date(2026, 3, 1),
+            total_amount=Decimal("300.00"), status="open",
+        )
+        # 4. 61-90 days overdue (due 75 days ago, Jan 30)
+        Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="B-61-90",
+            bill_date=date(2026, 1, 1), due_date=date(2026, 1, 30),
+            total_amount=Decimal("400.00"), status="open",
+        )
+        # 5. 90+ days overdue (due 105 days ago, Dec 31 2025)
+        Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="B-90+",
+            bill_date=date(2025, 12, 1), due_date=date(2025, 12, 31),
+            total_amount=Decimal("500.00"), status="open",
+        )
+
+        res = self.client.get(f"/api/accounting/payables/aging/?as_of_date={ref_date.isoformat()}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        totals = res.data["totals"]
+
+        self.assertEqual(Decimal(totals["total_payables"]), Decimal("1500.00"))
+        self.assertEqual(Decimal(totals["current"]), Decimal("100.00"))
+        self.assertEqual(Decimal(totals["days_1_30"]), Decimal("200.00"))
+        self.assertEqual(Decimal(totals["days_31_60"]), Decimal("300.00"))
+        self.assertEqual(Decimal(totals["days_61_90"]), Decimal("400.00"))
+        self.assertEqual(Decimal(totals["days_90_plus"]), Decimal("500.00"))
+        self.assertEqual(Decimal(totals["overdue_total"]), Decimal("1400.00"))
+
+    def test_vendor_ap_statement(self):
+        bill = Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="BILL-STM-1",
+            bill_date=date(2026, 1, 10), due_date=date(2026, 1, 25),
+            total_amount=Decimal("1000.00"), status="open",
+        )
+        VendorPayment.objects.create(
+            company=self.comp1, vendor=self.vendor1, bill=bill,
+            amount=Decimal("400.00"), payment_date=date(2026, 1, 15),
+            method="bank_transfer", reference="VPMT-1234",
+        )
+
+        res = self.client.get(f"/api/accounting/payables/vendor/{self.vendor1.id}/statement/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data["transactions"]), 2)
+        # Line 1: Bill credit 1000, running balance 1000
+        self.assertEqual(Decimal(res.data["transactions"][0]["credit"]), Decimal("1000.00"))
+        self.assertEqual(Decimal(res.data["transactions"][0]["running_balance"]), Decimal("1000.00"))
+        # Line 2: Payment debit 400, running balance 600
+        self.assertEqual(Decimal(res.data["transactions"][1]["debit"]), Decimal("400.00"))
+        self.assertEqual(Decimal(res.data["transactions"][1]["running_balance"]), Decimal("600.00"))
+        self.assertEqual(Decimal(res.data["summary"]["ending_balance"]), Decimal("600.00"))
+
+    def test_locked_period_blocks_bill_and_payment_posting(self):
+        # Lock Period 1 (Jan 2026)
+        p1 = AccountingPeriod.objects.get(company=self.comp1, period_number=1)
+        p1.status = "locked"
+        p1.save()
+
+        bill = Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="BILL-LOCK-1",
+            bill_date=date(2026, 1, 15), total_amount=Decimal("450.00"),
+            status="open",
+        )
+
+        # Attempt to post in locked period
+        res = self.client.post("/api/accounting/payables/post-bill/", {
+            "bill_id": bill.id
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("locked", str(res.data).lower())
+
+    def test_tenant_isolation_in_payables(self):
+        # Company 2 bill
+        bill_comp2 = Bill.objects.create(
+            company=self.comp2, vendor=self.vendor_comp2,
+            bill_number="BILL-COMP2-1",
+            bill_date=date(2026, 1, 15), total_amount=Decimal("888.00"),
+            status="open",
+        )
+
+        # Company 1 user attempts to post Company 2 bill -> 400
+        res = self.client.post("/api/accounting/payables/post-bill/", {
+            "bill_id": bill_comp2.id
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Company 1 user attempts to query Company 2 vendor statement -> 400
+        res2 = self.client.get(f"/api/accounting/payables/vendor/{self.vendor_comp2.id}/statement/")
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unauthorized_user_denied_ap_access(self):
+        self.client.force_authenticate(user=self.store_user)
+        res = self.client.get("/api/accounting/payables/summary/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_invalid_payment_amounts_rejected(self):
+        bill = Bill.objects.create(
+            company=self.comp1, vendor=self.vendor1,
+            bill_number="BILL-VAL-1",
+            bill_date=date(2026, 1, 10), total_amount=Decimal("150.00"),
+            status="open",
+        )
+
+        # Negative amount
+        res1 = self.client.post("/api/accounting/payables/record-payment/", {
+            "vendor_id": self.vendor1.id,
+            "amount": "-50.00",
+            "allocations": [{"bill_id": bill.id, "amount": "-50.00"}]
+        }, format="json")
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Zero amount
+        res1b = self.client.post("/api/accounting/payables/record-payment/", {
+            "vendor_id": self.vendor1.id,
+            "amount": "0.00",
+            "allocations": [{"bill_id": bill.id, "amount": "0.00"}]
+        }, format="json")
+        self.assertEqual(res1b.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Amount exceeding balance due
+        res2 = self.client.post("/api/accounting/payables/record-payment/", {
+            "vendor_id": self.vendor1.id,
+            "amount": "250.00",
+            "allocations": [{"bill_id": bill.id, "amount": "250.00"}]
+        }, format="json")
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("exceeds balance due", str(res2.data).lower())
+
+        # Invalid vendor/bill relationship
+        res3 = self.client.post("/api/accounting/payables/record-payment/", {
+            "vendor_id": self.vendor_comp2.id,
+            "amount": "50.00",
+            "allocations": [{"bill_id": bill.id, "amount": "50.00"}]
+        }, format="json")
+        self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+
 
 
