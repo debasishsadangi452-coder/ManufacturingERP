@@ -3,7 +3,8 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from decimal import Decimal
 from .models import (
     FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings,
-    BankAccount, BankReconciliation, BankTransaction, BankAuditLog
+    BankAccount, BankReconciliation, BankTransaction, BankAuditLog,
+    Payment, PaymentAllocation, PaymentAuditLog
 )
 
 
@@ -1015,6 +1016,203 @@ class ReconciliationInputSerializer(serializers.Serializer):
     transaction_ids = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
     journal_line_ids = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
     notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #18 — PAYMENTS & ALLOCATIONS SERIALIZERS
+# ==============================================================================
+
+class PaymentAllocationSerializer(serializers.ModelSerializer):
+    invoice_number = serializers.SerializerMethodField()
+    bill_number = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PaymentAllocation
+        fields = [
+            "id",
+            "company",
+            "payment",
+            "allocation_number",
+            "allocation_date",
+            "allocated_amount",
+            "invoice",
+            "invoice_number",
+            "bill",
+            "bill_number",
+            "status",
+            "notes",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "reversed_at",
+        ]
+        read_only_fields = [
+            "id",
+            "allocation_number",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "reversed_at",
+        ]
+
+    def get_invoice_number(self, obj):
+        return f"INV-{obj.invoice_id}" if obj.invoice_id else None
+
+    def get_bill_number(self, obj):
+        if not obj.bill_id:
+            return None
+        return obj.bill.bill_number or f"BILL-{obj.bill_id}"
+
+    def get_created_by_name(self, obj):
+        return (obj.created_by.get_full_name() or obj.created_by.username) if obj.created_by else None
+
+
+class PaymentAuditLogSerializer(serializers.ModelSerializer):
+    actor_name = serializers.SerializerMethodField()
+    payment_number = serializers.ReadOnlyField(source="payment.payment_number")
+
+    class Meta:
+        model = PaymentAuditLog
+        fields = [
+            "id",
+            "company",
+            "payment",
+            "payment_number",
+            "action",
+            "actor",
+            "actor_name",
+            "details",
+            "notes",
+            "created_at",
+        ]
+        read_only_fields = ["id", "payment_number", "actor_name", "created_at"]
+
+    def get_actor_name(self, obj):
+        return (obj.actor.get_full_name() or obj.actor.username) if obj.actor else None
+
+
+class PaymentSerializer(serializers.ModelSerializer):
+    customer_name = serializers.ReadOnlyField(source="customer.name")
+    vendor_name = serializers.ReadOnlyField(source="vendor.name")
+    bank_account_name = serializers.ReadOnlyField(source="bank_account.account_name")
+    cash_account_name = serializers.ReadOnlyField(source="cash_account.name")
+    journal_entry_number = serializers.ReadOnlyField(source="journal_entry.entry_number")
+    reversal_journal_entry_number = serializers.ReadOnlyField(source="reversal_journal_entry.entry_number")
+    unallocated_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
+    allocations = PaymentAllocationSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Payment
+        fields = [
+            "id",
+            "company",
+            "payment_number",
+            "payment_type",
+            "payment_date",
+            "amount",
+            "currency",
+            "customer",
+            "customer_name",
+            "vendor",
+            "vendor_name",
+            "payment_source_type",
+            "bank_account",
+            "bank_account_name",
+            "cash_account",
+            "cash_account_name",
+            "payment_method",
+            "reference",
+            "external_reference",
+            "notes",
+            "status",
+            "allocation_status",
+            "allocated_amount",
+            "unallocated_amount",
+            "journal_entry",
+            "journal_entry_number",
+            "bank_transaction",
+            "reversal_journal_entry",
+            "reversal_journal_entry_number",
+            "created_by",
+            "created_by_name",
+            "approved_by",
+            "approved_by_name",
+            "posted_at",
+            "created_at",
+            "updated_at",
+            "allocations",
+        ]
+        read_only_fields = [
+            "id",
+            "payment_number",
+            "customer_name",
+            "vendor_name",
+            "bank_account_name",
+            "cash_account_name",
+            "journal_entry_number",
+            "reversal_journal_entry_number",
+            "allocated_amount",
+            "unallocated_amount",
+            "journal_entry",
+            "bank_transaction",
+            "reversal_journal_entry",
+            "created_by",
+            "created_by_name",
+            "approved_by",
+            "approved_by_name",
+            "posted_at",
+            "created_at",
+            "updated_at",
+            "allocations",
+        ]
+
+    def get_created_by_name(self, obj):
+        return (obj.created_by.get_full_name() or obj.created_by.username) if obj.created_by else None
+
+    def get_approved_by_name(self, obj):
+        return (obj.approved_by.get_full_name() or obj.approved_by.username) if obj.approved_by else None
+
+
+# Action Inputs
+
+class CreatePaymentInputSerializer(serializers.Serializer):
+    payment_type = serializers.ChoiceField(choices=["customer_receipt", "vendor_payment"])
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2, min_value=Decimal("0.01"))
+    payment_date = serializers.DateField(required=False)
+    customer_id = serializers.IntegerField(required=False, allow_null=True)
+    vendor_id = serializers.IntegerField(required=False, allow_null=True)
+    payment_source_type = serializers.ChoiceField(choices=["bank", "cash"], default="bank")
+    bank_account_id = serializers.IntegerField(required=False, allow_null=True)
+    cash_account_id = serializers.IntegerField(required=False, allow_null=True)
+    payment_method = serializers.ChoiceField(
+        choices=["bank_transfer", "cash", "cheque", "card", "upi", "other"],
+        default="bank_transfer"
+    )
+    reference = serializers.CharField(required=False, allow_blank=True, default="")
+    external_reference = serializers.CharField(required=False, allow_blank=True, default="")
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    auto_post = serializers.BooleanField(required=False, default=False)
+    allocations = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        default=list
+    )
+
+
+class AllocatePaymentInputSerializer(serializers.Serializer):
+    allocations = serializers.ListField(
+        child=serializers.DictField(),
+        min_length=1,
+        help_text="List of objects: {'invoice_id': ID, 'amount': X} or {'bill_id': ID, 'amount': X}"
+    )
+
+
+class ReversePaymentInputSerializer(serializers.Serializer):
+    reason = serializers.CharField(min_length=3, max_length=255)
+
 
 
 

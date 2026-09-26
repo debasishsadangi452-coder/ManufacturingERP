@@ -4444,6 +4444,779 @@ class CashAndBankAPITests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #18 — PAYMENTS & ALLOCATIONS TEST SUITE
+# ==============================================================================
+
+from sales.models import Customer, Invoice, CustomerPayment
+from procurement.models import Vendor, Bill, VendorPayment
+from .models import Payment, PaymentAllocation, PaymentAuditLog
+from .payments_allocations import (
+    create_payment,
+    post_payment,
+    allocate_payment,
+    unallocate_allocation,
+    reverse_payment,
+    cancel_payment,
+    get_available_documents_for_allocation,
+    get_payments_summary,
+)
+
+
+class PaymentsAllocationsTestCase(TestCase):
+    """
+    Blueprint Section #18 comprehensive test suite:
+      - Payment creation, validation, idempotency, company isolation
+      - Atomic double-entry GL journal posting (#8, #9)
+      - Cash & Bank integration (#17)
+      - Single, partial, and multi-document allocation
+      - Unallocation & allocation reversal (balance restoration)
+      - Payment cancellation and reversal (#8 reversal engine)
+      - Available documents query and summary KPIs
+      - REST API endpoints and permission controls
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Brewing Master Co", slug="brewing-master-co")
+        self.user = User.objects.create_user(
+            username="finance_lead",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+        )
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+
+        self.bank_gl = Account.objects.get(company=self.company, code="1010")
+        self.ar_gl = Account.objects.get(company=self.company, code="1100")
+        self.ap_gl = Account.objects.get(company=self.company, code="2010")
+
+        self.bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Operating Account",
+            bank_name="JPMorgan Chase",
+            account_number="111122223333",
+            account_type="checking",
+            currency="USD",
+            gl_account=self.bank_gl,
+        )
+
+        self.customer = Customer.objects.create(
+            company=self.company,
+            name="Downtown Bistro",
+        )
+        self.vendor = Vendor.objects.create(
+            company=self.company,
+            name="Quality Malts Ltd",
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_create_customer_receipt_draft(self):
+        """Creates a valid Customer Receipt in draft status."""
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1500.00"),
+            payment_date=date(2026, 2, 10),
+            customer_id=self.customer.id,
+            payment_source_type="bank",
+            bank_account_id=self.bank_account.id,
+            reference="CHK-4501",
+            notes="Invoice prepayment",
+        )
+        self.assertEqual(pmt.status, "draft")
+        self.assertEqual(pmt.allocation_status, "unallocated")
+        self.assertEqual(pmt.amount, Decimal("1500.00"))
+        self.assertEqual(pmt.unallocated_amount, Decimal("1500.00"))
+        self.assertTrue(pmt.payment_number.startswith("REC-2026-"))
+        self.assertIsNone(pmt.journal_entry)
+        self.assertIsNone(pmt.bank_transaction)
+
+    def test_create_vendor_payment_draft(self):
+        """Creates a valid Vendor Payment in draft status."""
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="vendor_payment",
+            amount=Decimal("3200.00"),
+            payment_date=date(2026, 2, 12),
+            vendor_id=self.vendor.id,
+            payment_source_type="bank",
+            bank_account_id=self.bank_account.id,
+            reference="WIRE-8812",
+        )
+        self.assertEqual(pmt.status, "draft")
+        self.assertEqual(pmt.amount, Decimal("3200.00"))
+        self.assertTrue(pmt.payment_number.startswith("PAY-2026-"))
+
+    def test_create_payment_invalid_amount_rejection(self):
+        """Zero or negative amount is rejected."""
+        with self.assertRaises(ValidationError):
+            create_payment(
+                company=self.company,
+                user=self.user,
+                payment_type="customer_receipt",
+                amount=Decimal("0.00"),
+                customer_id=self.customer.id,
+                bank_account_id=self.bank_account.id,
+            )
+
+    def test_create_payment_cross_company_party_rejection(self):
+        """Customer belonging to another company cannot be used."""
+        other_co = Company.objects.create(name="Other Co", slug="other-co-pmt")
+        other_cust = Customer.objects.create(company=other_co, name="Foreign Customer")
+
+        with self.assertRaises(ValidationError):
+            create_payment(
+                company=self.company,
+                user=self.user,
+                payment_type="customer_receipt",
+                amount=Decimal("100.00"),
+                customer_id=other_cust.id,
+                bank_account_id=self.bank_account.id,
+            )
+
+    def test_create_payment_inactive_bank_account_rejection(self):
+        """Inactive bank account cannot be selected."""
+        self.bank_account.is_active = False
+        self.bank_account.save()
+
+        with self.assertRaises(ValidationError):
+            create_payment(
+                company=self.company,
+                user=self.user,
+                payment_type="customer_receipt",
+                amount=Decimal("200.00"),
+                customer_id=self.customer.id,
+                bank_account_id=self.bank_account.id,
+            )
+
+    def test_create_payment_duplicate_external_reference_rejection(self):
+        """Idempotency check prevents duplicate payments with same external reference."""
+        create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("500.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            external_reference="EXT-IDEM-001",
+        )
+        with self.assertRaises(ValidationError):
+            create_payment(
+                company=self.company,
+                user=self.user,
+                payment_type="customer_receipt",
+                amount=Decimal("500.00"),
+                customer_id=self.customer.id,
+                bank_account_id=self.bank_account.id,
+                external_reference="EXT-IDEM-001",
+            )
+
+    def test_post_customer_receipt_journal_and_banking(self):
+        """
+        Customer Receipt posting:
+        DR 1010 Bank Asset = $2,000.00
+        CR 1100 AR Asset = $2,000.00
+        Creates linked BankTransaction in Cash & Bank (#17).
+        """
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("2000.00"),
+            payment_date=date(2026, 2, 1),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            reference="WIRE-CR-01",
+        )
+        posted_pmt = post_payment(pmt.id, user=self.user, company=self.company)
+        self.assertEqual(posted_pmt.status, "posted")
+        self.assertIsNotNone(posted_pmt.posted_at)
+
+        # Journal Entry
+        je = posted_pmt.journal_entry
+        self.assertIsNotNone(je)
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+        self.assertEqual(je.total_debit, Decimal("2000.00"))
+        self.assertEqual(je.total_credit, Decimal("2000.00"))
+
+        bank_lines = je.lines.filter(account=self.bank_gl)
+        ar_lines = je.lines.filter(account=self.ar_gl)
+        self.assertEqual(bank_lines.first().debit, Decimal("2000.00"))
+        self.assertEqual(ar_lines.first().credit, Decimal("2000.00"))
+
+        # Cash & Bank Transaction
+        bt = posted_pmt.bank_transaction
+        self.assertIsNotNone(bt)
+        self.assertEqual(bt.direction, "inflow")
+        self.assertEqual(bt.transaction_type, "customer_receipt")
+        self.assertEqual(bt.amount, Decimal("2000.00"))
+        self.assertEqual(bt.matching_status, "matched")
+        self.assertEqual(bt.reconciliation_status, "unreconciled")
+
+        # Bank Account GL balance updated
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("2000.00"))
+
+    def test_post_vendor_payment_journal_and_banking(self):
+        """
+        Vendor Payment posting:
+        DR 2010 AP Liability = $1,200.00
+        CR 1010 Bank Asset = $1,200.00
+        Creates linked BankTransaction with outflow direction.
+        """
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="vendor_payment",
+            amount=Decimal("1200.00"),
+            payment_date=date(2026, 2, 2),
+            vendor_id=self.vendor.id,
+            bank_account_id=self.bank_account.id,
+            reference="CHK-VP-01",
+        )
+        posted_pmt = post_payment(pmt.id, user=self.user, company=self.company)
+        self.assertEqual(posted_pmt.status, "posted")
+
+        je = posted_pmt.journal_entry
+        self.assertTrue(je.is_balanced)
+        ap_lines = je.lines.filter(account=self.ap_gl)
+        bank_lines = je.lines.filter(account=self.bank_gl)
+        self.assertEqual(ap_lines.first().debit, Decimal("1200.00"))
+        self.assertEqual(bank_lines.first().credit, Decimal("1200.00"))
+
+        bt = posted_pmt.bank_transaction
+        self.assertEqual(bt.direction, "outflow")
+        self.assertEqual(bt.transaction_type, "vendor_payment")
+
+    def test_post_payment_closed_period_rejection(self):
+        """Payment date falling in a closed period cannot be posted."""
+        period = AccountingPeriod.objects.filter(
+            fiscal_year__company=self.company,
+            start_date__lte=date(2026, 2, 1),
+            end_date__gte=date(2026, 2, 1),
+        ).first()
+        period.status = "closed"
+        period.save()
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1000.00"),
+            payment_date=date(2026, 2, 1),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+        )
+        with self.assertRaises(ValidationError):
+            post_payment(pmt.id, user=self.user, company=self.company)
+
+    def test_post_payment_lock_date_rejection(self):
+        """Payment date on or before global lock date cannot be posted."""
+        self.settings.lock_date = date(2026, 2, 15)
+        self.settings.save()
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("500.00"),
+            payment_date=date(2026, 2, 10),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+        )
+        with self.assertRaises(ValidationError):
+            post_payment(pmt.id, user=self.user, company=self.company)
+
+    def test_allocate_customer_receipt_full_and_partial(self):
+        """
+        Tests allocating a customer payment against an invoice:
+          1. Partial allocation leaving invoice with remaining balance
+          2. Second allocation fully settling the invoice
+        """
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("1000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1000.00"),
+            payment_date=date(2026, 2, 5),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        # 1. Partial allocation of $400
+        allocate_payment(
+            payment_id=pmt.id,
+            allocations=[{"invoice_id": inv.id, "amount": "400.00"}],
+            user=self.user,
+            company=self.company,
+        )
+
+        pmt.refresh_from_db()
+        inv.refresh_from_db()
+        self.assertEqual(pmt.allocation_status, "partially_allocated")
+        self.assertEqual(pmt.allocated_amount, Decimal("400.00"))
+        self.assertEqual(pmt.unallocated_amount, Decimal("600.00"))
+        self.assertEqual(inv.status, "partial")
+        self.assertEqual(inv.amount_paid, Decimal("400.00"))
+        self.assertEqual(inv.balance_due, Decimal("600.00"))
+
+        # Legacy CustomerPayment created for statement queries
+        self.assertTrue(CustomerPayment.objects.filter(customer=self.customer, invoice=inv, amount=Decimal("400.00")).exists())
+
+        # 2. Second allocation of remaining $600
+        allocate_payment(
+            payment_id=pmt.id,
+            allocations=[{"invoice_id": inv.id, "amount": "600.00"}],
+            user=self.user,
+            company=self.company,
+        )
+
+        pmt.refresh_from_db()
+        inv.refresh_from_db()
+        self.assertEqual(pmt.allocation_status, "fully_allocated")
+        self.assertEqual(pmt.allocated_amount, Decimal("1000.00"))
+        self.assertEqual(pmt.unallocated_amount, Decimal("0.00"))
+        self.assertEqual(inv.status, "paid")
+        self.assertEqual(inv.amount_paid, Decimal("1000.00"))
+        self.assertEqual(inv.balance_due, Decimal("0.00"))
+
+    def test_allocate_multi_document_allocation(self):
+        """A single payment allocated across multiple invoices atomically."""
+        inv1 = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("600.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        inv2 = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 2),
+            total_amount=Decimal("400.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1000.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        allocate_payment(
+            payment_id=pmt.id,
+            allocations=[
+                {"invoice_id": inv1.id, "amount": "600.00"},
+                {"invoice_id": inv2.id, "amount": "400.00"},
+            ],
+            user=self.user,
+            company=self.company,
+        )
+
+        inv1.refresh_from_db()
+        inv2.refresh_from_db()
+        pmt.refresh_from_db()
+
+        self.assertEqual(inv1.status, "paid")
+        self.assertEqual(inv2.status, "paid")
+        self.assertEqual(pmt.allocation_status, "fully_allocated")
+        self.assertEqual(pmt.allocations.filter(status="active").count(), 2)
+
+    def test_allocate_exceeding_payment_unallocated_amount_rejection(self):
+        """Allocation exceeding available payment unallocated funds is rejected."""
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("1000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("300.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        with self.assertRaises(ValidationError) as ctx:
+            allocate_payment(
+                payment_id=pmt.id,
+                allocations=[{"invoice_id": inv.id, "amount": "500.00"}],
+                user=self.user,
+                company=self.company,
+            )
+        self.assertIn("exceeds available unallocated amount", str(ctx.exception))
+
+    def test_allocate_exceeding_invoice_balance_due_rejection(self):
+        """Allocation exceeding document balance due is rejected."""
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("200.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("500.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        with self.assertRaises(ValidationError) as ctx:
+            allocate_payment(
+                payment_id=pmt.id,
+                allocations=[{"invoice_id": inv.id, "amount": "300.00"}],
+                user=self.user,
+                company=self.company,
+            )
+        self.assertIn("exceeds balance due", str(ctx.exception))
+
+    def test_allocate_vendor_payment_to_bills(self):
+        """Vendor payment allocated across bills."""
+        bill1 = Bill.objects.create(
+            company=self.company,
+            vendor=self.vendor,
+            bill_number="BILL-101",
+            bill_date=date(2026, 2, 1),
+            total_amount=Decimal("800.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        bill2 = Bill.objects.create(
+            company=self.company,
+            vendor=self.vendor,
+            bill_number="BILL-102",
+            bill_date=date(2026, 2, 2),
+            total_amount=Decimal("500.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="vendor_payment",
+            amount=Decimal("1100.00"),
+            vendor_id=self.vendor.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        allocate_payment(
+            payment_id=pmt.id,
+            allocations=[
+                {"bill_id": bill1.id, "amount": "800.00"},
+                {"bill_id": bill2.id, "amount": "300.00"},
+            ],
+            user=self.user,
+            company=self.company,
+        )
+
+        bill1.refresh_from_db()
+        bill2.refresh_from_db()
+        pmt.refresh_from_db()
+
+        self.assertEqual(bill1.status, "paid")
+        self.assertEqual(bill2.status, "partial")
+        self.assertEqual(bill2.balance_due, Decimal("200.00"))
+        self.assertEqual(pmt.allocation_status, "fully_allocated")
+        self.assertTrue(VendorPayment.objects.filter(vendor=self.vendor, bill=bill1, amount=Decimal("800.00")).exists())
+
+    def test_unallocate_restores_document_and_payment_balances(self):
+        """
+        Unallocating an active allocation:
+          - Decrements document amount_paid
+          - Restores document status (open or partial)
+          - Restores payment unallocated amount
+          - Marks allocation reversed
+          - Does not alter posted journal entry
+        """
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("500.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("500.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+            allocations=[{"invoice_id": inv.id, "amount": "500.00"}],
+        )
+
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "paid")
+        alloc = pmt.allocations.filter(status="active").first()
+        self.assertIsNotNone(alloc)
+
+        # Unallocate
+        unallocate_allocation(alloc.id, user=self.user, company=self.company)
+
+        inv.refresh_from_db()
+        pmt.refresh_from_db()
+        alloc.refresh_from_db()
+
+        self.assertEqual(alloc.status, "reversed")
+        self.assertEqual(inv.status, "open")
+        self.assertEqual(inv.amount_paid, Decimal("0.00"))
+        self.assertEqual(inv.balance_due, Decimal("500.00"))
+        self.assertEqual(pmt.allocation_status, "unallocated")
+        self.assertEqual(pmt.unallocated_amount, Decimal("500.00"))
+        self.assertEqual(pmt.journal_entry.status, "posted")  # GL remains intact!
+
+    def test_reverse_posted_payment_pipeline(self):
+        """
+        Reversing a posted payment:
+          1. Reverses active allocations (restoring invoices)
+          2. Inverts journal entry using Blueprint #8 reverse_journal_entry
+          3. Updates bank transaction
+          4. Marks payment reversed
+        """
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("750.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("750.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+            allocations=[{"invoice_id": inv.id, "amount": "750.00"}],
+        )
+
+        orig_je = pmt.journal_entry
+
+        # Execute Reversal
+        rev_pmt = reverse_payment(
+            payment_id=pmt.id,
+            reason="Customer check bounced (NSF)",
+            user=self.user,
+            company=self.company,
+        )
+
+        self.assertEqual(rev_pmt.status, "reversed")
+        self.assertIsNotNone(rev_pmt.reversal_journal_entry)
+        self.assertEqual(rev_pmt.reversal_journal_entry.status, "posted")
+        self.assertTrue(rev_pmt.reversal_journal_entry.is_balanced)
+
+        # Original JE marked reversed
+        orig_je.refresh_from_db()
+        self.assertEqual(orig_je.status, "reversed")
+
+        # Invoice restored to open
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "open")
+        self.assertEqual(inv.amount_paid, Decimal("0.00"))
+
+        # Bank transaction updated
+        pmt.bank_transaction.refresh_from_db()
+        self.assertEqual(pmt.bank_transaction.matching_status, "unmatched")
+        self.assertIn("Reversed:", pmt.bank_transaction.description)
+
+    def test_cancel_draft_payment(self):
+        """Draft payments can be cancelled."""
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("300.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+        )
+        cancelled = cancel_payment(pmt.id, user=self.user, company=self.company)
+        self.assertEqual(cancelled.status, "cancelled")
+
+        # Cannot post cancelled payment
+        with self.assertRaises(ValidationError):
+            post_payment(pmt.id, user=self.user, company=self.company)
+
+    def test_get_available_documents_query(self):
+        """Returns open/partial invoices for customer or bills for vendor."""
+        Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("1200.00"),
+            amount_paid=Decimal("200.00"),
+            status="partial",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1000.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+        )
+        docs = get_available_documents_for_allocation(pmt.id, company=self.company)
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0]["balance_due"], "1000.00")
+        self.assertEqual(docs[0]["document_type"], "invoice")
+
+    def test_payments_summary_kpi(self):
+        """Calculates tenant-level KPI aggregations for Payments & Allocations."""
+        create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("5000.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+        create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="vendor_payment",
+            amount=Decimal("2000.00"),
+            vendor_id=self.vendor.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+        summary = get_payments_summary(company=self.company)
+        self.assertEqual(summary["posted_count"], 2)
+        self.assertEqual(summary["total_receipts_amount"], "5000.00")
+        self.assertEqual(summary["total_disbursements_amount"], "2000.00")
+        self.assertEqual(summary["total_unallocated_amount"], "7000.00")
+
+    def test_payment_api_flow(self):
+        """
+        Verifies end-to-end REST API endpoints:
+          - POST /api/accounting/payments/
+          - POST /api/accounting/payments/{id}/post/
+          - GET  /api/accounting/payments/{id}/available-documents/
+          - POST /api/accounting/payments/{id}/allocate/
+          - POST /api/accounting/payment-allocations/{id}/unallocate/
+          - POST /api/accounting/payments/{id}/reverse/
+          - GET  /api/accounting/payments/{id}/audit-trail/
+          - GET  /api/accounting/payments/summary/
+        """
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("800.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        # 1. Create Payment via API
+        create_res = self.client.post("/api/accounting/payments/", {
+            "payment_type": "customer_receipt",
+            "amount": "800.00",
+            "payment_date": "2026-02-15",
+            "customer_id": self.customer.id,
+            "bank_account_id": self.bank_account.id,
+            "reference": "API-CHK-100",
+        })
+        self.assertEqual(create_res.status_code, status.HTTP_201_CREATED)
+        pmt_id = create_res.data["id"]
+        self.assertEqual(create_res.data["status"], "draft")
+
+        # 2. Post Payment via API
+        post_res = self.client.post(f"/api/accounting/payments/{pmt_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(post_res.data["status"], "posted")
+
+        # 3. Available documents
+        docs_res = self.client.get(f"/api/accounting/payments/{pmt_id}/available-documents/")
+        self.assertEqual(docs_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(docs_res.data), 1)
+
+        # 4. Allocate via API
+        alloc_res = self.client.post(
+            f"/api/accounting/payments/{pmt_id}/allocate/",
+            {"allocations": [{"invoice_id": inv.id, "amount": "800.00"}]},
+            format="json"
+        )
+        self.assertEqual(alloc_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(alloc_res.data["allocation_status"], "fully_allocated")
+        alloc_id = alloc_res.data["allocations"][0]["id"]
+
+        # 5. Unallocate via API
+        unalloc_res = self.client.post(f"/api/accounting/payment-allocations/{alloc_id}/unallocate/")
+        self.assertEqual(unalloc_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(unalloc_res.data["payment"]["allocation_status"], "unallocated")
+
+        # 6. Reverse Payment via API
+        rev_res = self.client.post(f"/api/accounting/payments/{pmt_id}/reverse/", {
+            "reason": "Payment issued in error"
+        })
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "reversed")
+
+        # 7. Audit trail
+        audit_res = self.client.get(f"/api/accounting/payments/{pmt_id}/audit-trail/")
+        self.assertEqual(audit_res.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(audit_res.data), 3)
+
+        # 8. Summary
+        sum_res = self.client.get("/api/accounting/payments/summary/")
+        self.assertEqual(sum_res.status_code, status.HTTP_200_OK)
+        self.assertIn("total_payments_count", sum_res.data)
+
+    def test_payment_unauthorized_forbidden(self):
+        """Non-finance role is rejected with 403."""
+        operator = User.objects.create_user(
+            username="forklift_driver",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.client.force_authenticate(user=operator)
+        res = self.client.get("/api/accounting/payments/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+
 
 
 

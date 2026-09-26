@@ -22,6 +22,8 @@ from .views import (
     BankTransactionViewSet,
     BankReconciliationViewSet,
     BankingSummaryViewSet,
+    PaymentViewSet,
+    PaymentAllocationViewSet,
 )
 
 router = DefaultRouter()
@@ -46,6 +48,8 @@ router.register(r'bank-accounts', BankAccountViewSet, basename='accounting-bank-
 router.register(r'bank-transactions', BankTransactionViewSet, basename='accounting-bank-transactions')
 router.register(r'bank-reconciliations', BankReconciliationViewSet, basename='accounting-bank-reconciliations')
 router.register(r'banking', BankingSummaryViewSet, basename='accounting-banking')
+router.register(r'payments', PaymentViewSet, basename='accounting-payments')
+router.register(r'payment-allocations', PaymentAllocationViewSet, basename='accounting-payment-allocations')
 
 urlpatterns = [
     path('', include(router.urls)),

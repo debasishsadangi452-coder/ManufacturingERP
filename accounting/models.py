@@ -1483,4 +1483,435 @@ class BankAuditLog(models.Model):
         return f"BankAudit: {acc} - {self.action} at {self.created_at}"
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #18 — PAYMENTS & ALLOCATIONS
+# ==============================================================================
+
+class Payment(models.Model):
+    """
+    Blueprint Section #18 — Unified Payment & Receipt entity.
+    Tracks Customer Receipts (money in) and Vendor Payments (money out),
+    integrating Cash & Bank (#17), AR/AP allocations (#10, #11),
+    and double-entry General Ledger posting (#8, #9).
+    """
+    PAYMENT_TYPE_CHOICES = [
+        ("customer_receipt", "Customer Receipt"),
+        ("vendor_payment", "Vendor Payment"),
+    ]
+    PAYMENT_SOURCE_TYPE_CHOICES = [
+        ("bank", "Bank Account"),
+        ("cash", "Cash Account"),
+    ]
+    PAYMENT_METHOD_CHOICES = [
+        ("bank_transfer", "Bank Transfer"),
+        ("cash", "Cash"),
+        ("cheque", "Cheque"),
+        ("card", "Credit/Debit Card"),
+        ("upi", "UPI / Electronic"),
+        ("other", "Other"),
+    ]
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("posted", "Posted"),
+        ("cancelled", "Cancelled"),
+        ("reversed", "Reversed"),
+    ]
+    ALLOCATION_STATUS_CHOICES = [
+        ("unallocated", "Unallocated"),
+        ("partially_allocated", "Partially Allocated"),
+        ("fully_allocated", "Fully Allocated"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="accounting_payments"
+    )
+    payment_number = models.CharField(
+        max_length=50,
+        blank=True,
+        db_index=True,
+        help_text="Sequential human-readable identifier (e.g. REC-2026-00001 or PAY-2026-00001)"
+    )
+    payment_type = models.CharField(
+        max_length=30,
+        choices=PAYMENT_TYPE_CHOICES,
+        default="customer_receipt"
+    )
+    payment_date = models.DateField(default=timezone.now)
+    amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        help_text="Total payment transaction amount"
+    )
+    currency = models.CharField(max_length=10, default="USD")
+
+    # Counterparty
+    customer = models.ForeignKey(
+        "sales.Customer",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="accounting_payments"
+    )
+    vendor = models.ForeignKey(
+        "procurement.Vendor",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="accounting_payments"
+    )
+
+    # Source: Bank or Cash
+    payment_source_type = models.CharField(
+        max_length=20,
+        choices=PAYMENT_SOURCE_TYPE_CHOICES,
+        default="bank"
+    )
+    bank_account = models.ForeignKey(
+        BankAccount,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="payments"
+    )
+    cash_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="cash_payments"
+    )
+    payment_method = models.CharField(
+        max_length=30,
+        choices=PAYMENT_METHOD_CHOICES,
+        default="bank_transfer"
+    )
+    reference = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Cheque #, UTR, transaction ref or memo"
+    )
+    external_reference = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="External unique ID for idempotency"
+    )
+    notes = models.TextField(blank=True, default="")
+
+    # Lifecycle & Allocation
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="draft"
+    )
+    allocation_status = models.CharField(
+        max_length=25,
+        choices=ALLOCATION_STATUS_CHOICES,
+        default="unallocated"
+    )
+    allocated_amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal("0.00")
+    )
+
+    # Links
+    journal_entry = models.ForeignKey(
+        JournalEntry,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="accounting_payments",
+        help_text="Linked GL double-entry journal entry"
+    )
+    bank_transaction = models.ForeignKey(
+        BankTransaction,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="accounting_payments",
+        help_text="Linked BankTransaction in Cash & Bank subledger"
+    )
+    reversal_journal_entry = models.ForeignKey(
+        JournalEntry,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reversed_accounting_payments"
+    )
+
+    created_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_payments"
+    )
+    approved_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approved_payments"
+    )
+    posted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-payment_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "payment_type", "status"]),
+            models.Index(fields=["company", "allocation_status"]),
+            models.Index(fields=["company", "external_reference"]),
+        ]
+
+    @property
+    def unallocated_amount(self):
+        amt = self.amount or Decimal("0.00")
+        alc = self.allocated_amount or Decimal("0.00")
+        return max(Decimal("0.00"), amt - alc)
+
+    def clean(self):
+        super().clean()
+        if self.amount is not None and self.amount <= Decimal("0.00"):
+            raise ValidationError({"amount": _("Payment amount must be greater than zero.")})
+
+        if self.payment_type == "customer_receipt":
+            if not self.customer_id:
+                raise ValidationError({"customer": _("Customer is required for customer receipt.")})
+            if self.vendor_id:
+                raise ValidationError({"vendor": _("Vendor must not be set for customer receipt.")})
+            if self.customer and self.company_id and self.customer.company_id != self.company_id:
+                raise ValidationError({"customer": _("Customer belongs to a different company.")})
+        elif self.payment_type == "vendor_payment":
+            if not self.vendor_id:
+                raise ValidationError({"vendor": _("Vendor is required for vendor payment.")})
+            if self.customer_id:
+                raise ValidationError({"customer": _("Customer must not be set for vendor payment.")})
+            if self.vendor and self.company_id and self.vendor.company_id != self.company_id:
+                raise ValidationError({"vendor": _("Vendor belongs to a different company.")})
+
+        if self.payment_source_type == "bank":
+            if not self.bank_account_id:
+                raise ValidationError({"bank_account": _("Bank account is required when source type is 'bank'.")})
+            if self.bank_account and self.company_id and self.bank_account.company_id != self.company_id:
+                raise ValidationError({"bank_account": _("Bank account belongs to a different company.")})
+            if self.bank_account and not self.bank_account.is_active:
+                raise ValidationError({"bank_account": _("Selected bank account is inactive.")})
+        elif self.payment_source_type == "cash":
+            if self.cash_account_id:
+                if self.company_id and self.cash_account.company_id != self.company_id:
+                    raise ValidationError({"cash_account": _("Cash account belongs to a different company.")})
+                if self.cash_account.is_header:
+                    raise ValidationError({"cash_account": _("Cannot select a header account for cash payments.")})
+
+        if self.external_reference and self.company_id:
+            dup_qs = Payment.objects.filter(
+                company_id=self.company_id,
+                external_reference=self.external_reference
+            )
+            if self.pk:
+                dup_qs = dup_qs.exclude(pk=self.pk)
+            if dup_qs.exists():
+                raise ValidationError({"external_reference": _(f"A payment with external reference '{self.external_reference}' already exists for this company.")})
+
+    def save(self, *args, **kwargs):
+        if not self.payment_number and self.company_id:
+            year = self.payment_date.year if self.payment_date else timezone.now().year
+            prefix = f"REC-{year}-" if self.payment_type == "customer_receipt" else f"PAY-{year}-"
+            last_record = Payment.objects.filter(
+                company_id=self.company_id,
+                payment_number__startswith=prefix
+            ).order_by("-payment_number").first()
+            if last_record and last_record.payment_number:
+                try:
+                    last_seq = int(last_record.payment_number.split("-")[-1])
+                    seq = last_seq + 1
+                except (ValueError, IndexError):
+                    seq = 1
+            else:
+                seq = 1
+            self.payment_number = f"{prefix}{seq:05d}"
+
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        party = self.customer.name if self.customer else (self.vendor.name if self.vendor else "Unknown")
+        return f"{self.payment_number} ({self.get_payment_type_display()} ${self.amount:.2f} - {party})"
+
+
+class PaymentAllocation(models.Model):
+    """
+    Blueprint Section #18 — Allocation of Payment against Invoice(s) or Bill(s).
+    Maintains document settlement balances without creating duplicate GL entries.
+    """
+    STATUS_CHOICES = [
+        ("active", "Active"),
+        ("reversed", "Reversed"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="payment_allocations"
+    )
+    payment = models.ForeignKey(
+        Payment,
+        on_delete=models.CASCADE,
+        related_name="allocations"
+    )
+    allocation_number = models.CharField(max_length=50, blank=True, db_index=True)
+    allocation_date = models.DateField(default=timezone.now)
+    allocated_amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        help_text="Amount applied to the specific document"
+    )
+
+    # Document linkage
+    invoice = models.ForeignKey(
+        "sales.Invoice",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="accounting_allocations"
+    )
+    bill = models.ForeignKey(
+        "procurement.Bill",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="accounting_allocations"
+    )
+
+    # Dual operational compatibility with #10 AR and #11 AP statement queries
+    legacy_customer_payment = models.ForeignKey(
+        "sales.CustomerPayment",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="accounting_allocations"
+    )
+    legacy_vendor_payment = models.ForeignKey(
+        "procurement.VendorPayment",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="accounting_allocations"
+    )
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
+    notes = models.CharField(max_length=255, blank=True, default="")
+    created_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_allocations"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    reversed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["payment", "status"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.allocated_amount is not None and self.allocated_amount <= Decimal("0.00"):
+            raise ValidationError({"allocated_amount": _("Allocated amount must be greater than zero.")})
+
+        if self.payment_id:
+            if self.payment.payment_type == "customer_receipt":
+                if not self.invoice_id:
+                    raise ValidationError({"invoice": _("Invoice is required for customer receipt allocation.")})
+                if self.bill_id:
+                    raise ValidationError({"bill": _("Bill cannot be allocated to customer receipt.")})
+                if self.invoice and self.invoice.company_id != self.company_id:
+                    raise ValidationError({"invoice": _("Invoice belongs to a different company.")})
+                if self.payment.customer_id and self.invoice and self.invoice.customer_id != self.payment.customer_id:
+                    raise ValidationError({"invoice": _("Invoice does not belong to the payment's customer.")})
+            elif self.payment.payment_type == "vendor_payment":
+                if not self.bill_id:
+                    raise ValidationError({"bill": _("Bill is required for vendor payment allocation.")})
+                if self.invoice_id:
+                    raise ValidationError({"invoice": _("Invoice cannot be allocated to vendor payment.")})
+                if self.bill and self.bill.company_id != self.company_id:
+                    raise ValidationError({"bill": _("Bill belongs to a different company.")})
+                if self.payment.vendor_id and self.bill and self.bill.vendor_id != self.payment.vendor_id:
+                    raise ValidationError({"bill": _("Bill does not belong to the payment's vendor.")})
+
+    def save(self, *args, **kwargs):
+        if not self.allocation_number and self.company_id:
+            year = self.allocation_date.year if self.allocation_date else timezone.now().year
+            prefix = f"ALC-{year}-"
+            last_record = PaymentAllocation.objects.filter(
+                company_id=self.company_id,
+                allocation_number__startswith=prefix
+            ).order_by("-allocation_number").first()
+            if last_record and last_record.allocation_number:
+                try:
+                    last_seq = int(last_record.allocation_number.split("-")[-1])
+                    seq = last_seq + 1
+                except (ValueError, IndexError):
+                    seq = 1
+            else:
+                seq = 1
+            self.allocation_number = f"{prefix}{seq:05d}"
+
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        doc = f"INV-{self.invoice_id}" if self.invoice_id else f"BILL-{self.bill_id}"
+        return f"{self.allocation_number}: ${self.allocated_amount:.2f} on {doc} ({self.status})"
+
+
+class PaymentAuditLog(models.Model):
+    """
+    Blueprint Section #18 — Audit Trail for Payments & Allocations.
+    Records creation, posting, allocation, unallocation, cancellation, and reversal.
+    """
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="payment_audit_logs"
+    )
+    payment = models.ForeignKey(
+        Payment,
+        on_delete=models.CASCADE,
+        related_name="audit_logs"
+    )
+    action = models.CharField(
+        max_length=60,
+        help_text="e.g. payment_created, payment_posted, allocation_created, allocation_unallocated, payment_cancelled, payment_reversed"
+    )
+    actor = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    details = models.JSONField(default=dict, blank=True)
+    notes = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"PaymentAudit: {self.payment.payment_number} - {self.action} at {self.created_at}"
+
+
+
 

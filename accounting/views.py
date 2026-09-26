@@ -2352,6 +2352,244 @@ class BankingSummaryViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #18 — PAYMENTS & ALLOCATIONS VIEWS
+# ==============================================================================
+
+from .models import Payment, PaymentAllocation, PaymentAuditLog
+from .serializers import (
+    PaymentSerializer,
+    PaymentAllocationSerializer,
+    PaymentAuditLogSerializer,
+    CreatePaymentInputSerializer,
+    AllocatePaymentInputSerializer,
+    ReversePaymentInputSerializer,
+)
+from .payments_allocations import (
+    create_payment,
+    post_payment,
+    allocate_payment,
+    unallocate_allocation,
+    reverse_payment,
+    cancel_payment,
+    get_available_documents_for_allocation,
+    get_payments_summary,
+)
+
+
+class PaymentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    Blueprint Section #18 — Payments & Allocations API.
+    Manages Customer Receipts and Vendor Payments:
+      - Draft creation and atomic GL posting (#8, #9)
+      - Cash & Bank integration (#17)
+      - Multi-document allocation and partial payments
+      - Allocation reversals and payment reversals
+      - Full audit trail lineage
+    """
+    company_field = "company"
+    queryset = Payment.objects.select_related(
+        "customer", "vendor", "bank_account", "cash_account",
+        "journal_entry", "bank_transaction", "reversal_journal_entry",
+        "created_by", "approved_by"
+    ).prefetch_related(
+        "allocations", "allocations__invoice", "allocations__bill"
+    ).all()
+    serializer_class = PaymentSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = [
+        "payment_type", "status", "allocation_status",
+        "payment_source_type", "customer", "vendor", "bank_account"
+    ]
+    search_fields = [
+        "payment_number", "reference", "external_reference",
+        "notes", "customer__name", "vendor__name"
+    ]
+    ordering_fields = ["payment_date", "created_at", "amount", "payment_number"]
+    ordering = ["-payment_date", "-created_at"]
+
+    def create(self, request, *args, **kwargs):
+        """POST /api/accounting/payments/"""
+        company = getattr(request.user, "company", None)
+        serializer = CreatePaymentInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            payment = create_payment(
+                company=company,
+                user=request.user,
+                payment_type=data["payment_type"],
+                amount=data["amount"],
+                payment_date=data.get("payment_date"),
+                customer_id=data.get("customer_id"),
+                vendor_id=data.get("vendor_id"),
+                payment_source_type=data.get("payment_source_type", "bank"),
+                bank_account_id=data.get("bank_account_id"),
+                cash_account_id=data.get("cash_account_id"),
+                payment_method=data.get("payment_method", "bank_transfer"),
+                reference=data.get("reference", ""),
+                external_reference=data.get("external_reference", ""),
+                notes=data.get("notes", ""),
+                auto_post=data.get("auto_post", False),
+                allocations=data.get("allocations", []),
+            )
+            return Response(PaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="post")
+    def post_action(self, request, pk=None):
+        """POST /api/accounting/payments/{id}/post/"""
+        payment = self.get_object()
+        company = getattr(request.user, "company", None)
+        allocations = request.data.get("allocations", [])
+
+        try:
+            posted = post_payment(
+                payment_id=payment.id,
+                user=request.user,
+                company=company,
+                allocations=allocations,
+            )
+            return Response(PaymentSerializer(posted).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="allocate")
+    def allocate_action(self, request, pk=None):
+        """POST /api/accounting/payments/{id}/allocate/"""
+        payment = self.get_object()
+        company = getattr(request.user, "company", None)
+        serializer = AllocatePaymentInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            allocated = allocate_payment(
+                payment_id=payment.id,
+                allocations=serializer.validated_data["allocations"],
+                user=request.user,
+                company=company,
+            )
+            return Response(PaymentSerializer(allocated).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reverse")
+    def reverse_action(self, request, pk=None):
+        """POST /api/accounting/payments/{id}/reverse/"""
+        payment = self.get_object()
+        company = getattr(request.user, "company", None)
+        serializer = ReversePaymentInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            reversed_pmt = reverse_payment(
+                payment_id=payment.id,
+                reason=serializer.validated_data["reason"],
+                user=request.user,
+                company=company,
+            )
+            return Response(PaymentSerializer(reversed_pmt).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="cancel")
+    def cancel_action(self, request, pk=None):
+        """POST /api/accounting/payments/{id}/cancel/"""
+        payment = self.get_object()
+        company = getattr(request.user, "company", None)
+
+        try:
+            cancelled = cancel_payment(
+                payment_id=payment.id,
+                user=request.user,
+                company=company,
+            )
+            return Response(PaymentSerializer(cancelled).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["get"], url_path="available-documents")
+    def available_documents(self, request, pk=None):
+        """GET /api/accounting/payments/{id}/available-documents/"""
+        payment = self.get_object()
+        company = getattr(request.user, "company", None)
+        docs = get_available_documents_for_allocation(payment_id=payment.id, company=company)
+        return Response(docs, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="audit-trail")
+    def audit_trail(self, request, pk=None):
+        """GET /api/accounting/payments/{id}/audit-trail/"""
+        payment = self.get_object()
+        logs = payment.audit_logs.select_related("actor").all()
+        return Response(PaymentAuditLogSerializer(logs, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary_action(self, request):
+        """GET /api/accounting/payments/summary/"""
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_payments_summary(company=company)
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PaymentAllocationViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    Blueprint Section #18 — Read-only listing and unallocation of individual payment allocations.
+    """
+    company_field = "company"
+    queryset = PaymentAllocation.objects.select_related(
+        "payment", "invoice", "bill", "created_by"
+    ).all()
+    serializer_class = PaymentAllocationSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ["payment", "status", "invoice", "bill"]
+    ordering = ["-created_at"]
+
+    @action(detail=True, methods=["post"], url_path="unallocate")
+    def unallocate(self, request, pk=None):
+        """POST /api/accounting/payment-allocations/{id}/unallocate/"""
+        allocation = self.get_object()
+        company = getattr(request.user, "company", None)
+
+        try:
+            updated_pmt = unallocate_allocation(
+                allocation_id=allocation.id,
+                user=request.user,
+                company=company,
+            )
+            return Response({
+                "message": f"Allocation {allocation.allocation_number} unallocated successfully.",
+                "payment": PaymentSerializer(updated_pmt).data,
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
 
 
 
