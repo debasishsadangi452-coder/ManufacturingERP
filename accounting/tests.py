@@ -5689,14 +5689,363 @@ class TaxLayerTestCase(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class JournalEntryEnhancementsTestCase(APITestCase):
+    """
+    Blueprint Section #20: Journal Entries Enhancements Test Suite.
+    Verifies:
+    - Manual journal entry creation with entry types and explanations
+    - Draft editing and line manipulation
+    - Real-time double-entry equilibrium and validation
+    - Approval workflow: Draft -> Submitted -> Approved / Rejected -> Posted
+    - Rejection requires reason and allows re-drafting
+    - Posting approved journals to General Ledger
+    - Attachments upload and deletion with audit trail
+    - Controlled reversals with reason, custom date, and inverted lines
+    - Duplicate reversal prevention
+    - Immutable chronological audit trail
+    - Company isolation and multi-tenancy enforcement
+    - Permission controls (IsFinanceOrAdmin)
+    - Closed period and lock date posting protection
+    """
 
+    def setUp(self):
+        self.company = Company.objects.create(name="Apex Brewing Co")
+        self.other_company = Company.objects.create(name="Rival Brewing Co")
 
+        self.user = User.objects.create_user(
+            username="finance_officer",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.client.force_authenticate(user=self.user)
 
+        ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_chart_of_accounts(self.other_company)
 
+        self.cash_account = Account.objects.get(company=self.company, code="1010")
+        self.expense_account = Account.objects.get(company=self.company, code="6010")
+        self.revenue_account = Account.objects.get(company=self.company, code="4010")
 
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+        self.period = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            name="Jan 2026",
+            period_number=1,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
 
+    def test_manual_journal_creation_with_type_and_explanation(self):
+        """Creates draft journal entry with explicit entry_type and detailed explanation."""
+        payload = {
+            "entry_type": "adjusting",
+            "transaction_date": "2026-01-15",
+            "reference": "ADJ-2026-001",
+            "description": "Accrue month-end electricity utility",
+            "explanation": "Electricity invoice not received before cutoff; accrued based on prior meter reading.",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "450.00", "credit": "0.00", "description": "Utilities expense"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "450.00", "description": "Accrued utilities payable"},
+            ],
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data["status"], "draft")
+        self.assertEqual(res.data["entry_type"], "adjusting")
+        self.assertEqual(res.data["explanation"], payload["explanation"])
+        self.assertEqual(res.data["total_debit"], "450.00")
+        self.assertEqual(res.data["total_credit"], "450.00")
+        self.assertTrue(res.data["is_balanced"])
 
+        # Verify audit log CREATED
+        entry = JournalEntry.objects.get(pk=res.data["id"])
+        self.assertTrue(entry.audit_logs.filter(action="CREATED").exists())
 
+    def test_draft_modification_and_line_updates(self):
+        """Draft journal entries can be modified and lines replaced prior to posting."""
+        payload = {
+            "entry_type": "manual",
+            "transaction_date": "2026-01-15",
+            "reference": "MJE-01",
+            "description": "Original narration",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "100.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "100.00"},
+            ],
+        }
+        create_res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = create_res.data["id"]
 
+        update_payload = {
+            "description": "Updated narration",
+            "explanation": "Added audit reasoning",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "200.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "200.00"},
+            ],
+        }
+        patch_res = self.client.patch(f"/api/accounting/journal-entries/{entry_id}/", update_payload, format="json")
+        self.assertEqual(patch_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(patch_res.data["description"], "Updated narration")
+        self.assertEqual(patch_res.data["total_debit"], "200.00")
 
+        # Verify audit log UPDATED
+        entry = JournalEntry.objects.get(pk=entry_id)
+        self.assertTrue(entry.audit_logs.filter(action="UPDATED").exists())
 
+    def test_unbalanced_manual_journal_rejected_on_submit(self):
+        """Unbalanced journal entries cannot be submitted for approval."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "500.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "400.00"},
+            ],
+        }
+        create_res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = create_res.data["id"]
+
+        submit_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/submit/")
+        self.assertEqual(submit_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("error", submit_res.data)
+
+    def test_full_approval_workflow_lifecycle(self):
+        """Tests complete workflow: Draft -> Submitted -> Approved -> Posted."""
+        payload = {
+            "entry_type": "manual",
+            "transaction_date": "2026-01-15",
+            "reference": "WF-001",
+            "description": "Office supplies purchase",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "300.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "300.00"},
+            ],
+        }
+        create_res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = create_res.data["id"]
+        self.assertEqual(create_res.data["status"], "draft")
+
+        # 1. Submit for approval
+        sub_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/submit/")
+        self.assertEqual(sub_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(sub_res.data["status"], "submitted")
+        self.assertIsNotNone(sub_res.data["submitted_at"])
+
+        # 2. Approve entry
+        app_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/approve/")
+        self.assertEqual(app_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(app_res.data["status"], "approved")
+        self.assertIsNotNone(app_res.data["approved_at"])
+
+        # 3. Post approved entry to General Ledger
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(post_res.data["status"], "posted")
+        self.assertIsNotNone(post_res.data["posted_at"])
+
+    def test_rejection_workflow_and_revision(self):
+        """Tests rejection requiring reason, reverting to draft, and resubmitting."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "150.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "150.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/submit/")
+
+        # Reject without reason fails
+        rej_fail = self.client.post(f"/api/accounting/journal-entries/{entry_id}/reject/", {"reason": ""}, format="json")
+        self.assertEqual(rej_fail.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Reject with valid reason
+        rej_ok = self.client.post(
+            f"/api/accounting/journal-entries/{entry_id}/reject/",
+            {"reason": "Expense category requires additional vendor invoice."},
+            format="json"
+        )
+        self.assertEqual(rej_ok.status_code, status.HTTP_200_OK)
+        self.assertEqual(rej_ok.data["status"], "rejected")
+        self.assertEqual(rej_ok.data["rejection_reason"], "Expense category requires additional vendor invoice.")
+
+        # Revert to draft for revision
+        rev_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/revert-draft/")
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "draft")
+
+    def test_cannot_modify_or_delete_posted_entry(self):
+        """Posted journal entries are strictly immutable and cannot be patched or deleted."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "100.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "100.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        # Attempt to modify
+        patch_res = self.client.patch(f"/api/accounting/journal-entries/{entry_id}/", {"description": "Tampered"}, format="json")
+        self.assertEqual(patch_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Attempt to delete
+        del_res = self.client.delete(f"/api/accounting/journal-entries/{entry_id}/")
+        self.assertEqual(del_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reverse_posted_entry_with_tracking_and_audit(self):
+        """Reversing a posted journal entry creates an inverted entry, updates status, and logs audit."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "reference": "REV-ORIG-1",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "800.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "800.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        # Reverse with reason
+        rev_res = self.client.post(
+            f"/api/accounting/journal-entries/{entry_id}/reverse/",
+            {"reason": "Entry posted to wrong cost account", "transaction_date": "2026-01-20"},
+            format="json"
+        )
+        self.assertEqual(rev_res.status_code, status.HTTP_201_CREATED)
+        reversal_id = rev_res.data["id"]
+
+        # Check original entry
+        orig = JournalEntry.objects.get(pk=entry_id)
+        self.assertEqual(orig.status, "reversed")
+        self.assertIsNotNone(orig.reversed_at)
+        self.assertEqual(orig.reversal_reason, "Entry posted to wrong cost account")
+
+        # Check reversal entry
+        reversal = JournalEntry.objects.get(pk=reversal_id)
+        self.assertEqual(reversal.status, "posted")
+        self.assertEqual(reversal.entry_type, "reversal")
+        self.assertEqual(reversal.reversal_of_id, orig.id)
+
+        # Verify inverted lines: Expense has Credit 800, Cash has Debit 800
+        exp_line = reversal.lines.get(account=self.expense_account)
+        self.assertEqual(exp_line.credit, Decimal("800.00"))
+        self.assertEqual(exp_line.debit, Decimal("0.00"))
+
+        # Verify duplicate reversal is prevented
+        dup_rev = self.client.post(f"/api/accounting/journal-entries/{entry_id}/reverse/", {"reason": "Duplicate"}, format="json")
+        self.assertEqual(dup_rev.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_attachment_upload_and_deletion(self):
+        """Allows uploading and deleting supporting documentation attachments."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "50.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "50.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+
+        # Upload attachment
+        file_content = b"PDF invoice memo sample binary data"
+        uploaded_file = SimpleUploadedFile("vendor_receipt.pdf", file_content, content_type="application/pdf")
+
+        upload_res = self.client.post(
+            f"/api/accounting/journal-entries/{entry_id}/upload-attachment/",
+            {"file": uploaded_file, "description": "Original vendor receipt scanned"},
+            format="multipart"
+        )
+        self.assertEqual(upload_res.status_code, status.HTTP_201_CREATED)
+        attachment_id = upload_res.data["id"]
+        self.assertEqual(upload_res.data["filename"], "vendor_receipt.pdf")
+
+        # Verify audit log ATTACHMENT_ADDED
+        entry = JournalEntry.objects.get(pk=entry_id)
+        self.assertTrue(entry.audit_logs.filter(action="ATTACHMENT_ADDED").exists())
+
+        # Delete attachment
+        del_res = self.client.delete(f"/api/accounting/journal-entries/{entry_id}/attachments/{attachment_id}/")
+        self.assertEqual(del_res.status_code, status.HTTP_204_NO_CONTENT)
+
+        # Verify audit log ATTACHMENT_REMOVED
+        self.assertTrue(entry.audit_logs.filter(action="ATTACHMENT_REMOVED").exists())
+
+    def test_audit_trail_endpoint(self):
+        """GET /api/accounting/journal-entries/{id}/audit-trail/ returns immutable chronological history."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "75.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "75.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/submit/")
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/approve/")
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        res = self.client.get(f"/api/accounting/journal-entries/{entry_id}/audit-trail/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        actions = [log["action"] for log in res.data]
+        self.assertIn("CREATED", actions)
+        self.assertIn("SUBMITTED", actions)
+        self.assertIn("APPROVED", actions)
+        self.assertIn("POSTED", actions)
+
+    def test_company_isolation(self):
+        """Company A users cannot view, submit, or manipulate Company B's journal entries."""
+        other_entry = JournalEntry.objects.create(
+            company=self.other_company,
+            entry_number="JE-RIVAL-001",
+            transaction_date=date(2026, 1, 15),
+            status="draft",
+        )
+        res = self.client.get(f"/api/accounting/journal-entries/{other_entry.id}/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+        post_res = self.client.post(f"/api/accounting/journal-entries/{other_entry.id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unauthorized_user_forbidden(self):
+        """Non-finance users are rejected with 403 Forbidden."""
+        operator = User.objects.create_user(
+            username="keg_filler",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.client.force_authenticate(user=operator)
+        res = self.client.get("/api/accounting/journal-entries/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_period_closed_prevents_posting(self):
+        """Posting to a closed accounting period is rejected."""
+        self.period.status = "closed"
+        self.period.save()
+
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "100.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "100.00"},
+            ],
+        }
+        create_res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = create_res.data["id"]
+
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("accounting_period", str(post_res.data))

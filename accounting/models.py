@@ -536,8 +536,21 @@ class JournalEntry(models.Model):
     Encapsulates financial transactions with atomic lines, lifecycle status,
     and period/lock-date boundary enforcement.
     """
+    ENTRY_TYPE_CHOICES = [
+        ("manual", "Manual Journal"),
+        ("adjusting", "Adjusting Entry"),
+        ("reclassifying", "Reclassification"),
+        ("closing", "Closing Entry"),
+        ("opening", "Opening Balance Entry"),
+        ("reversal", "Reversal Entry"),
+        ("system", "System Generated"),
+    ]
+
     STATUS_CHOICES = [
         ("draft", "Draft"),
+        ("submitted", "Submitted for Approval"),
+        ("approved", "Approved"),
+        ("rejected", "Rejected"),
         ("posted", "Posted"),
         ("reversed", "Reversed"),
     ]
@@ -552,6 +565,12 @@ class JournalEntry(models.Model):
         max_length=64,
         db_index=True,
         help_text="Unique sequence number e.g. JE-2026-00001"
+    )
+    entry_type = models.CharField(
+        max_length=30,
+        choices=ENTRY_TYPE_CHOICES,
+        default="manual",
+        help_text="Classification of the journal entry."
     )
     transaction_date = models.DateField(
         default=timezone.now,
@@ -575,6 +594,11 @@ class JournalEntry(models.Model):
         blank=True,
         default="",
         help_text="Transaction narration or business purpose."
+    )
+    explanation = models.TextField(
+        blank=True,
+        default="",
+        help_text="Detailed business justification or background explanation."
     )
     source_module = models.CharField(
         max_length=50,
@@ -600,6 +624,40 @@ class JournalEntry(models.Model):
         on_delete=models.SET_NULL,
         related_name="posted_journal_entries"
     )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    submitted_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="submitted_journal_entries"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approved_journal_entries"
+    )
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="rejected_journal_entries"
+    )
+    rejection_reason = models.TextField(blank=True, default="")
+    reversed_at = models.DateTimeField(null=True, blank=True)
+    reversed_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reversed_journal_entries"
+    )
+    reversal_reason = models.TextField(blank=True, default="")
     reversal_of = models.ForeignKey(
         "self",
         null=True,
@@ -639,7 +697,12 @@ class JournalEntry(models.Model):
 
     def generate_entry_number(self):
         """Generates sequential entry number for the company: JE-YYYY-XXXXX."""
-        year = self.transaction_date.year if self.transaction_date else timezone.now().year
+        if hasattr(self.transaction_date, "year"):
+            year = self.transaction_date.year
+        elif isinstance(self.transaction_date, str) and len(self.transaction_date) >= 4:
+            year = int(self.transaction_date[:4])
+        else:
+            year = timezone.now().year
         prefix = f"JE-{year}-"
         last_entry = JournalEntry.objects.filter(
             company_id=self.company_id,
@@ -743,6 +806,77 @@ class JournalEntry(models.Model):
         for line in lines:
             line.clean()
 
+    def submit_for_approval(self, user=None):
+        """Transitions draft/rejected entry to submitted state."""
+        if self.status not in ["draft", "rejected"]:
+            raise ValidationError(_(f"Cannot submit an entry with status '{self.status}'. Only draft or rejected entries may be submitted."))
+        self.validate_double_entry()
+        self.status = "submitted"
+        self.submitted_at = timezone.now()
+        self.submitted_by = user
+        self.save()
+        from accounting.engine import record_journal_audit_log
+        record_journal_audit_log(
+            self,
+            action="SUBMITTED",
+            user=user,
+            details={"submitted_at": self.submitted_at.isoformat()}
+        )
+        return self
+
+    def approve_entry(self, user=None):
+        """Approves a submitted journal entry."""
+        if self.status != "submitted":
+            raise ValidationError(_(f"Cannot approve an entry with status '{self.status}'. Entry must be submitted first."))
+        self.validate_double_entry()
+        self.status = "approved"
+        self.approved_at = timezone.now()
+        self.approved_by = user
+        self.save()
+        from accounting.engine import record_journal_audit_log
+        record_journal_audit_log(
+            self,
+            action="APPROVED",
+            user=user,
+            details={"approved_at": self.approved_at.isoformat()}
+        )
+        return self
+
+    def reject_entry(self, user=None, reason=""):
+        """Rejects a submitted journal entry with an auditable reason."""
+        if self.status != "submitted":
+            raise ValidationError(_(f"Cannot reject an entry with status '{self.status}'. Only submitted entries may be rejected."))
+        if not reason or not str(reason).strip():
+            raise ValidationError(_("A rejection reason is required."))
+        self.status = "rejected"
+        self.rejected_at = timezone.now()
+        self.rejected_by = user
+        self.rejection_reason = str(reason).strip()
+        self.save()
+        from accounting.engine import record_journal_audit_log
+        record_journal_audit_log(
+            self,
+            action="REJECTED",
+            user=user,
+            details={"reason": self.rejection_reason, "rejected_at": self.rejected_at.isoformat()}
+        )
+        return self
+
+    def revert_to_draft(self, user=None):
+        """Allows reverting a submitted or rejected entry back to draft for revisions."""
+        if self.status not in ["submitted", "rejected"]:
+            raise ValidationError(_(f"Cannot revert entry with status '{self.status}' to draft."))
+        self.status = "draft"
+        self.save()
+        from accounting.engine import record_journal_audit_log
+        record_journal_audit_log(
+            self,
+            action="UPDATED",
+            user=user,
+            details={"action": "reverted_to_draft"}
+        )
+        return self
+
     def __str__(self):
         return f"{self.entry_number} [{self.status.upper()}] ({self.transaction_date})"
 
@@ -841,6 +975,94 @@ class JournalEntryLine(models.Model):
     def __str__(self):
         side = f"DR {self.debit:.2f}" if self.debit > 0 else f"CR {self.credit:.2f}"
         return f"Line {self.line_number}: {self.account.code} - {side}"
+
+
+class JournalEntryAttachment(models.Model):
+    """
+    Supporting attachments and documentation for Journal Entries (Blueprint #20).
+    """
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="journal_attachments"
+    )
+    journal_entry = models.ForeignKey(
+        JournalEntry,
+        on_delete=models.CASCADE,
+        related_name="attachments"
+    )
+    file = models.FileField(upload_to="journal_attachments/")
+    filename = models.CharField(max_length=255)
+    file_size = models.PositiveIntegerField(default=0)
+    file_type = models.CharField(max_length=100, blank=True, default="")
+    description = models.CharField(max_length=255, blank=True, default="")
+    uploaded_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="uploaded_journal_attachments"
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-uploaded_at"]
+        indexes = [
+            models.Index(fields=["company", "journal_entry"]),
+        ]
+
+    def __str__(self):
+        return f"{self.filename} ({self.journal_entry.entry_number})"
+
+
+class JournalEntryAuditLog(models.Model):
+    """
+    Immutable chronological audit history for Journal Entries (Blueprint #20).
+    Tracks draft creation, modifications, approval workflow, posting, reversals, and attachments.
+    """
+    ACTION_CHOICES = [
+        ("CREATED", "Created Draft"),
+        ("UPDATED", "Updated Draft"),
+        ("SUBMITTED", "Submitted for Approval"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+        ("POSTED", "Posted to Ledger"),
+        ("REVERSED", "Reversed"),
+        ("ATTACHMENT_ADDED", "Attachment Added"),
+        ("ATTACHMENT_REMOVED", "Attachment Removed"),
+        ("DELETED", "Draft Deleted"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="journal_audit_logs"
+    )
+    journal_entry = models.ForeignKey(
+        JournalEntry,
+        on_delete=models.CASCADE,
+        related_name="audit_logs"
+    )
+    action = models.CharField(max_length=50, choices=ACTION_CHOICES, db_index=True)
+    performed_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="journal_audit_logs"
+    )
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+    details = models.JSONField(default=dict, blank=True)
+    ip_address = models.CharField(max_length=45, blank=True, default="")
+
+    class Meta:
+        ordering = ["-timestamp"]
+        indexes = [
+            models.Index(fields=["company", "journal_entry", "timestamp"]),
+        ]
+
+    def __str__(self):
+        return f"{self.journal_entry.entry_number} - {self.action} at {self.timestamp}"
 
 
 # ==============================================================================

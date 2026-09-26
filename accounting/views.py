@@ -292,26 +292,45 @@ class ERPContextViewSet(viewsets.ViewSet):
         return Response(context_data)
 
 
-from .models import JournalEntry, JournalEntryLine
-from .serializers import JournalEntrySerializer, JournalEntryLineSerializer
-from .engine import post_journal_entry, reverse_journal_entry
+from .models import JournalEntry, JournalEntryLine, JournalEntryAttachment, JournalEntryAuditLog
+from .serializers import (
+    JournalEntrySerializer,
+    JournalEntryLineSerializer,
+    JournalEntryAttachmentSerializer,
+    JournalEntryAuditLogSerializer,
+)
+from .engine import post_journal_entry, reverse_journal_entry, record_journal_audit_log
 from django.core.exceptions import ValidationError as DjangoValidationError
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
 
 class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     """
-    Manages double-entry Journal Entries.
-    Supports draft creation, line manipulation, atomic posting, and reversals.
+    Manages double-entry Journal Entries (Blueprint #8 & #20).
+    Supports draft creation, line manipulation, approval workflow (submit, approve, reject),
+    atomic posting, attachments, audit logs, and reversals.
     """
-    queryset = JournalEntry.objects.all().prefetch_related("lines__account")
+    queryset = JournalEntry.objects.all().prefetch_related(
+        "lines__account",
+        "attachments__uploaded_by",
+        "audit_logs__performed_by",
+    )
     serializer_class = JournalEntrySerializer
     permission_classes = [IsFinanceOrAdmin]
 
     def get_queryset(self):
         qs = super().get_queryset()
         status_param = self.request.query_params.get("status")
-        if status_param:
+        if status_param and status_param != "all":
             qs = qs.filter(status=status_param)
+
+        entry_type_param = self.request.query_params.get("entry_type")
+        if entry_type_param and entry_type_param != "all":
+            qs = qs.filter(entry_type=entry_type_param)
+
+        source_module_param = self.request.query_params.get("source_module")
+        if source_module_param and source_module_param != "all":
+            qs = qs.filter(source_module=source_module_param)
 
         period_param = self.request.query_params.get("accounting_period")
         if period_param:
@@ -323,6 +342,7 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 models.Q(entry_number__icontains=search)
                 | models.Q(reference__icontains=search)
                 | models.Q(description__icontains=search)
+                | models.Q(explanation__icontains=search)
             )
 
         start_date = self.request.query_params.get("start_date")
@@ -337,16 +357,73 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
-        if instance.status != "draft":
+        if instance.status not in ["draft", "rejected"]:
             return Response(
-                {"error": f"Cannot delete a journal entry with status '{instance.status}'. Only draft entries may be deleted."},
+                {"error": f"Cannot delete a journal entry with status '{instance.status}'. Only draft or rejected entries may be deleted."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         return super().destroy(request, *args, **kwargs)
 
+    @action(detail=True, methods=["post"], url_path="submit")
+    def submit_entry(self, request, pk=None):
+        """Submit a draft journal entry for approval."""
+        entry = self.get_object()
+        try:
+            entry.submit_for_approval(user=request.user)
+            serializer = self.get_serializer(entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="approve")
+    def approve_entry(self, request, pk=None):
+        """Approve a submitted journal entry."""
+        entry = self.get_object()
+        try:
+            entry.approve_entry(user=request.user)
+            serializer = self.get_serializer(entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reject")
+    def reject_entry(self, request, pk=None):
+        """Reject a submitted journal entry with reason."""
+        entry = self.get_object()
+        reason = request.data.get("reason", "")
+        try:
+            entry.reject_entry(user=request.user, reason=reason)
+            serializer = self.get_serializer(entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="revert-draft")
+    def revert_to_draft(self, request, pk=None):
+        """Revert a submitted or rejected journal entry back to draft."""
+        entry = self.get_object()
+        try:
+            entry.revert_to_draft(user=request.user)
+            serializer = self.get_serializer(entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
     @action(detail=True, methods=["post"], url_path="post")
     def post_entry(self, request, pk=None):
-        """Atomically post a draft journal entry."""
+        """Atomically post a draft or approved journal entry."""
         entry = self.get_object()
         company = getattr(request.user, "company", None)
         try:
@@ -401,6 +478,66 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 "difference": diff,
                 "errors": msg,
             }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="upload-attachment", parser_classes=[MultiPartParser, FormParser])
+    def upload_attachment(self, request, pk=None):
+        """Uploads a supporting document to the journal entry."""
+        entry = self.get_object()
+        uploaded_file = request.FILES.get("file")
+        if not uploaded_file:
+            return Response({"error": "No file uploaded."}, status=status.HTTP_400_BAD_REQUEST)
+
+        description = request.data.get("description", "")
+        attachment = JournalEntryAttachment.objects.create(
+            company=entry.company,
+            journal_entry=entry,
+            file=uploaded_file,
+            filename=uploaded_file.name,
+            file_size=uploaded_file.size,
+            file_type=uploaded_file.content_type or "",
+            description=description,
+            uploaded_by=request.user,
+        )
+
+        record_journal_audit_log(
+            entry,
+            action="ATTACHMENT_ADDED",
+            user=request.user,
+            details={
+                "attachment_id": attachment.id,
+                "filename": attachment.filename,
+                "file_size": attachment.file_size,
+            }
+        )
+
+        serializer = JournalEntryAttachmentSerializer(attachment)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["delete"], url_path=r"attachments/(?P<attachment_id>\d+)")
+    def delete_attachment(self, request, pk=None, attachment_id=None):
+        """Deletes a supporting document attachment from the journal entry."""
+        entry = self.get_object()
+        try:
+            attachment = entry.attachments.get(id=attachment_id, company=entry.company)
+            filename = attachment.filename
+            attachment.delete()
+            record_journal_audit_log(
+                entry,
+                action="ATTACHMENT_REMOVED",
+                user=request.user,
+                details={"attachment_id": int(attachment_id), "filename": filename}
+            )
+            return Response({"message": "Attachment deleted successfully."}, status=status.HTTP_204_NO_CONTENT)
+        except JournalEntryAttachment.DoesNotExist:
+            return Response({"error": "Attachment not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=["get"], url_path="audit-trail")
+    def audit_trail(self, request, pk=None):
+        """Returns the immutable chronological audit log for the journal entry."""
+        entry = self.get_object()
+        logs = entry.audit_logs.all().order_by("-timestamp")
+        serializer = JournalEntryAuditLogSerializer(logs, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 from .general_ledger import get_account_ledger, get_general_ledger_summary

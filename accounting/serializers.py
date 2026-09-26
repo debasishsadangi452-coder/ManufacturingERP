@@ -340,7 +340,8 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
         ]
 
 
-from .models import JournalEntry, JournalEntryLine
+from .models import JournalEntry, JournalEntryLine, JournalEntryAttachment, JournalEntryAuditLog
+from .engine import record_journal_audit_log
 from decimal import Decimal
 
 
@@ -377,11 +378,75 @@ class JournalEntryLineSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class JournalEntryAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.ReadOnlyField(source="uploaded_by.username")
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = JournalEntryAttachment
+        fields = [
+            "id",
+            "journal_entry",
+            "file",
+            "file_url",
+            "filename",
+            "file_size",
+            "file_type",
+            "description",
+            "uploaded_by",
+            "uploaded_by_name",
+            "uploaded_at",
+        ]
+        read_only_fields = [
+            "id",
+            "file_url",
+            "filename",
+            "file_size",
+            "file_type",
+            "uploaded_by",
+            "uploaded_by_name",
+            "uploaded_at",
+        ]
+
+    def get_file_url(self, obj):
+        if obj.file:
+            return obj.file.url
+        return None
+
+
+class JournalEntryAuditLogSerializer(serializers.ModelSerializer):
+    performed_by_name = serializers.ReadOnlyField(source="performed_by.username")
+
+    class Meta:
+        model = JournalEntryAuditLog
+        fields = [
+            "id",
+            "journal_entry",
+            "action",
+            "performed_by",
+            "performed_by_name",
+            "timestamp",
+            "details",
+            "ip_address",
+        ]
+        read_only_fields = [
+            "id",
+            "performed_by_name",
+            "timestamp",
+        ]
+
+
 class JournalEntrySerializer(serializers.ModelSerializer):
     lines = JournalEntryLineSerializer(many=True, required=False)
+    attachments = JournalEntryAttachmentSerializer(many=True, read_only=True)
+    audit_logs = JournalEntryAuditLogSerializer(many=True, read_only=True)
     accounting_period_name = serializers.ReadOnlyField(source="accounting_period.name")
     posted_by_name = serializers.ReadOnlyField(source="posted_by.username")
     created_by_name = serializers.ReadOnlyField(source="created_by.username")
+    submitted_by_name = serializers.ReadOnlyField(source="submitted_by.username")
+    approved_by_name = serializers.ReadOnlyField(source="approved_by.username")
+    rejected_by_name = serializers.ReadOnlyField(source="rejected_by.username")
+    reversed_by_name = serializers.ReadOnlyField(source="reversed_by.username")
     reversal_of_entry_number = serializers.ReadOnlyField(source="reversal_of.entry_number")
     total_debit = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
     total_credit = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
@@ -392,17 +457,33 @@ class JournalEntrySerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "entry_number",
+            "entry_type",
             "transaction_date",
             "accounting_period",
             "accounting_period_name",
             "reference",
             "description",
+            "explanation",
             "source_module",
             "source_id",
             "status",
             "posted_at",
             "posted_by",
             "posted_by_name",
+            "submitted_at",
+            "submitted_by",
+            "submitted_by_name",
+            "approved_at",
+            "approved_by",
+            "approved_by_name",
+            "rejected_at",
+            "rejected_by",
+            "rejected_by_name",
+            "rejection_reason",
+            "reversed_at",
+            "reversed_by",
+            "reversed_by_name",
+            "reversal_reason",
             "reversal_of",
             "reversal_of_entry_number",
             "created_by",
@@ -411,6 +492,8 @@ class JournalEntrySerializer(serializers.ModelSerializer):
             "total_credit",
             "is_balanced",
             "lines",
+            "attachments",
+            "audit_logs",
             "created_at",
             "updated_at",
         ]
@@ -422,6 +505,20 @@ class JournalEntrySerializer(serializers.ModelSerializer):
             "posted_at",
             "posted_by",
             "posted_by_name",
+            "submitted_at",
+            "submitted_by",
+            "submitted_by_name",
+            "approved_at",
+            "approved_by",
+            "approved_by_name",
+            "rejected_at",
+            "rejected_by",
+            "rejected_by_name",
+            "rejection_reason",
+            "reversed_at",
+            "reversed_by",
+            "reversed_by_name",
+            "reversal_reason",
             "reversal_of",
             "reversal_of_entry_number",
             "created_by",
@@ -429,6 +526,8 @@ class JournalEntrySerializer(serializers.ModelSerializer):
             "total_debit",
             "total_credit",
             "is_balanced",
+            "attachments",
+            "audit_logs",
             "created_at",
             "updated_at",
         ]
@@ -455,16 +554,29 @@ class JournalEntrySerializer(serializers.ModelSerializer):
                 line_data["line_number"] = line_data.get("line_number") or idx
                 JournalEntryLine.objects.create(**line_data)
 
+            record_journal_audit_log(
+                entry,
+                action="CREATED",
+                user=user,
+                details={
+                    "entry_number": entry.entry_number,
+                    "entry_type": entry.entry_type,
+                    "lines_count": len(lines_data),
+                }
+            )
+
             return entry
         except DjangoValidationError as e:
             msg = e.message_dict if hasattr(e, "message_dict") else e.messages
             raise serializers.ValidationError(msg)
 
     def update(self, instance, validated_data):
-        if instance.status != "draft":
-            raise serializers.ValidationError("Cannot modify a journal entry that is not in draft status.")
+        if instance.status not in ["draft", "rejected"]:
+            raise serializers.ValidationError(f"Cannot modify a journal entry with status '{instance.status}'. Only draft or rejected entries may be edited.")
 
         lines_data = validated_data.pop("lines", None)
+        request = self.context.get("request")
+        user = request.user if request and request.user.is_authenticated else None
 
         try:
             for attr, value in validated_data.items():
@@ -480,6 +592,17 @@ class JournalEntrySerializer(serializers.ModelSerializer):
                     line_data["journal_entry"] = instance
                     line_data["line_number"] = line_data.get("line_number") or idx
                     JournalEntryLine.objects.create(**line_data)
+
+            record_journal_audit_log(
+                instance,
+                action="UPDATED",
+                user=user,
+                details={
+                    "lines_count": instance.lines.count(),
+                    "total_debit": str(instance.total_debit),
+                    "total_credit": str(instance.total_credit),
+                }
+            )
 
             return instance
         except DjangoValidationError as e:
