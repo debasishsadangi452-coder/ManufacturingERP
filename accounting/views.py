@@ -3770,3 +3770,58 @@ class APIArchitectureViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #26 — FRONTEND / UI ARCHITECTURE VIEWS
+# ==============================================================================
+
+from .ui_architecture import (
+    get_ui_architecture_metadata,
+    verify_ui_architecture_health,
+)
+
+
+class UIArchitectureViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #26 — Frontend / UI Architecture API.
+    Provides complete navigation hierarchy (10 core nodes), screen element matrix,
+    5 mandatory UI principles enforcement specs, and automated UI health diagnostics.
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        """GET /api/accounting/ui-architecture/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_ui_architecture_metadata(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="health")
+    def health(self, request):
+        """GET /api/accounting/ui-architecture/health/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_ui_architecture_health(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="verify")
+    def verify(self, request):
+        """POST /api/accounting/ui-architecture/verify/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_ui_architecture_health(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+

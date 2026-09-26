@@ -7671,4 +7671,143 @@ class APIArchitectureTestCase(APITestCase):
         self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+class UIArchitectureTestCase(TestCase):
+    """
+    Blueprint Section #26: Frontend / UI Architecture Test Suite.
+    Verifies 10 core navigation nodes, exact navigation flow, sub-screens,
+    5 mandatory UI principles, live health diagnostics, company isolation, and RBAC.
+    """
+    def setUp(self):
+        self.company = Company.objects.create(name="Brewing Master UI Co", slug="brewing-master-ui-co")
+        self.company_b = Company.objects.create(name="Competitor Brewer Co", slug="competitor-brewer-co")
+
+        self.user = User.objects.create_user(
+            username="ui_arch_lead",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.user_b = User.objects.create_user(
+            username="tenant_b_user",
+            password="testpassword123",
+            company=self.company_b,
+            role="finance",
+        )
+        self.regular_user = User.objects.create_user(
+            username="regular_worker",
+            password="testpassword123",
+            company=self.company,
+            role="operator",
+        )
+
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_ui_architecture_metadata(self):
+        """GET /api/accounting/ui-architecture/ returns full metadata and 10 navigation nodes."""
+        res = self.client.get("/api/accounting/ui-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "OPERATIONAL")
+        self.assertIn("Blueprint Section #26", res.data["blueprint_section"])
+        self.assertEqual(res.data["company"]["id"], self.company.id)
+
+        metrics = res.data["metrics"]
+        self.assertEqual(metrics["total_navigation_nodes"], 10)
+        self.assertEqual(metrics["total_ui_principles"], 5)
+        self.assertTrue(metrics["total_accounts"] > 0)
+        self.assertTrue(metrics["fiscal_years"] >= 1)
+
+    def test_ui_navigation_order_and_sub_screens(self):
+        """Navigation nodes must match exact Blueprint Section #26 flow (Page 31)."""
+        res = self.client.get("/api/accounting/ui-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        nav_list = res.data["navigation_hierarchy"]
+        self.assertEqual(len(nav_list), 10)
+
+        # Expected sequence from Blueprint Section #26 Page 31:
+        # Dashboard -> Accounts -> Sales -> Purchases -> Banking -> Expenses -> Journals -> Taxes -> Reports -> Settings
+        expected_flow = [
+            ("dashboard", "Accounting Dashboard", 1),
+            ("accounts", "Accounts", 2),
+            ("sales", "Sales", 3),
+            ("purchases", "Purchases", 4),
+            ("banking", "Banking", 5),
+            ("expenses", "Expenses", 6),
+            ("journals", "Journal Entries", 7),
+            ("taxes", "Taxes", 8),
+            ("reports", "Reports", 9),
+            ("settings", "Settings", 10),
+        ]
+        for idx, (expected_id, expected_title, expected_order) in enumerate(expected_flow):
+            node = nav_list[idx]
+            self.assertEqual(node["nav_id"], expected_id)
+            self.assertEqual(node["title"], expected_title)
+            self.assertEqual(node["order"], expected_order)
+            self.assertTrue(len(node["sub_screens"]) >= 1)
+            # Verify sub-screen structure
+            for sub in node["sub_screens"]:
+                self.assertIn("name", sub)
+                self.assertTrue(len(sub["key_elements"]) >= 1)
+                self.assertTrue(len(sub["main_actions"]) >= 1)
+
+    def test_ui_principles_enforcement(self):
+        """Verifies the 5 core UI principles from Blueprint / Research Doc Page 38."""
+        res = self.client.get("/api/accounting/ui-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        principles = res.data["ui_principles"]
+        self.assertEqual(len(principles), 5)
+
+        principle_ids = [p["principle_id"] for p in principles]
+        expected_principles = [
+            "status_prominence",
+            "role_state_gating",
+            "live_debit_credit_balancing",
+            "source_document_traceability",
+            "posted_record_immutability",
+        ]
+        for ep in expected_principles:
+            self.assertIn(ep, principle_ids)
+
+    def test_ui_architecture_health_endpoint(self):
+        """GET /api/accounting/ui-architecture/health/ returns healthy diagnostics."""
+        res = self.client.get("/api/accounting/ui-architecture/health/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "HEALTHY")
+        self.assertEqual(res.data["overall_errors"], 0)
+        self.assertTrue(res.data["total_checks"] >= 15)
+        self.assertEqual(res.data["total_checks"], res.data["passing_checks"])
+
+    def test_ui_architecture_verify_endpoint(self):
+        """POST /api/accounting/ui-architecture/verify/ triggers live verification."""
+        res = self.client.post("/api/accounting/ui-architecture/verify/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "HEALTHY")
+
+    def test_company_isolation(self):
+        """Company B only views its own tenant UI context and accounts."""
+        self.client.force_authenticate(user=self.user_b)
+        res = self.client.get("/api/accounting/ui-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["company"]["id"], self.company_b.id)
+        # Company B has no accounts seeded yet
+        self.assertEqual(res.data["metrics"]["total_accounts"], 0)
+
+    def test_permissions(self):
+        """Non-finance user receives 403 Forbidden; anonymous user receives 401 Unauthorized."""
+        self.client.force_authenticate(user=self.regular_user)
+        res_forbidden = self.client.get("/api/accounting/ui-architecture/")
+        self.assertEqual(res_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_health_forbidden = self.client.get("/api/accounting/ui-architecture/health/")
+        self.assertEqual(res_health_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_unauth = self.client.get("/api/accounting/ui-architecture/")
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+
 
