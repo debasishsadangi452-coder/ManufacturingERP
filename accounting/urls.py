@@ -14,6 +14,7 @@ from .views import (
     AccountsPayableViewSet,
     SalesAccountingViewSet,
     AutoPostingLogViewSet,
+    PurchaseAccountingViewSet,
 )
 
 router = DefaultRouter()
@@ -30,6 +31,7 @@ router.register(r'receivables', AccountsReceivableViewSet, basename='accounting-
 router.register(r'payables', AccountsPayableViewSet, basename='accounting-payables')
 router.register(r'sales', SalesAccountingViewSet, basename='accounting-sales')
 router.register(r'auto-posting', AutoPostingLogViewSet, basename='accounting-auto-posting')
+router.register(r'purchases', PurchaseAccountingViewSet, basename='accounting-purchases')
 
 urlpatterns = [
     path('', include(router.urls)),
