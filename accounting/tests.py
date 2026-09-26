@@ -6748,3 +6748,382 @@ class FinancialReportsTestCase(APITestCase):
         self.assertEqual(res_anon.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #23 — ACCOUNTING DASHBOARD TEST SUITE
+# ==============================================================================
+
+class AccountingDashboardTestCase(APITestCase):
+    """
+    Blueprint Section #23 comprehensive test suite:
+      - Master executive dashboard aggregation
+      - Cash and bank balance summary
+      - Receivables due / overdue & aging
+      - Payables due / overdue & aging
+      - Gross margin and profitability metrics
+      - 6-month historical revenue & expense trends
+      - Inventory balance breakdown (Raw materials, WIP, Finished goods)
+      - Production cost indicators (DM, DL, MOH, Prime, Conversion, COGM)
+      - Unreconciled bank transactions count & amount
+      - Pending journal approvals and draft counts
+      - Period closing status and closing readiness
+      - Recent transactions activity feed
+      - Date filter presets (today, this_week, this_month, this_quarter, this_year, custom)
+      - Multi-tenant company isolation
+      - Permission and authentication enforcement
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Dashboard Alpha Corp", slug="dashboard-alpha")
+        self.user = User.objects.create_user(
+            username="dash_finance",
+            email="dash@alpha.com",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.regular_user = User.objects.create_user(
+            username="dash_worker",
+            email="worker@alpha.com",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.other_company = Company.objects.create(name="Dashboard Beta Corp", slug="dashboard-beta")
+        self.other_user = User.objects.create_user(
+            username="other_dash_user",
+            email="other@beta.com",
+            password="password123",
+            company=self.other_company,
+            role="finance",
+        )
+
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+        )
+        AccountingSettings.objects.create(
+            company=self.other_company,
+            default_currency="USD",
+        )
+
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+        seed_standard_chart_of_accounts(self.other_company)
+        seed_standard_fiscal_year(self.other_company, year=2026)
+
+        # Reference accounts
+        self.acc_cash = Account.objects.get(company=self.company, code="1010")
+        self.acc_bank = Account.objects.get(company=self.company, code="1020")
+        self.acc_ar = Account.objects.get(company=self.company, code="1100")
+        self.acc_inv_rm = Account.objects.get(company=self.company, code="1210")
+        self.acc_inv_wip = Account.objects.get(company=self.company, code="1220")
+        self.acc_inv_fg = Account.objects.get(company=self.company, code="1230")
+        self.acc_ap = Account.objects.get(company=self.company, code="2010")
+        self.acc_tax = Account.objects.get(company=self.company, code="2100")
+        self.acc_equity = Account.objects.get(company=self.company, code="3010")
+        self.acc_revenue = Account.objects.get(company=self.company, code="4010")
+        self.acc_cogs = Account.objects.get(company=self.company, code="5010")
+        self.acc_overhead = Account.objects.get(company=self.company, code="5210")
+        self.acc_rent = Account.objects.get(company=self.company, code="6020")
+
+        # Bank Account
+        self.bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Main Operating Account",
+            bank_name="Citibank",
+            account_number="987654321012",
+            account_type="checking",
+            currency="USD",
+            gl_account=self.acc_bank,
+        )
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("50000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+
+        # Customer & Vendor
+        self.customer = Customer.objects.create(company=self.company, name="Global Breweries Inc")
+        self.vendor = Vendor.objects.create(company=self.company, name="Hops Harvest Co")
+
+        # 1. Sales Invoice: $10,000 + $1,800 Tax
+        from sales.models import Invoice as SalesInv
+        self.sales_inv = SalesInv.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 1, 15),
+            due_date=date(2026, 2, 15),
+            total_amount=Decimal("11800.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        from .sales_accounting import post_sales_invoice_to_accounting
+        post_sales_invoice_to_accounting(
+            self.sales_inv.id,
+            user=self.user,
+            company=self.company,
+            revenue_account_id=self.acc_revenue.id,
+            tax_account_id=self.acc_tax.id,
+            tax_amount=Decimal("1800.00"),
+        )
+
+        # 2. Supplier Bill: $20,000 for Raw Material Inventory
+        from procurement.models import Bill as SuppBill
+        self.supp_bill = SuppBill.objects.create(
+            company=self.company,
+            vendor=self.vendor,
+            bill_number="BILL-DASH-01",
+            bill_date=date(2026, 1, 20),
+            due_date=date(2026, 2, 20),
+            total_amount=Decimal("20000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        from .purchase_accounting import post_purchase_to_accounting
+        post_purchase_to_accounting(
+            self.supp_bill.id,
+            user=self.user,
+            company=self.company,
+            expense_account_id=self.acc_inv_rm.id,
+        )
+
+        # 3. COGS entry: Dr COGS 6,000, Cr Inventory RM 6,000
+        p1 = AccountingPeriod.objects.filter(company=self.company, period_number=1).first()
+        cogs_je = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="system",
+            source_module="sales",
+            source_id=101,
+            transaction_date=date(2026, 1, 16),
+            accounting_period=p1,
+            reference="DEL-DASH-01",
+            description="COGS for sales delivery",
+            status="draft",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=cogs_je,
+            account=self.acc_cogs,
+            debit=Decimal("6000.00"),
+            credit=Decimal("0.00"),
+            description="COGS delivery recognition",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=cogs_je,
+            account=self.acc_inv_rm,
+            debit=Decimal("0.00"),
+            credit=Decimal("6000.00"),
+            description="Stock relief for delivery",
+        )
+        post_journal_entry(cogs_je.id, user=self.user)
+
+        # 4. Production cost entries: Dr WIP 3000 / Cr RM 3000
+        prod_je = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="system",
+            source_module="manufacturing",
+            source_id=202,
+            transaction_date=date(2026, 1, 18),
+            accounting_period=p1,
+            reference="PR-DASH-01",
+            description="Issue RM to production WIP",
+            status="draft",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=prod_je,
+            account=self.acc_inv_wip,
+            debit=Decimal("3000.00"),
+            credit=Decimal("0.00"),
+            description="WIP direct materials",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=prod_je,
+            account=self.acc_inv_rm,
+            debit=Decimal("0.00"),
+            credit=Decimal("3000.00"),
+            description="RM stock consumption",
+        )
+        post_journal_entry(prod_je.id, user=self.user)
+
+        # 5. Pending approvals & drafts
+        self.draft_je = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="manual",
+            transaction_date=date(2026, 1, 25),
+            accounting_period=p1,
+            reference="MAN-DRAFT-01",
+            description="Pending draft journal",
+            status="draft",
+        )
+        self.submitted_je = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="manual",
+            transaction_date=date(2026, 1, 26),
+            accounting_period=p1,
+            reference="MAN-SUBMIT-01",
+            description="Pending approval journal",
+            status="submitted",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.submitted_je,
+            account=self.acc_rent,
+            debit=Decimal("500.00"),
+            credit=Decimal("0.00"),
+            description="Rent adjustment",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.submitted_je,
+            account=self.acc_cash,
+            debit=Decimal("0.00"),
+            credit=Decimal("500.00"),
+            description="Rent cash outflow",
+        )
+
+        # 6. Unreconciled bank item
+        BankTransaction.objects.create(
+            company=self.company,
+            bank_account=self.bank_account,
+            transaction_date=date(2026, 1, 28),
+            amount=Decimal("1250.00"),
+            direction="inflow",
+            reconciliation_status="unreconciled",
+            description="Unreconciled merchant settlement",
+        )
+
+        self.client.force_authenticate(user=self.user)
+
+    def test_dashboard_full_aggregation_and_sections(self):
+        """Validates all 10 Blueprint #23 dashboard sections and KPIs."""
+        res = self.client.get("/api/accounting/dashboard/?date_filter=custom&start_date=2026-01-01&end_date=2026-01-31")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        # 0. Metadata
+        self.assertEqual(data["company_name"], "Dashboard Alpha Corp")
+        self.assertEqual(data["currency"], "USD")
+        self.assertEqual(data["date_filter"], "custom")
+        self.assertEqual(data["start_date"], "2026-01-01")
+        self.assertEqual(data["end_date"], "2026-01-31")
+
+        # 1. Cash and bank summary
+        cash_bank = data["cash_bank"]
+        self.assertEqual(Decimal(str(cash_bank["total_cash_and_bank"])), Decimal("50000.00"))
+        self.assertEqual(cash_bank["accounts_count"], 1)
+        self.assertEqual(cash_bank["accounts"][0]["bank_name"], "Citibank")
+        self.assertEqual(cash_bank["accounts"][0]["account_number_masked"], "****1012")
+
+        # 2. Receivables due / overdue & aging
+        ar = data["receivables"]
+        self.assertEqual(Decimal(str(ar["total_receivables"])), Decimal("11800.00"))
+        self.assertEqual(Decimal(str(ar["current_due"])), Decimal("11800.00"))
+        self.assertEqual(Decimal(str(ar["overdue_receivables"])), Decimal("0.00"))
+        self.assertTrue(len(ar["aging_brackets"]) >= 5)
+        self.assertTrue(len(ar["top_debtors"]) >= 1)
+        self.assertEqual(ar["top_debtors"][0]["customer_name"], "Global Breweries Inc")
+
+        # 3. Payables due / overdue & aging
+        ap = data["payables"]
+        self.assertEqual(Decimal(str(ap["total_payables"])), Decimal("20000.00"))
+        self.assertEqual(Decimal(str(ap["current_due"])), Decimal("20000.00"))
+        self.assertEqual(Decimal(str(ap["overdue_payables"])), Decimal("0.00"))
+        self.assertTrue(len(ap["aging_brackets"]) >= 5)
+        self.assertTrue(len(ap["top_creditors"]) >= 1)
+        self.assertEqual(ap["top_creditors"][0]["vendor_name"], "Hops Harvest Co")
+
+        # 4. Gross margin and profitability
+        profit = data["profitability"]
+        self.assertEqual(Decimal(str(profit["total_revenue"])), Decimal("10000.00"))
+        self.assertEqual(Decimal(str(profit["total_cogs"])), Decimal("6000.00"))
+        self.assertEqual(Decimal(str(profit["gross_profit"])), Decimal("4000.00"))
+        self.assertEqual(Decimal(str(profit["gross_margin_pct"])), Decimal("40.00"))
+        self.assertEqual(Decimal(str(profit["net_profit"])), Decimal("4000.00"))
+
+        # 5. Revenue & expense trends
+        trends = data["revenue_expense_trends"]
+        self.assertEqual(len(trends), 6)
+        jan_trend = next((t for t in trends if t["year"] == 2026 and t["month_num"] == 1), None)
+        if jan_trend:
+            self.assertEqual(Decimal(str(jan_trend["revenue"])), Decimal("10000.00"))
+            self.assertEqual(Decimal(str(jan_trend["cogs"])), Decimal("6000.00"))
+
+        # 6. Inventory value breakdown
+        inv = data["inventory"]
+        self.assertEqual(Decimal(str(inv["raw_materials_value"])), Decimal("11000.00"))
+        self.assertEqual(Decimal(str(inv["work_in_progress_value"])), Decimal("3000.00"))
+        self.assertEqual(Decimal(str(inv["finished_goods_value"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(inv["total_inventory_value"])), Decimal("14000.00"))
+        self.assertEqual(len(inv["breakdown"]), 3)
+
+        # 7. Production cost indicators
+        prod = data["production_cost"]
+        self.assertIn("prime_cost", prod)
+        self.assertIn("conversion_cost", prod)
+        self.assertIn("cost_of_goods_manufactured", prod)
+
+        # 8. Unreconciled bank items
+        unrec = data["unreconciled_bank"]
+        self.assertEqual(unrec["unreconciled_count"], 1)
+        self.assertEqual(Decimal(str(unrec["unreconciled_amount"])), Decimal("1250.00"))
+
+        # 9. Pending approvals
+        approvals = data["pending_approvals"]
+        self.assertEqual(approvals["pending_journals_count"], 1)
+        self.assertEqual(Decimal(str(approvals["pending_journals_amount"])), Decimal("500.00"))
+        self.assertEqual(approvals["draft_journals_count"], 1)
+
+        # 10. Period closing status
+        closing = data["period_closing"]
+        self.assertIsNotNone(closing["fiscal_year"])
+        self.assertEqual(closing["fiscal_year"]["name"], "FY 2026")
+        self.assertTrue(closing["open_periods_count"] > 0)
+        self.assertIn("is_ready_to_close", closing)
+
+        # 11. Recent transactions
+        recent = data["recent_transactions"]
+        self.assertTrue(len(recent) >= 4)
+        first_txn = recent[0]
+        self.assertIn("entry_number", first_txn)
+        self.assertIn("transaction_date", first_txn)
+        self.assertIn("amount", first_txn)
+
+    def test_date_filter_options(self):
+        """Tests preset date filter options: today, this_week, this_month, this_quarter, this_year."""
+        for filter_name in ["today", "this_week", "this_month", "this_quarter", "this_year"]:
+            res = self.client.get(f"/api/accounting/dashboard/?date_filter={filter_name}")
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.assertEqual(res.data["date_filter"], filter_name)
+            self.assertIsNotNone(res.data["start_date"])
+            self.assertIsNotNone(res.data["end_date"])
+
+    def test_company_isolation(self):
+        """Company B receives clean isolated metrics without seeing Company A's data."""
+        self.client.force_authenticate(user=self.other_user)
+        res = self.client.get("/api/accounting/dashboard/?date_filter=this_month")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["company_name"], "Dashboard Beta Corp")
+        self.assertEqual(Decimal(str(data["cash_bank"]["total_cash_and_bank"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(data["receivables"]["total_receivables"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(data["payables"]["total_payables"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(data["profitability"]["total_revenue"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(data["inventory"]["total_inventory_value"])), Decimal("0.00"))
+        self.assertEqual(data["pending_approvals"]["pending_journals_count"], 0)
+        self.assertEqual(len(data["recent_transactions"]), 0)
+
+    def test_permissions(self):
+        """Unauthorized access controls: 403 for non-finance, 401 for anonymous."""
+        self.client.force_authenticate(user=self.regular_user)
+        res = self.client.get("/api/accounting/dashboard/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_anon = self.client.get("/api/accounting/dashboard/")
+        self.assertEqual(res_anon.status_code, status.HTTP_401_UNAUTHORIZED)
+

@@ -29,6 +29,7 @@ from .views import (
     TaxAdjustmentViewSet,
     TaxManagementViewSet,
     FinancialReportsViewSet,
+    AccountingDashboardViewSet,
 )
 
 router = DefaultRouter()
@@ -60,6 +61,7 @@ router.register(r'tax-lines', TaxTransactionLineViewSet, basename='accounting-ta
 router.register(r'tax-adjustments', TaxAdjustmentViewSet, basename='accounting-tax-adjustments')
 router.register(r'taxes', TaxManagementViewSet, basename='accounting-taxes')
 router.register(r'reports', FinancialReportsViewSet, basename='accounting-reports')
+router.register(r'dashboard', AccountingDashboardViewSet, basename='accounting-dashboard')
 
 urlpatterns = [
     path('', include(router.urls)),

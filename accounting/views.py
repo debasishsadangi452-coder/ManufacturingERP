@@ -3560,14 +3560,35 @@ class FinancialReportsViewSet(CompanyScopedMixin, viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #23 — ACCOUNTING DASHBOARD VIEWS
+# ==============================================================================
+
+from .dashboard import get_accounting_dashboard_data
 
 
+class AccountingDashboardViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #23 — Accounting Dashboard API.
+    Provides authoritative executive KPIs, profitability metrics, aging summaries,
+    liquidity, inventory, production costs, and recent accounting transactions.
+    """
+    permission_classes = [IsFinanceOrAdmin]
 
-
-
-
-
-
-
-
-
+    def list(self, request):
+        """GET /api/accounting/dashboard/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_accounting_dashboard_data(
+                company=company,
+                date_filter=request.query_params.get("date_filter", "this_month"),
+                start_date=request.query_params.get("start_date"),
+                end_date=request.query_params.get("end_date"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                period_id=request.query_params.get("period_id"),
+            )
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
