@@ -7127,3 +7127,307 @@ class AccountingDashboardTestCase(APITestCase):
         res_anon = self.client.get("/api/accounting/dashboard/")
         self.assertEqual(res_anon.status_code, status.HTTP_401_UNAUTHORIZED)
 
+
+# ==============================================================================
+# BLUEPRINT SECTION #24 — DATABASE ARCHITECTURE TESTS
+# ==============================================================================
+
+from django.utils import timezone
+from accounting.database_architecture import (
+    get_database_architecture_metadata,
+    verify_database_integrity,
+    LOGICAL_ENTITIES_SPEC,
+)
+
+
+
+class DatabaseArchitectureTestCase(APITestCase):
+    """
+    Automated verification suite for Blueprint Section #24 (Database Architecture).
+    Validates:
+    1. Schema alignment for all 18 core logical entities and their relationships.
+    2. ERD flows (General Ledger, AR Subledger, AP Subledger).
+    3. Cross-domain relationships (Invoices, Bills, Payments, Allocations, Source tracking).
+    4. Data design rules & integrity constraints (Decimals, Tenant Scoping, Debit XOR Credit).
+    5. Database integrity diagnostics engine (Balance, orphans, constraints, cross-tenant isolation).
+    6. Multi-tenant company isolation and strict permission controls.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="DB Arch Alpha Corp")
+        self.user = User.objects.create_user(
+            username="db_arch_admin",
+            password="password123",
+            company=self.company,
+            role="admin",
+        )
+        self.regular_user = User.objects.create_user(
+            username="db_arch_regular",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+
+        # Company B for cross-tenant isolation tests
+        self.company_b = Company.objects.create(name="DB Arch Beta Corp")
+        self.user_b = User.objects.create_user(
+            username="db_arch_user_b",
+            password="password123",
+            company=self.company_b,
+            role="finance",
+        )
+
+
+        # Setup basic accounting data for Company A
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            is_closed=False,
+        )
+
+        self.period = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+
+        self.asset_type = AccountType.objects.filter(category="ASSET").first()
+        if not self.asset_type:
+            self.asset_type = AccountType.objects.create(
+                name="Cash & Cash Equivalents", category="ASSET", normal_balance="DEBIT", code_prefix="1"
+            )
+
+        self.equity_type = AccountType.objects.filter(category="EQUITY").first()
+        if not self.equity_type:
+            self.equity_type = AccountType.objects.create(
+                name="Retained Earnings", category="EQUITY", normal_balance="CREDIT", code_prefix="3"
+            )
+
+
+        self.cash_account = Account.objects.create(
+            company=self.company,
+            account_type=self.asset_type,
+            code="1010",
+            name="Cash at Bank",
+            is_active=True,
+            is_reconciled=True,
+        )
+        self.equity_account = Account.objects.create(
+            company=self.company,
+            account_type=self.equity_type,
+            code="3010",
+            name="Share Capital",
+            is_active=True,
+        )
+
+        # Create balanced posted journal entry
+        self.entry = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-ARCH-001",
+            entry_type="manual",
+            transaction_date=date(2026, 1, 15),
+            accounting_period=self.period,
+            status="posted",
+            posted_at=timezone.now(),
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.entry,
+            account=self.cash_account,
+            line_number=1,
+            debit=Decimal("5000.00"),
+            credit=Decimal("0.00"),
+            description="Initial capital deposit",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.entry,
+            account=self.equity_account,
+            line_number=2,
+            debit=Decimal("0.00"),
+            credit=Decimal("5000.00"),
+            description="Capital credit",
+        )
+
+        self.client.force_authenticate(user=self.user)
+
+    def test_database_architecture_metadata_endpoint(self):
+        """Test GET /api/accounting/database-architecture/ returns full schema & entity catalog."""
+        res = self.client.get("/api/accounting/database-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        # 1. Tenant info
+        self.assertEqual(data["tenant"]["company_id"], self.company.id)
+        self.assertEqual(data["tenant"]["company_name"], "DB Arch Alpha Corp")
+
+        # 2. Summary
+        self.assertEqual(data["summary"]["total_logical_entities"], 19)
+        self.assertTrue(data["summary"]["total_accounting_records"] > 0)
+        self.assertIn("Strict Company Isolation", data["summary"]["tenant_isolation_mode"])
+
+        # 3. Entities catalog contains all 18 Blueprint #24 entities
+        entities = {e["entity"]: e for e in data["entities"]}
+        required_entities = [
+            "Company", "Account", "AccountType", "JournalEntry", "JournalLine",
+            "Customer", "Supplier", "Invoice / InvoiceLine", "Bill / BillLine",
+            "Payment", "PaymentAllocation", "Expense", "Tax", "BankAccount",
+            "BankTransaction", "AccountingPeriod", "FiscalYear", "Reconciliation", "AuditLog"
+        ]
+        for ent in required_entities:
+            self.assertIn(ent, entities, f"Entity {ent} must be present in catalog")
+            self.assertIsNotNone(entities[ent]["table_name"])
+            self.assertIsNotNone(entities[ent]["relationships"])
+
+        # 4. Verify ERD flows
+        flow_ids = [f["id"] for f in data["erd_flows"]]
+        self.assertIn("general_ledger_flow", flow_ids)
+        self.assertIn("ar_subledger_flow", flow_ids)
+        self.assertIn("ap_subledger_flow", flow_ids)
+
+        # 5. Verify cross-domain relationships
+        self.assertTrue(len(data["cross_domain_relationships"]) >= 7)
+        sources = [r["source"] for r in data["cross_domain_relationships"]]
+        self.assertIn("Invoice", sources)
+        self.assertIn("Bill", sources)
+        self.assertIn("PaymentAllocation", sources)
+
+        # 6. Verify data design rules
+        rule_ids = [r["rule_id"] for r in data["data_design_rules"]]
+        self.assertIn("fixed_precision_decimals", rule_ids)
+        self.assertIn("multi_tenant_isolation", rule_ids)
+        self.assertIn("debit_xor_credit", rule_ids)
+        self.assertIn("double_entry_balance", rule_ids)
+
+    def test_database_integrity_endpoint_healthy(self):
+        """Test GET /api/accounting/database-architecture/integrity/ passes on valid data."""
+        res = self.client.get("/api/accounting/database-architecture/integrity/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["status"], "HEALTHY")
+        self.assertEqual(data["overall_errors"], 0)
+        self.assertEqual(data["total_checks"], 8)
+        self.assertEqual(data["passing_checks"], 8)
+
+        check_ids = [c["check_id"] for c in data["checks"]]
+        self.assertIn("double_entry_balance", check_ids)
+        self.assertIn("orphaned_lines", check_ids)
+        self.assertIn("debit_xor_credit", check_ids)
+        self.assertIn("non_negative_amounts", check_ids)
+        self.assertIn("account_code_uniqueness", check_ids)
+        self.assertIn("entry_number_uniqueness", check_ids)
+        self.assertIn("subledger_allocations", check_ids)
+        self.assertIn("cross_tenant_isolation", check_ids)
+
+    def test_database_integrity_post_verify_action(self):
+        """Test POST /api/accounting/database-architecture/verify/ executes diagnostic check."""
+        res = self.client.post("/api/accounting/database-architecture/verify/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "HEALTHY")
+
+    def test_database_integrity_detects_unbalanced_entry(self):
+        """Integrity engine flags unbalanced posted journal entries as FAIL."""
+        # Create a valid entry, then corrupt a line to make it unbalanced
+        unbalanced_entry = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-UNBALANCED-999",
+            entry_type="manual",
+            transaction_date=date(2026, 1, 20),
+            accounting_period=self.period,
+            status="posted",
+            posted_at=timezone.now(),
+        )
+        l1 = JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=unbalanced_entry,
+            account=self.cash_account,
+            line_number=1,
+            debit=Decimal("1000.00"),
+            credit=Decimal("0.00"),
+        )
+        l2 = JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=unbalanced_entry,
+            account=self.equity_account,
+            line_number=2,
+            debit=Decimal("0.00"),
+            credit=Decimal("1000.00"),
+        )
+        # Bypass clean() via update() to simulate corrupted unbalanced state
+        JournalEntryLine.objects.filter(id=l2.id).update(credit=Decimal("500.00"))
+
+        diag = verify_database_integrity(self.company)
+        self.assertEqual(diag["status"], "FAIL")
+        self.assertTrue(diag["overall_errors"] >= 1)
+
+        bal_check = next(c for c in diag["checks"] if c["check_id"] == "double_entry_balance")
+        self.assertEqual(bal_check["status"], "FAIL")
+        self.assertIn("JE-UNBALANCED-999", bal_check["details"])
+
+    def test_database_integrity_detects_cross_tenant_line(self):
+        """Integrity engine flags any cross-tenant journal entry line as FAIL."""
+        # Create a line in company A, then update journal_entry to company B
+        entry_b = JournalEntry.objects.create(
+            company=self.company_b,
+            entry_number="JE-BETA-001",
+            entry_type="manual",
+            transaction_date=date(2026, 1, 15),
+            status="draft",
+        )
+        test_line = JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.entry,
+            account=self.cash_account,
+            line_number=99,
+            debit=Decimal("100.00"),
+            credit=Decimal("0.00"),
+        )
+        # Update entry to entry_b to simulate cross-tenant corruption
+        JournalEntryLine.objects.filter(id=test_line.id).update(journal_entry=entry_b)
+
+        diag = verify_database_integrity(self.company)
+        self.assertEqual(diag["status"], "FAIL")
+        cross_check = next(c for c in diag["checks"] if c["check_id"] == "cross_tenant_isolation")
+        self.assertEqual(cross_check["status"], "FAIL")
+
+
+    def test_company_isolation(self):
+        """Company B only views its own schema counts and cannot see Company A's entries."""
+        self.client.force_authenticate(user=self.user_b)
+        res = self.client.get("/api/accounting/database-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["tenant"]["company_id"], self.company_b.id)
+        self.assertEqual(data["tenant"]["company_name"], "DB Arch Beta Corp")
+
+        # Company B has 0 journal entries
+        je_catalog = next(e for e in data["entities"] if e["entity"] == "JournalEntry")
+        self.assertEqual(je_catalog["count"], 0)
+
+        # Integrity for Company B is healthy and scans 0 entries
+        res_diag = self.client.get("/api/accounting/database-architecture/integrity/")
+        self.assertEqual(res_diag.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_diag.data["status"], "HEALTHY")
+
+    def test_permissions(self):
+        """Non-finance user receives 403 Forbidden; anonymous user receives 401 Unauthorized."""
+        self.client.force_authenticate(user=self.regular_user)
+        res_forbidden = self.client.get("/api/accounting/database-architecture/")
+        self.assertEqual(res_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_diag_forbidden = self.client.get("/api/accounting/database-architecture/integrity/")
+        self.assertEqual(res_diag_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_unauth = self.client.get("/api/accounting/database-architecture/")
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+
+

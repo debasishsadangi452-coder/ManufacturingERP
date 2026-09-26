@@ -3592,3 +3592,58 @@ class AccountingDashboardViewSet(viewsets.ViewSet):
             return Response(data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #24 — DATABASE ARCHITECTURE VIEWS
+# ==============================================================================
+
+from .database_architecture import (
+    get_database_architecture_metadata,
+    verify_database_integrity,
+)
+
+
+class DatabaseArchitectureViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #24 — Database Architecture API.
+    Provides schema registry for the 18 core accounting entities, ERD flows,
+    cross-domain relationships, data design constraints, and live integrity diagnostics.
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        """GET /api/accounting/database-architecture/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_database_architecture_metadata(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="integrity")
+    def integrity(self, request):
+        """GET /api/accounting/database-architecture/integrity/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_database_integrity(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="verify")
+    def verify(self, request):
+        """POST /api/accounting/database-architecture/verify/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_database_integrity(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+

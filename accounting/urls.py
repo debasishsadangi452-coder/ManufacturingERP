@@ -30,6 +30,7 @@ from .views import (
     TaxManagementViewSet,
     FinancialReportsViewSet,
     AccountingDashboardViewSet,
+    DatabaseArchitectureViewSet,
 )
 
 router = DefaultRouter()
@@ -62,6 +63,8 @@ router.register(r'tax-adjustments', TaxAdjustmentViewSet, basename='accounting-t
 router.register(r'taxes', TaxManagementViewSet, basename='accounting-taxes')
 router.register(r'reports', FinancialReportsViewSet, basename='accounting-reports')
 router.register(r'dashboard', AccountingDashboardViewSet, basename='accounting-dashboard')
+router.register(r'database-architecture', DatabaseArchitectureViewSet, basename='accounting-database-architecture')
+
 
 urlpatterns = [
     path('', include(router.urls)),
