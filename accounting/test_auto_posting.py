@@ -87,11 +87,16 @@ class ProductionAndSalesCycleTests(AutoPostingTestBase):
         with self.captureOnCommitCallbacks(execute=True):
             res = self.client.post(f"/api/production/production-orders/{order.id}/complete/")
         self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
-        self.assertEqual(lines_of(self.entry("production.order")), {
-            "1220": (Decimal("20.00"), Decimal("20.00")),
-            "1210": (Decimal("0.00"), Decimal("20.00")),
-            "1230": (Decimal("20.00"), Decimal("0.00")),
-        })
+        # Posted through Manufacturing-to-Accounting (#15): raw materials out,
+        # finished goods in, WIP cleared.
+        net = {code: dr - cr for code, (dr, cr) in lines_of(self.entry("manufacturing")).items()}
+        self.assertEqual(net.get("1210"), Decimal("-20.00"))
+        self.assertEqual(net.get("1230"), Decimal("20.00"))
+        self.assertEqual(net.get("1220", Decimal("0.00")), Decimal("0.00"))
+        # The Manufacturing tab sees it as posted and won't book it again.
+        from accounting.manufacturing_accounting import post_manufacturing_accounting
+        _, created = post_manufacturing_accounting(order.id, self.company, user=self.admin)
+        self.assertFalse(created)
 
         # Shipment: 20 bottles at standard cost 1.00 -> COGS 20.00
         so = SalesOrder.objects.create(customer=self.customer, status="confirmed")

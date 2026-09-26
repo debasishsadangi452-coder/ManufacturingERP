@@ -192,6 +192,7 @@ class StockMovementSerializer(serializers.ModelSerializer):
         if not hasattr(obj, "_cached_je"):
             from accounting.models import JournalEntry
             obj._cached_je = JournalEntry.objects.filter(
+                company_id=obj.item.company_id,
                 source_module="inventory",
                 source_id=obj.id,
             ).first()

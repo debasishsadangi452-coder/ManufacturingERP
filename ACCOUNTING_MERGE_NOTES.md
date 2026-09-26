@@ -135,3 +135,44 @@ Users can set an ingredient, a quantity and a date, and the purchase order is pl
 - **API:** `/api/procurement/scheduled-orders/` supports list, create and edit, DELETE (which cancels and keeps history), and `POST {id}/place_now/`. It is open to Store and Admin users and scoped to the company.
 - **AI Procurement:** new tools `schedule_procurement` (for requests like "order 500 kg sugar on the 1st of next month", optionally weekly or monthly) and `list_scheduled_procurements`. Today's date is now added to every AI agent's system prompt, so relative dates resolve correctly.
 - **Tests:** `procurement/test_scheduled_orders.py` (8). I also verified it live: a server started against a copy of the DB placed a due schedule by itself (PO-0071, `ordered`, 40 × $2.00).
+
+---
+
+# Second merge: Accounting Blueprints #13–#21 (2026-09-26/27)
+
+**Rollback point:** local tag `pre-accounting-merge-2`.
+
+## What was merged
+
+As before, the branches were merged one at a time with `--no-ff`. `feature/accounting-13-purchase-to-accounting` is contained in `feature/accounting`, so it went first.
+
+| Step | Branch | Adds |
+|---|---|---|
+| 1 | `feature/accounting-13-purchase-to-accounting` | `purchase_accounting.py`: post, preview and reverse vendor bills with input tax (`/api/accounting/purchases/`) |
+| 2 | `feature/accounting` (#14–#21) | #14 Inventory-to-Accounting, #15 Manufacturing-to-Accounting, #16 Expenses, #17 Cash & Bank, #18 Payments & Allocations, #19 Tax layer, #20 Journal approvals, audit and attachments, #21 Period closing and year-end closing entry. Adds migrations `accounting` 0003–0010. `inventory/serializers.py` adds an accounting status to stock movements. |
+
+None of the new modules post automatically; each one posts only when a user clicks.
+
+## Conflicts and fixes made while merging
+
+- **Migrations:**
+  - The branch's migrations depended on `accounts/0009`, the migration removed earlier because it rewrote and locked the user and company tables. They now depend on `accounts/0008`.
+  - `main`'s `0003_auto_posting` is renumbered to `0011_auto_posting`, so it runs after the branch's `0003`–`0010`. It had never been deployed.
+  - There's no migration drift for `accounting`.
+- **`models.py`, `serializers.py`, `views.py`:** the branch's version was used as the base, and `main`'s changes were re-applied on top: `auto_post_enabled`, `AutoPostingLog`, auto-posting API, fiscal-year lifecycle and `start_next_year`.
+- **Fiscal year:**
+  - The branch's stricter `close_year` is kept. Every month must be closed first, and it generates a year-end closing entry.
+  - The branch's rule that reopening needs a reason is kept, plus `main`'s rule that only one year can be open.
+- **Payments summary (branch bug):** money totals came back as `"5000"` instead of `"5000.00"` on SQLite. They are now formatted consistently.
+
+## Reconciling automatic posting with the new subledgers (no double posting)
+
+| Event | Before | Now |
+|---|---|---|
+| Production completed | Auto-posting wrote its own entry (`production.order`). The Manufacturing tab could post the same order again (`manufacturing`). | Auto-posting calls `post_manufacturing_accounting`. There is one entry per order, and the Manufacturing tab shows it as posted. It respects `manufacturing_accounting_enabled` and the labour and overhead policy. |
+| Goods receipt | Auto-posted (`procurement.receipt`). The Inventory tab could post the same `GRN PO#…` stock movement again. | The Inventory module treats those movements as "already accounted (auto_posted)". Auto-posting also skips a receipt whose movements were already posted by hand. |
+| Sales shipment | Auto-posted COGS (`sales.shipment`). The Inventory tab could post the `Fulfilled / Partial fulfillment / Shipment SO#…` movements again. | Handled the same way. `Reserved for SO#… production` movements are deliberately **not** matched. References must match exactly, so `SO#1` never matches `SO#12`. |
+| Vendor bill posted by hand (Purchase-to-Accounting) | Debited Raw Materials again even if the receipt was auto-posted to inventory. | Clears GRNI (2050) when the receipt was auto-posted, in both the preview and the post. |
+| Stock movement list (branch) | The accounting-status lookup was **not scoped by company**, so one company could see another company's journal number for a matching ID. | Scoped to the movement's company. |
+
+**Tests:** `accounting/test_subledger_reconciliation.py` (4 tests, new). `test_auto_posting.py` is updated for the Manufacturing module delegation.

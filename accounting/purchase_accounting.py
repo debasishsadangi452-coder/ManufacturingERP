@@ -110,6 +110,12 @@ def get_purchase_accounting_preview(bill_id, company, expense_account_id=None, t
     net_purchase = total_amount - tax_val
 
     ap_account = get_ap_account(company)
+    if expense_account_id is None:
+        # Match post_purchase_to_accounting: auto-posted receipts clear GRNI.
+        from accounting.auto_posting import grni_account_for_bill
+        grni = grni_account_for_bill(bill)
+        if grni:
+            expense_account_id = grni.id
     expense_account = get_bill_expense_account(company, account_id=expense_account_id)
 
     lines_preview = [
@@ -224,6 +230,12 @@ def post_purchase_to_accounting(
         net_purchase = total_amount - tax_val
 
         ap_account = get_ap_account(company)
+        if expense_account_id is None:
+            # Goods already capitalised at receipt by GL auto-posting clear GRNI.
+            from accounting.auto_posting import grni_account_for_bill
+            grni = grni_account_for_bill(bill)
+            if grni:
+                expense_account_id = grni.id
         expense_account = get_bill_expense_account(company, account_id=expense_account_id)
 
         # Create draft journal entry

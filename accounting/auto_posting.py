@@ -8,7 +8,7 @@ move when goods or money move:
   ----------------------------------------  ------------------------------------------------
   goods_receipt       (PO received)          Dr 1210 Raw Materials     / Cr 2050 GRNI
   vendor_bill         (bill from PO)         Dr 2050 GRNI (or 1210)    / Cr 2010 Accounts Payable
-  production_completed                       Dr 1220 WIP / Cr 1210 RM, then Dr 1230 FG / Cr 1220 WIP
+  production_completed                       via Manufacturing-to-Accounting (#15): RM -> WIP -> FG
   sales_shipment      (SO fulfilled/shipped) Dr 5050 COGS              / Cr 1230 Finished Goods
                                              (bought-in items without a recipe: Cr 1210)
   sales_invoice       (invoice from SO)      Dr 1100 AR                / Cr 4010 Sales
@@ -26,6 +26,7 @@ Safety guarantees for the operational flows that call `queue_auto_post`:
     accounts exists) and have `auto_post_enabled` switched on.
 """
 import logging
+import re
 from decimal import Decimal, ROUND_HALF_UP
 
 from django.core.exceptions import ValidationError
@@ -151,6 +152,7 @@ def _post_goods_receipt(company, receipt_id, user, payload):
     if not receipt:
         raise ValidationError(f"Goods receipt #{receipt_id} not found.")
     _skip_if_posted(company, "procurement.receipt", receipt.id)
+    _skip_if_movements_posted(company, "grn", receipt.purchase_order_id)
 
     po = receipt.purchase_order
     amount = _money(sum(
@@ -188,6 +190,12 @@ def _post_vendor_bill(company, bill_id, user, payload):
 
 
 def _post_production(company, order_id, user, payload):
+    # Delegates to Manufacturing-to-Accounting (Blueprint #15): one entry per
+    # production order under source "manufacturing", with its WIP / labour /
+    # overhead / scrap policy, shown as posted on the Manufacturing tab.
+    from accounting.manufacturing_accounting import (
+        determine_production_order_accounting_requirement, post_manufacturing_accounting,
+    )
     from production.models import ProductionOrder
 
     order = ProductionOrder.objects.select_related("recipe__product").filter(
@@ -195,32 +203,12 @@ def _post_production(company, order_id, user, payload):
     ).first()
     if not order:
         raise ValidationError(f"Production order #{order_id} not found.")
-    _skip_if_posted(company, "production.order", order.id)
-
-    cost = _money(sum(
-        Decimal(str(required)) * (ing.item.purchase_cost or Decimal("0"))
-        for ing, required in order.recipe.material_requirements(order.quantity)
-    ))
-    if cost <= 0:
-        raise SkipPosting(
-            f"Recipe ingredients for '{order.recipe.product.name}' have no purchase cost; nothing to post."
-        )
-
-    wip, product = _account(company, "1220"), order.recipe.product.name
-    return _create_and_post(
-        company, user,
-        date=timezone.localdate(order.end_time) if order.end_time else timezone.localdate(),
-        reference=f"PROD-{order.id}",
-        description=f"Production #{order.id}: {order.quantity} x {product}",
-        source_module="production.order",
-        source_id=order.id,
-        lines=[
-            (wip, cost, 0, f"Materials issued to production #{order.id}"),
-            (_account(company, "1210"), 0, cost, f"Raw materials consumed - production #{order.id}"),
-            (_account(company, "1230"), cost, 0, f"Finished goods completed - {product}"),
-            (wip, 0, cost, f"WIP relieved - production #{order.id}"),
-        ],
-    )
+    _skip_if_posted(company, "manufacturing", order.id)
+    required, reason, _ = determine_production_order_accounting_requirement(order, company)
+    if not required:
+        raise SkipPosting(reason)
+    entry, _created = post_manufacturing_accounting(order.id, company, user=user)
+    return entry
 
 
 def _post_sales_shipment(company, order_id, user, payload):
@@ -230,6 +218,7 @@ def _post_sales_shipment(company, order_id, user, payload):
     order = SalesOrder.objects.select_related("customer").filter(pk=order_id, customer__company=company).first()
     if not order:
         raise ValidationError(f"Sales order #{order_id} not found.")
+    _skip_if_movements_posted(company, "shipment", order.id)
 
     credits = {}  # inventory account code -> amount
     for line in payload.get("lines", []):
@@ -353,6 +342,60 @@ def _create_and_post(company, user, *, date, reference, description, source_modu
                 description=text,
             )
         return post_journal_entry(entry.id, user, company=company)
+
+
+# Stock-movement references written by the operational views for the events
+# auto-posting covers: "GRN PO#12" (goods receipt, incl. "GRN PO#12 (AI)") and
+# "Fulfilled SO#7" / "Partial fulfillment SO#7" / "Shipment SO#7". Material
+# reserved for production ("Reserved for SO#7 production") is deliberately not
+# matched — Manufacturing-to-Accounting accounts for it.
+MOVEMENT_EVENT_PATTERNS = {
+    "grn": re.compile(r"^GRN PO#(\d+)\b", re.I),
+    "shipment": re.compile(r"^(?:Fulfilled|Partial fulfillment|Shipment) SO#(\d+)\b", re.I),
+}
+
+
+def movement_event(reference):
+    """(kind, document id) of the auto-posted event a stock movement belongs to."""
+    for kind, pattern in MOVEMENT_EVENT_PATTERNS.items():
+        match = pattern.match((reference or "").strip())
+        if match:
+            return kind, int(match.group(1))
+    return None, None
+
+
+def _skip_if_movements_posted(company, kind, document_id):
+    """Skip when the Inventory subledger (#14) already posted this event's
+    stock movements manually."""
+    from inventory.models import StockMovement
+
+    candidates = StockMovement.objects.filter(
+        item__company=company, reference__icontains="PO#" if kind == "grn" else "SO#"
+    ).values_list("id", "reference")
+    movement_ids = [mid for mid, ref in candidates if movement_event(ref) == (kind, document_id)]
+    existing = JournalEntry.objects.filter(
+        company=company, source_module="inventory", source_id__in=movement_ids, status="posted"
+    ).first() if movement_ids else None
+    if existing:
+        raise SkipPosting(f"Already posted from Inventory-to-Accounting as {existing.entry_number}.")
+
+
+def auto_posted_event_for_movement(movement, company):
+    """The auto-posted journal entry that already covers this stock movement's
+    value (goods receipt or sales shipment), or None. Used by the Inventory
+    subledger so the same stock is never booked twice."""
+    kind, document_id = movement_event(movement.reference)
+    if kind == "grn":
+        from procurement.models import GoodsReceipt
+        receipt_ids = GoodsReceipt.objects.filter(purchase_order_id=document_id).values_list("id", flat=True)
+        return JournalEntry.objects.filter(
+            company=company, source_module="procurement.receipt", source_id__in=list(receipt_ids), status="posted"
+        ).first()
+    if kind == "shipment":
+        return JournalEntry.objects.filter(
+            company=company, source_module="sales.shipment", source_id=document_id, status="posted"
+        ).first()
+    return None
 
 
 def _skip_if_posted(company, source_module, source_id):

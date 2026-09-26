@@ -438,6 +438,13 @@ def determine_movement_accounting_requirement(movement, company):
             ).exists():
                 return False, f"Already accounted under Manufacturing-to-Accounting for Production Order #{order_id} to prevent duplicate GL impact.", "production_order"
 
+    # Goods receipts and sales shipments already booked by GL auto-posting
+    # (accounting/auto_posting.py) must not be valued a second time.
+    from accounting.auto_posting import auto_posted_event_for_movement
+    covering = auto_posted_event_for_movement(movement, company)
+    if covering:
+        return False, f"Already accounted by automatic posting ({covering.entry_number}).", "auto_posted"
+
     # Write-off: Scrapped / expired / damaged stock
     if "write-off" in ref or "write off" in ref or "scrap" in ref or "damaged" in ref or "expired" in ref:
         return True, "Inventory write-off / scrap loss", "write_off"
