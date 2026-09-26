@@ -282,6 +282,29 @@ def post_purchase_to_accounting(
         # Synchronize vendor's outstanding_balance
         sync_vendor_balance(bill.vendor)
 
+        # Blueprint #19 Tax Layer Integration
+        if tax_val > Decimal("0.00") and tax_account:
+            try:
+                from .tax import record_tax_line
+                tax_rate_val = Decimal("0.0000")
+                if net_purchase > Decimal("0.00"):
+                    tax_rate_val = (tax_val / net_purchase * Decimal("100.0000")).quantize(Decimal("0.0001"))
+                record_tax_line(
+                    company=company,
+                    source_module="purchases",
+                    source_id=str(bill.id),
+                    source_reference=ref_text,
+                    taxable_amount=net_purchase,
+                    tax_rate=tax_rate_val,
+                    tax_amount=tax_val,
+                    transaction_date=bill.bill_date,
+                    tax_account=tax_account,
+                    journal_entry=posted_entry,
+                    actor=user,
+                )
+            except Exception:
+                pass
+
         return posted_entry
 
 
@@ -327,6 +350,23 @@ def reverse_purchase_accounting(bill_id, user, company, reason=""):
 
         # Re-synchronize vendor balance
         sync_vendor_balance(bill.vendor)
+
+        # Blueprint #19 Tax Layer Integration: mark tax lines as reversed
+        try:
+            from .models import TaxTransactionLine
+            TaxTransactionLine.objects.filter(
+                company=company,
+                source_module="purchases",
+                source_id=str(bill.id),
+                is_reversed=False,
+            ).update(
+                is_reversed=True,
+                reversed_at=timezone.now(),
+                reversal_reference="Reversed via bill cancellation",
+                reversal_journal_entry=reversal_je,
+            )
+        except Exception:
+            pass
 
         return {
             "bill_id": bill.id,

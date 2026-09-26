@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('accounting', '0002_journalentry_journalentryline_and_more'),
+        ('accounting', '0010_accountingperiod_closed_at_and_more'),
         ('accounts', '0008_alter_company_id_alter_companysubscription_id_and_more'),
     ]
 

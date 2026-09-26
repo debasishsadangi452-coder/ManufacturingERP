@@ -3,6 +3,7 @@ from django.core.exceptions import ValidationError
 from rest_framework.test import APIClient, APITestCase
 from rest_framework import status
 from datetime import date
+from django.db.models import Sum
 from accounts.models import Company, User
 from .models import FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings
 from .seeds import (
@@ -10,6 +11,8 @@ from .seeds import (
     seed_standard_chart_of_accounts,
     seed_standard_fiscal_year,
 )
+from .engine import post_journal_entry, reverse_journal_entry
+from production.models import Recipe, RecipeIngredient, ProductionOrder
 
 
 class AccountingModelTests(TestCase):
@@ -2351,8 +2354,4071 @@ class PurchaseAccountingTests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
+from inventory.models import Item, Warehouse, Stock, StockMovement
 
 
+class InventoryAccountingTests(TestCase):
+    """
+    Automated Unit & Integration Tests for Blueprint Section #14: Inventory-to-Accounting.
+    Validates receipt, issue, transfer, adjustment, write-off, revaluation, idempotency,
+    reversals, and General Ledger posting.
+    """
+    def setUp(self):
+        self.company = Company.objects.create(name="Brew Craft Co", slug="brewcraft")
+        ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        self.fy = seed_standard_fiscal_year(self.company, 2026)
+
+        self.user = User.objects.create_user(
+            username="inventory_accountant",
+            email="inv@brewcraft.com",
+            role="finance",
+            company=self.company,
+        )
+
+        self.warehouse = Warehouse.objects.create(
+            company=self.company,
+            name="Main Plant Warehouse",
+            location="Building A",
+        )
+        self.secondary_warehouse = Warehouse.objects.create(
+            company=self.company,
+            name="Cold Storage Facility",
+            location="Building C",
+        )
+
+        self.raw_item = Item.objects.create(
+            company=self.company,
+            name="Organic Barley Malt",
+            category="raw_material",
+            unit="kg",
+            purchase_cost=Decimal("5.00"),
+            selling_price=Decimal("0.00"),
+        )
+        self.finished_item = Item.objects.create(
+            company=self.company,
+            name="Craft IPA 6-Pack",
+            category="finished_good",
+            unit="case",
+            purchase_cost=Decimal("12.00"),
+            selling_price=Decimal("24.00"),
+        )
+
+    def test_inventory_receipt_creates_balanced_journal(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import (
+            determine_movement_accounting_requirement,
+            post_inventory_movement_to_accounting,
+        )
+
+        # Operational receipt: 100 kg at $5.00 = $500.00
+        increase_stock(self.raw_item, self.warehouse, 100, user=self.user, reference="Vendor Delivery PO#1001")
+        movement = StockMovement.objects.filter(item=self.raw_item).latest("created_at")
+
+        requires, reason, event_subtype = determine_movement_accounting_requirement(movement, self.company)
+        self.assertTrue(requires)
+        self.assertEqual(event_subtype, "receipt")
+
+        je = post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.source_module, "inventory")
+        self.assertEqual(je.source_id, movement.id)
+        self.assertEqual(je.lines.count(), 2)
+
+        dr_line = je.lines.filter(debit__gt=0).first()
+        cr_line = je.lines.filter(credit__gt=0).first()
+
+        self.assertEqual(dr_line.account.code, "1210")  # Raw Materials Inventory Asset
+        self.assertEqual(dr_line.debit, Decimal("500.00"))
+        self.assertIn(cr_line.account.code, ["2010", "2020"])  # Clearing or AP Trade
+        self.assertEqual(cr_line.credit, Decimal("500.00"))
+
+    def test_finished_goods_receipt_uses_finished_goods_asset_account(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        # Production receipt: 50 cases of finished goods at $12.00 = $600.00
+        increase_stock(self.finished_item, self.warehouse, 50, user=self.user, reference="Finished Batch #B-101")
+        movement = StockMovement.objects.filter(item=self.finished_item).latest("created_at")
+
+        je = post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+
+        dr_line = je.lines.filter(debit__gt=0).first()
+        self.assertEqual(dr_line.account.code, "1230")  # Finished Goods Inventory
+        self.assertEqual(dr_line.debit, Decimal("600.00"))
+
+    def test_inventory_issue_consumption_creates_cogs_entry(self):
+        from inventory.services import increase_stock, decrease_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        # Inward stock first
+        increase_stock(self.raw_item, self.warehouse, 200, user=self.user, reference="Initial Stock")
+        # Issue for batch production: 40 kg at $5.00 = $200.00
+        decrease_stock(self.raw_item, self.warehouse, 40, user=self.user, reference="Batch Production #201")
+        out_movement = StockMovement.objects.filter(item=self.raw_item, movement_type="OUT").latest("created_at")
+
+        je = post_inventory_movement_to_accounting(out_movement.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+
+        dr_line = je.lines.filter(debit__gt=0).first()
+        cr_line = je.lines.filter(credit__gt=0).first()
+
+        self.assertEqual(dr_line.account.code, "5010")  # Direct Raw Materials Consumed (COGS)
+        self.assertEqual(dr_line.debit, Decimal("200.00"))
+        self.assertEqual(cr_line.account.code, "1210")  # Raw Materials Inventory Asset
+        self.assertEqual(cr_line.credit, Decimal("200.00"))
+
+    def test_internal_warehouse_transfer_does_not_create_redundant_gl_entry(self):
+        from inventory.services import increase_stock
+        from inventory.views import StockViewSet
+        from accounting.inventory_accounting import (
+            determine_movement_accounting_requirement,
+            post_inventory_movement_to_accounting,
+        )
+
+        increase_stock(self.raw_item, self.warehouse, 100, user=self.user, reference="Initial Stock")
+        # Simulate transfer out movement
+        transfer_out = StockMovement.objects.create(
+            item=self.raw_item,
+            warehouse=self.warehouse,
+            movement_type="OUT",
+            quantity=30,
+            reference=f"Transfer to {self.secondary_warehouse.name}",
+            created_by=self.user,
+        )
+
+        requires, reason, event_subtype = determine_movement_accounting_requirement(transfer_out, self.company)
+        self.assertFalse(requires)
+        self.assertEqual(event_subtype, "transfer_internal")
+
+        # Posting an internal transfer movement raises ValidationError
+        with self.assertRaises(ValidationError):
+            post_inventory_movement_to_accounting(transfer_out.id, user=self.user, company=self.company)
+
+    def test_positive_and_negative_inventory_adjustments(self):
+        from inventory.services import increase_stock, adjust_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        increase_stock(self.raw_item, self.warehouse, 50, user=self.user, reference="Initial Stock")
+
+        # 1. Positive adjustment (Found 10 extra: 50 -> 60, diff = +10 at $5 = $50 gain)
+        adjust_stock(self.raw_item, self.warehouse, 60, user=self.user, reference="Physical Count Variance Gain")
+        pos_mov = StockMovement.objects.filter(item=self.raw_item, movement_type="ADJUST").latest("created_at")
+
+        je_pos = post_inventory_movement_to_accounting(pos_mov.id, user=self.user, company=self.company)
+        self.assertEqual(je_pos.status, "posted")
+        dr_pos = je_pos.lines.filter(debit__gt=0).first()
+        cr_pos = je_pos.lines.filter(credit__gt=0).first()
+        self.assertEqual(dr_pos.account.code, "1210")  # DR Asset
+        self.assertEqual(dr_pos.debit, Decimal("50.00"))
+        self.assertEqual(cr_pos.account.code, "5090")  # CR Variance Gain
+        self.assertEqual(cr_pos.credit, Decimal("50.00"))
+
+        # 2. Negative adjustment (Shrinkage: 60 -> 45, diff = -15 at $5 = $75 loss)
+        adjust_stock(self.raw_item, self.warehouse, 45, user=self.user, reference="Physical Count Variance Loss")
+        neg_mov = StockMovement.objects.filter(item=self.raw_item, movement_type="ADJUST").latest("created_at")
+
+        je_neg = post_inventory_movement_to_accounting(neg_mov.id, user=self.user, company=self.company)
+        self.assertEqual(je_neg.status, "posted")
+        dr_neg = je_neg.lines.filter(debit__gt=0).first()
+        cr_neg = je_neg.lines.filter(credit__gt=0).first()
+        self.assertEqual(dr_neg.account.code, "5090")  # DR Adjustment Loss
+        self.assertEqual(dr_neg.debit, Decimal("75.00"))
+        self.assertEqual(cr_neg.account.code, "1210")  # CR Asset
+        self.assertEqual(cr_neg.credit, Decimal("75.00"))
+
+    def test_inventory_write_off_creates_loss_expense_entry(self):
+        from inventory.services import increase_stock, decrease_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        increase_stock(self.raw_item, self.warehouse, 50, user=self.user, reference="Initial Stock")
+        # Damaged stock write-off: 10 kg at $5.00 = $50.00
+        decrease_stock(self.raw_item, self.warehouse, 10, user=self.user, reference="Damaged moisture write-off")
+        write_off_mov = StockMovement.objects.filter(item=self.raw_item, movement_type="OUT").latest("created_at")
+
+        je = post_inventory_movement_to_accounting(write_off_mov.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+        dr_line = je.lines.filter(debit__gt=0).first()
+        cr_line = je.lines.filter(credit__gt=0).first()
+        self.assertEqual(dr_line.account.code, "6520")  # Inventory Loss & Write-off Expense
+        self.assertEqual(dr_line.debit, Decimal("50.00"))
+        self.assertEqual(cr_line.account.code, "1210")  # Inventory Asset
+        self.assertEqual(cr_line.credit, Decimal("50.00"))
+
+    def test_inventory_revaluation_event(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import post_inventory_valuation_event
+
+        # 100 kg on-hand at old cost $5.00 = $500.00
+        increase_stock(self.raw_item, self.warehouse, 100, user=self.user, reference="Initial Stock")
+
+        # Revalue to $6.50: New value = $650.00, Delta = +$150.00
+        res = post_inventory_valuation_event(
+            item_id=self.raw_item.id,
+            new_unit_cost=Decimal("6.50"),
+            user=self.user,
+            company=self.company,
+            reason="Market price index revaluation",
+        )
+        self.assertEqual(res["delta_amount"], 150.0)
+        self.raw_item.refresh_from_db()
+        self.assertEqual(self.raw_item.purchase_cost, Decimal("6.50"))
+
+        je = JournalEntry.objects.get(id=res["journal_entry_id"])
+        self.assertEqual(je.source_module, "inventory.valuation")
+        self.assertEqual(je.lines.count(), 2)
+        dr_line = je.lines.filter(debit__gt=0).first()
+        cr_line = je.lines.filter(credit__gt=0).first()
+        self.assertEqual(dr_line.account.code, "1210")
+        self.assertEqual(dr_line.debit, Decimal("150.00"))
+        self.assertEqual(cr_line.account.code, "5090")
+        self.assertEqual(cr_line.credit, Decimal("150.00"))
+
+        # Zero delta is rejected
+        with self.assertRaises(ValidationError):
+            post_inventory_valuation_event(
+                item_id=self.raw_item.id,
+                new_unit_cost=Decimal("6.50"),
+                user=self.user,
+                company=self.company,
+            )
+
+    def test_idempotency_prevents_duplicate_posting(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import post_inventory_movement_to_accounting
+
+        increase_stock(self.raw_item, self.warehouse, 20, user=self.user, reference="Inward Batch")
+        movement = StockMovement.objects.filter(item=self.raw_item).latest("created_at")
+
+        # First post succeeds
+        je1 = post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+        self.assertEqual(je1.status, "posted")
+
+        # Second post must raise ValidationError
+        with self.assertRaises(ValidationError):
+            post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+
+        # Journal count for this movement is exactly 1
+        self.assertEqual(
+            JournalEntry.objects.filter(company=self.company, source_module="inventory", source_id=movement.id).count(),
+            1
+        )
+
+    def test_inventory_reversal_creates_mirrored_reversal_entry(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import (
+            post_inventory_movement_to_accounting,
+            reverse_inventory_accounting,
+        )
+
+        increase_stock(self.raw_item, self.warehouse, 30, user=self.user, reference="To Reverse")
+        movement = StockMovement.objects.filter(item=self.raw_item).latest("created_at")
+
+        je = post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
+        self.assertEqual(je.status, "posted")
+
+        res = reverse_inventory_accounting(movement.id, user=self.user, company=self.company, reason="Incorrect goods receipt")
+        self.assertEqual(res["status"], "reversed")
+        reversal_je = res["reversal_journal_entry"]
+        self.assertEqual(reversal_je.status, "posted")
+        self.assertEqual(reversal_je.reversal_of, je)
+
+        # Original journal marked reversed
+        je.refresh_from_db()
+        self.assertEqual(je.status, "reversed")
+
+    def test_accounting_disabled_policy(self):
+        from inventory.services import increase_stock
+        from accounting.inventory_accounting import (
+            determine_movement_accounting_requirement,
+            post_inventory_movement_to_accounting,
+        )
+
+        # Disable inventory accounting in settings
+        settings = AccountingSettings.objects.get(company=self.company)
+        settings.inventory_accounting_enabled = False
+        settings.save()
+
+        increase_stock(self.raw_item, self.warehouse, 50, user=self.user, reference="When Disabled")
+        movement = StockMovement.objects.filter(item=self.raw_item).latest("created_at")
+
+        requires, reason, _ = determine_movement_accounting_requirement(movement, self.company)
+        self.assertFalse(requires)
+        self.assertIn("disabled", reason.lower())
+
+        with self.assertRaises(ValidationError):
+            post_inventory_movement_to_accounting(movement.id, user=self.user, company=self.company)
 
 
+class InventoryAccountingAPITests(APITestCase):
+    """
+    Integration tests for Section #14 REST API endpoints.
+    """
+    def setUp(self):
+        self.client = APIClient()
+        self.company = Company.objects.create(name="Apex Brewing", slug="apexbrew")
+        ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        self.fy = seed_standard_fiscal_year(self.company, 2026)
+
+        self.user = User.objects.create_user(
+            username="finance_officer",
+            email="finance@apexbrew.com",
+            role="finance",
+            company=self.company,
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.warehouse = Warehouse.objects.create(
+            company=self.company,
+            name="Apex Main Warehouse",
+            location="Zone 1",
+        )
+        self.item = Item.objects.create(
+            company=self.company,
+            name="Crystal Hops",
+            category="raw_material",
+            unit="kg",
+            purchase_cost=Decimal("15.00"),
+        )
+
+        from inventory.services import increase_stock
+        increase_stock(self.item, self.warehouse, 20, user=self.user, reference="GRN-8801")
+        self.movement = StockMovement.objects.filter(item=self.item).latest("created_at")
+
+    def test_inventory_accounting_summary_endpoint(self):
+        res = self.client.get("/api/accounting/inventory/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("total_inventory_gl_value", res.data)
+        self.assertIn("total_movements_count", res.data)
+        self.assertIn("policy", res.data)
+
+    def test_inventory_movements_endpoint(self):
+        res = self.client.get("/api/accounting/inventory/movements/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(res.data) >= 1)
+        first = res.data[0]
+        self.assertEqual(first["id"], self.movement.id)
+        self.assertEqual(first["accounting_status"], "pending")
+        self.assertEqual(first["valuation_amount"], 300.0)
+
+    def test_inventory_preview_and_post_flow(self):
+        # 1. Preview
+        prev_res = self.client.post(f"/api/accounting/inventory/{self.movement.id}/preview/")
+        self.assertEqual(prev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(prev_res.data["valuation_amount"], 300.0)
+        self.assertTrue(prev_res.data["is_balanced"])
+        self.assertEqual(len(prev_res.data["lines"]), 2)
+
+        # 2. Post
+        post_res = self.client.post(f"/api/accounting/inventory/{self.movement.id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(post_res.data["status"], "posted")
+        je_id = post_res.data["journal_entry_id"]
+
+        # 3. Check movement status updated
+        mov_res = self.client.get("/api/accounting/inventory/movements/")
+        self.assertEqual(mov_res.status_code, status.HTTP_200_OK)
+        updated = next(m for m in mov_res.data if m["id"] == self.movement.id)
+        self.assertEqual(updated["accounting_status"], "posted")
+        self.assertEqual(updated["journal_entry_id"], je_id)
+
+        # 4. Duplicate post rejected
+        dup_res = self.client.post(f"/api/accounting/inventory/{self.movement.id}/post/")
+        self.assertEqual(dup_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been posted", str(dup_res.data).lower())
+
+        # 5. Reverse
+        rev_res = self.client.post(f"/api/accounting/inventory/{self.movement.id}/reverse/", {"reason": "Test reversal"})
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "reversed")
+
+    def test_inventory_revaluation_endpoint(self):
+        # On-hand is 20 kg at $15.00 = $300.00. Revalue to $18.00 = $360.00, Delta = $60.00
+        res = self.client.post("/api/accounting/inventory/revalue/", {
+            "item_id": self.item.id,
+            "new_unit_cost": "18.00",
+            "reason": "Quarterly market adjustment",
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data["delta_amount"], 60.0)
+        self.assertEqual(res.data["new_unit_cost"], 18.0)
+
+
+# ==============================================================================
+# SECTION #15: MANUFACTURING-TO-ACCOUNTING INTEGRATION TESTS
+# ==============================================================================
+
+class ManufacturingAccountingTests(TestCase):
+    """
+    Unit & integration tests for Blueprint Section No. 15 (Manufacturing-to-Accounting).
+    Tests production order cost calculation, BOM material consumption, direct labor,
+    applied overhead, WIP asset accumulation, finished goods completion, scrap loss,
+    cost variance adjustments, idempotency, and audit traceability.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="BrewCraft Manufacturing Corp", slug="brewcraft-mfg")
+        ensure_account_types()
+        self.user = User.objects.create_user(
+            username="mfg_accountant",
+            email="mfg@brewcraft.com",
+            password="password123",
+            company=self.company,
+        )
+        self.fy = seed_standard_fiscal_year(self.company, 2026)
+        seed_standard_chart_of_accounts(self.company)
+
+        self.settings = AccountingSettings.objects.get(company=self.company)
+        self.settings.manufacturing_accounting_enabled = True
+        self.settings.wip_accounting_enabled = True
+        self.settings.labor_accounting_enabled = True
+        self.settings.overhead_accounting_enabled = True
+        self.settings.labor_rate_per_unit = Decimal("2.00")
+        self.settings.overhead_rate_per_unit = Decimal("1.50")
+        self.settings.save()
+
+        self.warehouse = Warehouse.objects.create(company=self.company, name="Mount Kisco Production Facility")
+        
+        # Raw materials
+        self.malt = Item.objects.create(
+            name="Organic Barley Malt",
+            sku="RAW-MALT-01",
+            category="raw_material",
+            purchase_cost=Decimal("4.00"),
+            company=self.company,
+        )
+        self.hops = Item.objects.create(
+            name="Cascade Hops",
+            sku="RAW-HOPS-01",
+            category="raw_material",
+            purchase_cost=Decimal("10.00"),
+            company=self.company,
+        )
+        # Finished Good
+        self.beer = Item.objects.create(
+            name="Craft Amber Ale 24pk",
+            sku="FG-ALE-24",
+            category="finished_good",
+            selling_price=Decimal("45.00"),
+            company=self.company,
+        )
+
+        # Recipe: 1 batch = 50 units
+        # Consumes 20 kg malt and 2 kg hops per batch
+        self.recipe = Recipe.objects.create(product=self.beer, batch_size=50)
+        self.ing1 = RecipeIngredient.objects.create(recipe=self.recipe, item=self.malt, quantity=20.0)
+        self.ing2 = RecipeIngredient.objects.create(recipe=self.recipe, item=self.hops, quantity=2.0)
+
+        # Production Order: 100 units (2 batches)
+        # Required: 40 kg malt ($160.00) + 4 kg hops ($40.00) = $200.00 Material Cost
+        # Labor: 100 * $2.00 = $200.00
+        # Overhead: 100 * $1.50 = $150.00
+        # Total Production Cost: $550.00 ($5.50/unit)
+        self.order = ProductionOrder.objects.create(
+            recipe=self.recipe,
+            quantity=100.0,
+            warehouse=self.warehouse,
+            status="completed",
+        )
+
+    def test_manufacturing_accounting_policy_resolution(self):
+        from accounting.manufacturing_accounting import (
+            get_manufacturing_policy,
+            resolve_manufacturing_wip_account,
+            resolve_manufacturing_raw_material_account,
+            resolve_manufacturing_finished_goods_account,
+            resolve_manufacturing_labor_account,
+            resolve_manufacturing_overhead_account,
+            resolve_manufacturing_scrap_account,
+            resolve_manufacturing_variance_account,
+        )
+        policy = get_manufacturing_policy(self.company)
+        self.assertTrue(policy["enabled"])
+        self.assertTrue(policy["wip_enabled"])
+        self.assertTrue(policy["labor_enabled"])
+        self.assertTrue(policy["overhead_enabled"])
+        self.assertEqual(policy["labor_rate_per_unit"], Decimal("2.00"))
+        self.assertEqual(policy["overhead_rate_per_unit"], Decimal("1.50"))
+
+        wip = resolve_manufacturing_wip_account(self.company)
+        self.assertEqual(wip.code, "1220")
+        self.assertFalse(wip.is_header)
+
+        raw = resolve_manufacturing_raw_material_account(self.malt, self.company)
+        self.assertEqual(raw.code, "1210")
+
+        fg = resolve_manufacturing_finished_goods_account(self.beer, self.company)
+        self.assertEqual(fg.code, "1230")
+
+        labor = resolve_manufacturing_labor_account(self.company)
+        self.assertIn(labor.code, ["2100", "5100"])
+
+        overhead = resolve_manufacturing_overhead_account(self.company)
+        self.assertIn(overhead.code, ["5040", "5200"])
+
+        scrap = resolve_manufacturing_scrap_account(self.company)
+        self.assertIn(scrap.code, ["5080", "6520"])
+
+        var = resolve_manufacturing_variance_account(self.company)
+        self.assertEqual(var.code, "5090")
+
+    def test_cost_calculation_from_bom_and_valuation(self):
+        from accounting.manufacturing_accounting import calculate_production_order_costs
+
+        costs = calculate_production_order_costs(self.order, self.company)
+        self.assertEqual(costs["planned_quantity"], 100.0)
+        self.assertEqual(costs["batches"], 2)
+        self.assertEqual(costs["total_material_cost"], Decimal("200.00"))
+        self.assertEqual(costs["labor_cost"], Decimal("200.00"))
+        self.assertEqual(costs["overhead_cost"], Decimal("150.00"))
+        self.assertEqual(costs["total_production_cost"], Decimal("550.00"))
+        self.assertEqual(costs["unit_production_cost"], Decimal("5.5000"))
+
+    def test_manufacturing_preview_and_posting_full_completion(self):
+        from accounting.manufacturing_accounting import (
+            get_manufacturing_accounting_preview,
+            post_manufacturing_accounting,
+        )
+
+        preview = get_manufacturing_accounting_preview(self.order.id, self.company)
+        self.assertTrue(preview["is_balanced"])
+        self.assertEqual(preview["costs"]["total_production_cost"], 550.0)
+        self.assertEqual(preview["costs"]["finished_goods_value"], 550.0)
+        self.assertEqual(preview["costs"]["remaining_wip_balance"], 0.0)
+
+        # Post to accounting
+        je, created = post_manufacturing_accounting(
+            self.order.id,
+            self.company,
+            user=self.user,
+            notes="Full batch run posted",
+        )
+        self.assertTrue(created)
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(je.source_module, "manufacturing")
+        self.assertEqual(je.source_id, self.order.id)
+        self.assertEqual(je.reference, f"MFG-PO-{self.order.id}")
+
+        # Check GL lines
+        lines = je.lines.all()
+        # Finished Goods Inventory (1230) debited for $550.00
+        fg_line = lines.filter(account__code="1230", debit__gt=0).first()
+        self.assertIsNotNone(fg_line)
+        self.assertEqual(fg_line.debit, Decimal("550.00"))
+
+        # Raw Material Inventory (1210) credited for $200.00
+        raw_lines_credit = lines.filter(account__code="1210").aggregate(s=Sum("credit"))["s"]
+        self.assertEqual(raw_lines_credit, Decimal("200.00"))
+
+        # Labor clearing credited for $200.00
+        labor_cr = lines.filter(account__code__in=["2100", "5100"], credit__gt=0).first()
+        self.assertIsNotNone(labor_cr)
+        self.assertEqual(labor_cr.credit, Decimal("200.00"))
+
+        # Overhead clearing credited for $150.00
+        oh_cr = lines.filter(account__code__in=["5040", "5200"], credit__gt=0).first()
+        self.assertIsNotNone(oh_cr)
+        self.assertEqual(oh_cr.credit, Decimal("150.00"))
+
+        # WIP lines: DR $550 (materials $200 + labor $200 + overhead $150) and CR $550 (to FG)
+        wip_dr = lines.filter(account__code="1220").aggregate(s=Sum("debit"))["s"]
+        wip_cr = lines.filter(account__code="1220").aggregate(s=Sum("credit"))["s"]
+        self.assertEqual(wip_dr, Decimal("550.00"))
+        self.assertEqual(wip_cr, Decimal("550.00"))
+
+    def test_partial_production_completion_preserves_remaining_wip(self):
+        from accounting.manufacturing_accounting import (
+            get_manufacturing_accounting_preview,
+            post_manufacturing_accounting,
+        )
+
+        # Complete only 60 units out of 100 planned
+        # 60 units * $5.50/unit = $330.00 transferred to FG
+        # Remaining 40 units * $5.50/unit = $220.00 preserved in WIP
+        preview = get_manufacturing_accounting_preview(
+            self.order.id,
+            self.company,
+            completed_qty=60.0,
+        )
+        self.assertTrue(preview["is_balanced"])
+        self.assertEqual(preview["costs"]["finished_goods_value"], 330.0)
+        self.assertEqual(preview["costs"]["remaining_wip_balance"], 220.0)
+
+        je, created = post_manufacturing_accounting(
+            self.order.id,
+            self.company,
+            user=self.user,
+            completed_qty=60.0,
+        )
+        self.assertTrue(created)
+
+        # FG debited for $330.00
+        fg_line = je.lines.filter(account__code="1230", debit__gt=0).first()
+        self.assertEqual(fg_line.debit, Decimal("330.00"))
+
+        # WIP debited for full cost ($550.00) and credited only for completed portion ($330.00)
+        wip_dr = je.lines.filter(account__code="1220").aggregate(s=Sum("debit"))["s"]
+        wip_cr = je.lines.filter(account__code="1220").aggregate(s=Sum("credit"))["s"]
+        self.assertEqual(wip_dr, Decimal("550.00"))
+        self.assertEqual(wip_cr, Decimal("330.00"))
+        # Net balance remaining in WIP = $220.00
+        self.assertEqual(wip_dr - wip_cr, Decimal("220.00"))
+
+    def test_production_scrap_loss_accounting(self):
+        from accounting.manufacturing_accounting import (
+            get_manufacturing_accounting_preview,
+            post_manufacturing_accounting,
+        )
+
+        # 90 completed, 10 scrapped = 100 total
+        # FG = 90 * $5.50 = $495.00
+        # Scrap Loss = 10 * $5.50 = $55.00
+        preview = get_manufacturing_accounting_preview(
+            self.order.id,
+            self.company,
+            completed_qty=90.0,
+            scrap_qty=10.0,
+        )
+        self.assertTrue(preview["is_balanced"])
+        self.assertEqual(preview["costs"]["finished_goods_value"], 495.0)
+        self.assertEqual(preview["costs"]["scrap_value"], 55.0)
+
+        je, created = post_manufacturing_accounting(
+            self.order.id,
+            self.company,
+            user=self.user,
+            completed_qty=90.0,
+            scrap_qty=10.0,
+        )
+        self.assertTrue(created)
+
+        scrap_line = je.lines.filter(account__code__in=["5080", "6520"], debit__gt=0).first()
+        self.assertIsNotNone(scrap_line)
+        self.assertEqual(scrap_line.debit, Decimal("55.00"))
+
+    def test_manufacturing_variance_adjustment(self):
+        from accounting.manufacturing_accounting import post_manufacturing_variance_adjustment
+
+        # Unfavorable variance of $25.00
+        var_je = post_manufacturing_variance_adjustment(
+            self.order.id,
+            self.company,
+            user=self.user,
+            variance_amount="25.00",
+            reason="Unfavorable malt price variance",
+        )
+        self.assertEqual(var_je.status, "posted")
+        var_dr = var_je.lines.filter(account__code="5090", debit__gt=0).first()
+        wip_cr = var_je.lines.filter(account__code="1220", credit__gt=0).first()
+        self.assertEqual(var_dr.debit, Decimal("25.00"))
+        self.assertEqual(wip_cr.credit, Decimal("25.00"))
+
+    def test_manufacturing_accounting_idempotency(self):
+        from accounting.manufacturing_accounting import post_manufacturing_accounting
+
+        je1, created1 = post_manufacturing_accounting(self.order.id, self.company, user=self.user)
+        self.assertTrue(created1)
+
+        # Repeated post should not create another journal entry
+        je2, created2 = post_manufacturing_accounting(self.order.id, self.company, user=self.user)
+        self.assertFalse(created2)
+        self.assertEqual(je1.id, je2.id)
+
+    def test_manufacturing_accounting_reversal(self):
+        from accounting.manufacturing_accounting import (
+            post_manufacturing_accounting,
+            reverse_manufacturing_accounting,
+        )
+
+        je, _ = post_manufacturing_accounting(self.order.id, self.company, user=self.user)
+        self.assertEqual(je.status, "posted")
+
+        rev_je = reverse_manufacturing_accounting(
+            self.order.id,
+            self.company,
+            user=self.user,
+            reason="Order cancelled after QA audit",
+        )
+        self.assertEqual(rev_je.status, "posted")
+        self.assertEqual(rev_je.reversal_of, je)
+        je.refresh_from_db()
+        self.assertEqual(je.status, "reversed")
+
+    def test_no_duplicate_gl_from_inventory_out_movement(self):
+        from inventory.services import increase_stock, decrease_stock
+        from accounting.manufacturing_accounting import post_manufacturing_accounting
+        from accounting.inventory_accounting import determine_movement_accounting_requirement
+
+        # Post manufacturing entry for order
+        post_manufacturing_accounting(self.order.id, self.company, user=self.user)
+
+        # Inventory movement created for this production order with stock available
+        increase_stock(self.malt, self.warehouse, 100, user=self.user, reference="Initial Malt Stock")
+        decrease_stock(self.malt, self.warehouse, 40, user=self.user, reference=f"Production #{self.order.id}")
+        mov = StockMovement.objects.filter(reference=f"Production #{self.order.id}").latest("created_at")
+
+        # Inventory requirement check detects order is already accounted in manufacturing
+        req, reason, subtype = determine_movement_accounting_requirement(mov, self.company)
+        self.assertFalse(req)
+        self.assertEqual(subtype, "production_order")
+        self.assertIn("already accounted under manufacturing", reason.lower())
+
+
+class ManufacturingAccountingAPITests(APITestCase):
+    """
+    REST API tests for /api/accounting/manufacturing/ endpoints.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="BrewCraft API Corp", slug="brewcraft-api")
+        ensure_account_types()
+        self.user = User.objects.create_user(
+            username="mfg_api_user",
+            email="mfg_api@brewcraft.com",
+            password="password123",
+            company=self.company,
+        )
+        self.client.force_authenticate(user=self.user)
+
+        seed_standard_fiscal_year(self.company, 2026)
+        seed_standard_chart_of_accounts(self.company)
+
+        self.settings = AccountingSettings.objects.get_or_create(
+            company=self.company,
+            defaults={"manufacturing_accounting_enabled": True, "wip_accounting_enabled": True},
+        )[0]
+        self.settings.manufacturing_accounting_enabled = True
+        self.settings.wip_accounting_enabled = True
+        self.settings.save()
+
+        self.warehouse = Warehouse.objects.create(company=self.company, name="Central Warehouse")
+        self.barley = Item.objects.create(
+            name="Roasted Barley",
+            sku="RAW-BARLEY",
+            category="raw_material",
+            purchase_cost=Decimal("5.00"),
+            company=self.company,
+        )
+        self.stout = Item.objects.create(
+            name="Imperial Stout 12pk",
+            sku="FG-STOUT-12",
+            category="finished_good",
+            selling_price=Decimal("40.00"),
+            company=self.company,
+        )
+        self.recipe = Recipe.objects.create(product=self.stout, batch_size=25)
+        RecipeIngredient.objects.create(recipe=self.recipe, item=self.barley, quantity=10.0)
+
+        self.order = ProductionOrder.objects.create(
+            recipe=self.recipe,
+            quantity=50.0,
+            warehouse=self.warehouse,
+            status="completed",
+        )
+
+    def test_manufacturing_summary_endpoint(self):
+        res = self.client.get("/api/accounting/manufacturing/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("active_wip_balance", res.data)
+        self.assertIn("finished_goods_value", res.data)
+        self.assertEqual(res.data["total_orders_count"], 1)
+
+    def test_manufacturing_orders_list_endpoint(self):
+        res = self.client.get("/api/accounting/manufacturing/orders/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["count"], 1)
+        first = res.data["results"][0]
+        self.assertEqual(first["id"], self.order.id)
+        self.assertEqual(first["product_name"], "Imperial Stout 12pk")
+        self.assertEqual(first["accounting_status"], "PENDING")
+
+    def test_manufacturing_preview_and_post_flow(self):
+        # 1. Preview
+        prev_res = self.client.post(f"/api/accounting/manufacturing/{self.order.id}/preview/")
+        self.assertEqual(prev_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(prev_res.data["is_balanced"])
+        self.assertEqual(prev_res.data["planned_quantity"], 50.0)
+
+        # 2. Post
+        post_res = self.client.post(f"/api/accounting/manufacturing/{self.order.id}/post/", {
+            "notes": "Posted batch via API",
+        })
+        self.assertEqual(post_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(post_res.data["status"], "posted")
+        je_id = post_res.data["journal_entry_id"]
+
+        # 3. Check updated status
+        orders_res = self.client.get("/api/accounting/manufacturing/orders/")
+        self.assertEqual(orders_res.status_code, status.HTTP_200_OK)
+        order_data = orders_res.data["results"][0]
+        self.assertEqual(order_data["accounting_status"], "POSTED")
+        self.assertEqual(order_data["journal_entry_id"], je_id)
+
+        # 4. Reverse
+        rev_res = self.client.post(f"/api/accounting/manufacturing/{self.order.id}/reverse/", {
+            "reason": "Test reversal API",
+        })
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "posted")
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #16 — EXPENSES-TO-ACCOUNTING TEST SUITE
+# ==============================================================================
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from workforce.models import Employee, Department
+from procurement.models import Vendor
+from accounting.models import Expense, ExpenseCategory, ExpenseAuditLog
+from accounting.expenses_accounting import (
+    seed_default_expense_categories,
+    get_expenses_policy,
+    resolve_expense_account,
+    resolve_tax_account,
+    resolve_payment_account,
+    submit_expense,
+    approve_expense,
+    reject_expense,
+    cancel_expense,
+    attach_receipt_to_expense,
+    get_expense_accounting_preview,
+    post_expense_accounting,
+    reverse_expense_accounting,
+    get_expenses_summary,
+)
+
+
+class ExpenseAccountingTests(TestCase):
+    """
+    Comprehensive unit tests for Section #16 Expenses-to-Accounting subledger:
+    Categories, account mapping, approval workflows, receipt handling, tax accounting,
+    payment sources, double-entry GL posting, idempotency, reversal, and period controls.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Stout Craft Breweries", slug="stoutcraft")
+        self.user = User.objects.create_user(
+            username="finance_auditor",
+            email="auditor@stoutcraft.com",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            expenses_accounting_enabled=True,
+            expenses_require_approval=True,
+        )
+        seed_standard_chart_of_accounts(self.company)
+        self.fy = seed_standard_fiscal_year(self.company, year=2026)
+        self.today = date(2026, 3, 15)
+
+        # Seed categories
+        seed_default_expense_categories(self.company)
+        self.travel_category = ExpenseCategory.objects.get(company=self.company, code="TRAVEL")
+        self.software_category = ExpenseCategory.objects.get(company=self.company, code="SOFTWARE")
+        self.office_category = ExpenseCategory.objects.get(company=self.company, code="OFFICE")
+
+        # Create workforce employee
+        self.department = Department.objects.create(company=self.company, name="Field Operations")
+        self.employee = Employee.objects.create(
+            company=self.company,
+            first_name="Marcus",
+            last_name="Vance",
+            email="marcus.vance@stoutcraft.com",
+            department=self.department,
+        )
+
+        # Create procurement vendor
+        self.vendor = Vendor.objects.create(
+            company=self.company,
+            name="Apex Cloud Services LLC",
+            email="billing@apexcloud.com",
+        )
+
+    def test_seed_default_categories(self):
+        """Verifies default categories are provisioned and mapped to leaf accounts."""
+        cats = ExpenseCategory.objects.filter(company=self.company)
+        self.assertGreaterEqual(cats.count(), 10)
+        travel = cats.filter(code="TRAVEL").first()
+        self.assertIsNotNone(travel)
+        self.assertIsNotNone(travel.expense_account)
+        self.assertFalse(travel.expense_account.is_header)
+
+    def test_employee_expense_creation_and_total_calculation(self):
+        """Tests that total_amount is automatically synchronized from pre-tax + tax."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Flight to Craft Beer Expo",
+            expense_date=self.today,
+            amount_before_tax=Decimal("450.00"),
+            tax_amount=Decimal("36.00"),
+            payment_source="payable",
+            created_by=self.user,
+        )
+        self.assertEqual(exp.total_amount, Decimal("486.00"))
+        self.assertTrue(exp.expense_number.startswith("EXP-"))
+        self.assertEqual(exp.approval_status, "draft")
+        self.assertEqual(exp.accounting_status, "not_ready")
+
+    def test_vendor_expense_creation(self):
+        """Tests vendor expense logging with custom raw vendor fallback."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="vendor",
+            vendor=self.vendor,
+            category=self.software_category,
+            title="Monthly ERP Server Hosting",
+            expense_date=self.today,
+            amount_before_tax=Decimal("1200.00"),
+            tax_amount=Decimal("0.00"),
+            payment_source="bank",
+            created_by=self.user,
+        )
+        self.assertEqual(exp.total_amount, Decimal("1200.00"))
+        self.assertEqual(exp.payment_source, "bank")
+
+    def test_approval_lifecycle_enforcement(self):
+        """
+        Draft and submitted expenses cannot be posted when approval is required.
+        Only approved expenses are eligible.
+        """
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Hotel Stay",
+            expense_date=self.today,
+            amount_before_tax=Decimal("300.00"),
+            tax_amount=Decimal("0.00"),
+            payment_source="payable",
+            created_by=self.user,
+        )
+
+        # 1. Draft cannot post
+        with self.assertRaises(ValidationError) as ctx:
+            post_expense_accounting(exp, user=self.user)
+        self.assertIn("cannot be posted in 'draft'", str(ctx.exception))
+
+        # 2. Submit for review
+        submit_expense(exp, user=self.user)
+        self.assertEqual(exp.approval_status, "submitted")
+
+        # 3. Submitted cannot post
+        with self.assertRaises(ValidationError) as ctx:
+            post_expense_accounting(exp, user=self.user)
+        self.assertIn("cannot be posted in 'submitted'", str(ctx.exception))
+
+        # 4. Reject
+        reject_expense(exp, user=self.user, reason="Missing receipt itemization")
+        self.assertEqual(exp.approval_status, "rejected")
+        self.assertEqual(exp.rejection_reason, "Missing receipt itemization")
+
+        # 5. Rejected cannot post
+        with self.assertRaises(ValidationError):
+            post_expense_accounting(exp, user=self.user)
+
+        # 6. Re-submit and Approve
+        submit_expense(exp, user=self.user)
+        approve_expense(exp, user=self.user, notes="Receipt verified")
+        self.assertEqual(exp.approval_status, "approved")
+        self.assertEqual(exp.approved_by, self.user)
+        self.assertEqual(exp.accounting_status, "ready")
+
+        # 7. Approved can post successfully
+        je = post_expense_accounting(exp, user=self.user)
+        self.assertEqual(je.status, "posted")
+        self.assertEqual(exp.accounting_status, "posted")
+
+    def test_receipt_attachment_validation(self):
+        """Validates receipt file upload extension and size checks."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.office_category,
+            title="Printer Paper & Ink",
+            expense_date=self.today,
+            amount_before_tax=Decimal("75.00"),
+            payment_source="cash",
+            created_by=self.user,
+        )
+
+        # Valid PDF receipt
+        valid_file = SimpleUploadedFile("receipt_invoice.pdf", b"%PDF-1.4 test receipt content", content_type="application/pdf")
+        attach_receipt_to_expense(exp, valid_file, user=self.user)
+        self.assertTrue(bool(exp.receipt))
+        self.assertEqual(exp.receipt_name, "receipt_invoice.pdf")
+        self.assertGreater(exp.receipt_size, 0)
+
+        # Audit log created
+        log = ExpenseAuditLog.objects.filter(expense=exp, action="receipt_attached").first()
+        self.assertIsNotNone(log)
+
+        # Invalid file format (e.g. .exe)
+        invalid_file = SimpleUploadedFile("malicious.exe", b"binary content", content_type="application/octet-stream")
+        with self.assertRaises(ValidationError) as ctx:
+            attach_receipt_to_expense(exp, invalid_file, user=self.user)
+        self.assertIn("Unsupported file format", str(ctx.exception))
+
+    def test_payment_source_account_resolution(self):
+        """Verifies correct leaf accounts are credited for CASH, BANK, and PAYABLE."""
+        exp_cash = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.office_category,
+            title="Local Hardware Store Petty Cash",
+            expense_date=self.today,
+            amount_before_tax=Decimal("40.00"),
+            payment_source="cash",
+        )
+        cash_acc = resolve_payment_account(exp_cash)
+        self.assertEqual(cash_acc.code, "1030")
+
+        exp_bank = Expense.objects.create(
+            company=self.company,
+            expense_type="vendor",
+            vendor=self.vendor,
+            category=self.software_category,
+            title="Wire Transfer for IT Consulting",
+            expense_date=self.today,
+            amount_before_tax=Decimal("1500.00"),
+            payment_source="bank",
+        )
+        bank_acc = resolve_payment_account(exp_bank)
+        self.assertEqual(bank_acc.code, "1010")
+
+        exp_emp_payable = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Mileage Reimbursement",
+            expense_date=self.today,
+            amount_before_tax=Decimal("120.00"),
+            payment_source="payable",
+        )
+        emp_pay_acc = resolve_payment_account(exp_emp_payable)
+        self.assertEqual(emp_pay_acc.code, "2100")
+
+        exp_vendor_payable = Expense.objects.create(
+            company=self.company,
+            expense_type="vendor",
+            vendor=self.vendor,
+            category=self.software_category,
+            title="Invoiced Software Annual License",
+            expense_date=self.today,
+            amount_before_tax=Decimal("5000.00"),
+            payment_source="payable",
+        )
+        vendor_pay_acc = resolve_payment_account(exp_vendor_payable)
+        self.assertEqual(vendor_pay_acc.code, "2010")
+
+    def test_tax_accounting_and_equilibrium(self):
+        """
+        Verifies tax calculation and double-entry equilibrium:
+        DR Expense (pre-tax) + DR Input Tax Recoverable (tax) == CR Payment Source (total)
+        """
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Car Rental + VAT",
+            expense_date=self.today,
+            amount_before_tax=Decimal("500.00"),
+            tax_amount=Decimal("90.00"),
+            payment_source="bank",
+            approval_status="approved",
+            created_by=self.user,
+        )
+        self.assertEqual(exp.total_amount, Decimal("590.00"))
+
+        # Preview check
+        prev = get_expense_accounting_preview(exp)
+        self.assertTrue(prev["balanced"])
+        self.assertEqual(prev["total_debit"], 590.0)
+        self.assertEqual(prev["total_credit"], 590.0)
+        self.assertEqual(len(prev["prospective_lines"]), 3)
+
+        # Post
+        je = post_expense_accounting(exp, user=self.user)
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+        self.assertEqual(je.total_debit, Decimal("590.00"))
+        self.assertEqual(je.total_credit, Decimal("590.00"))
+
+        # Inspect lines
+        lines = list(je.lines.all())
+        self.assertEqual(len(lines), 3)
+        debit_lines = [l for l in lines if l.debit > 0]
+        credit_lines = [l for l in lines if l.credit > 0]
+        self.assertEqual(len(debit_lines), 2)
+        self.assertEqual(len(credit_lines), 1)
+
+        # One debit is tax account 1310
+        tax_line = next(l for l in debit_lines if l.account.code == "1310")
+        self.assertEqual(tax_line.debit, Decimal("90.00"))
+
+        # Credit is bank account 1010
+        self.assertEqual(credit_lines[0].account.code, "1010")
+        self.assertEqual(credit_lines[0].credit, Decimal("590.00"))
+
+    def test_idempotency_prevents_duplicate_posting(self):
+        """Repeated posting attempts must be rejected with explicit error and create no extra journals."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Conference Registration",
+            expense_date=self.today,
+            amount_before_tax=Decimal("250.00"),
+            payment_source="bank",
+            approval_status="approved",
+            created_by=self.user,
+        )
+
+        je1 = post_expense_accounting(exp, user=self.user)
+        self.assertEqual(je1.status, "posted")
+
+        # Second attempt raises ValidationError
+        with self.assertRaises(ValidationError) as ctx:
+            post_expense_accounting(exp, user=self.user)
+        self.assertIn("has already been posted", str(ctx.exception))
+
+        # Only 1 journal entry exists
+        count = JournalEntry.objects.filter(company=self.company, source_module="expenses", source_id=str(exp.id)).count()
+        self.assertEqual(count, 1)
+
+    def test_reversal_creates_mirrored_journal_entry(self):
+        """Tests that reversing a posted expense creates a balanced reversal journal."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Train Ticket to Client",
+            expense_date=self.today,
+            amount_before_tax=Decimal("80.00"),
+            payment_source="cash",
+            approval_status="approved",
+            created_by=self.user,
+        )
+        je = post_expense_accounting(exp, user=self.user)
+        self.assertEqual(exp.accounting_status, "posted")
+
+        rev_je = reverse_expense_accounting(exp, user=self.user, reason="Trip rescheduled")
+        self.assertEqual(exp.accounting_status, "reversed")
+        self.assertEqual(rev_je.status, "posted")
+        self.assertEqual(rev_je.reversal_of, je)
+
+        # Check reversal lines invert original lines
+        orig_debit = je.lines.filter(debit__gt=0).first()
+        orig_credit = je.lines.filter(credit__gt=0).first()
+
+        rev_credit = rev_je.lines.filter(account=orig_debit.account).first()
+        rev_debit = rev_je.lines.filter(account=orig_credit.account).first()
+
+        self.assertEqual(rev_credit.credit, orig_debit.debit)
+        self.assertEqual(rev_debit.debit, orig_credit.credit)
+
+    def test_closed_period_and_lock_date_rejection(self):
+        """Posting to a locked date or closed period must fail."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Prior Year Expense",
+            expense_date=date(2025, 1, 1),
+            amount_before_tax=Decimal("100.00"),
+            approval_status="approved",
+            created_by=self.user,
+        )
+
+        # No open period exists for 2025-01-01
+        with self.assertRaises(ValidationError):
+            post_expense_accounting(exp, user=self.user)
+
+        # Lock date test
+        self.settings.lock_date = date(2026, 3, 20)
+        self.settings.save()
+
+        exp_locked = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Locked Period Expense",
+            expense_date=date(2026, 3, 10),
+            amount_before_tax=Decimal("150.00"),
+            approval_status="approved",
+            created_by=self.user,
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            post_expense_accounting(exp_locked, user=self.user)
+        self.assertIn("period is locked", str(ctx.exception))
+
+    def test_company_isolation(self):
+        """Ensures cross-company accounts and records are strictly rejected."""
+        company_b = Company.objects.create(name="Competitor Brewing", slug="competitor")
+        seed_standard_chart_of_accounts(company_b)
+
+        foreign_cat = ExpenseCategory.objects.create(
+            company=company_b,
+            code="COMP_TRAVEL",
+            name="Competitor Travel",
+        )
+
+        exp = Expense(
+            company=self.company,
+            expense_type="employee",
+            category=foreign_cat,
+            title="Cross Company Test",
+            expense_date=self.today,
+            amount_before_tax=Decimal("100.00"),
+        )
+        with self.assertRaises(ValidationError):
+            exp.full_clean()
+
+    def test_expenses_summary_aggregation(self):
+        """Verifies get_expenses_summary calculates counts, totals, tax, and payables."""
+        # 1. Draft
+        Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Draft Exp",
+            expense_date=self.today,
+            amount_before_tax=Decimal("100.00"),
+            approval_status="draft",
+        )
+        # 2. Submitted
+        Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Submitted Exp",
+            expense_date=self.today,
+            amount_before_tax=Decimal("200.00"),
+            approval_status="submitted",
+        )
+        # 3. Approved & Posted
+        exp_posted = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Posted Exp",
+            expense_date=self.today,
+            amount_before_tax=Decimal("300.00"),
+            tax_amount=Decimal("30.00"),
+            payment_source="payable",
+            approval_status="approved",
+        )
+        post_expense_accounting(exp_posted, user=self.user)
+
+        summary = get_expenses_summary(self.company)
+        self.assertEqual(summary["total_expenses_count"], 3)
+        self.assertEqual(summary["pending_approval_count"], 1)
+        self.assertEqual(summary["pending_approval_amount"], 200.0)
+        self.assertEqual(summary["posted_count"], 1)
+        self.assertEqual(summary["posted_amount"], 330.0)
+        self.assertEqual(summary["posted_tax_amount"], 30.0)
+        self.assertEqual(summary["employee_reimbursements_amount"], 330.0)
+
+
+class ExpenseAccountingAPITests(APITestCase):
+    """
+    Integration tests for Section #16 REST endpoints:
+    /api/accounting/expenses/ and /api/accounting/expense-categories/.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Highland Brewing", slug="highland")
+        self.user = User.objects.create_user(
+            username="finance_admin",
+            email="finance@highland.com",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            expenses_accounting_enabled=True,
+            expenses_require_approval=True,
+        )
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+        seed_default_expense_categories(self.company)
+        self.travel_category = ExpenseCategory.objects.get(company=self.company, code="TRAVEL")
+
+        self.department = Department.objects.create(company=self.company, name="Sales")
+        self.employee = Employee.objects.create(
+            company=self.company,
+            first_name="Sarah",
+            last_name="Connor",
+            email="sarah.connor@highland.com",
+            department=self.department,
+        )
+
+    def test_expense_crud_api(self):
+        """Tests expense creation, retrieval, and listing via REST API."""
+        # Create
+        res = self.client.post("/api/accounting/expenses/", {
+            "expense_type": "employee",
+            "employee": self.employee.id,
+            "category": self.travel_category.id,
+            "title": "Client Lunch in Chicago",
+            "expense_date": "2026-03-15",
+            "amount_before_tax": "150.00",
+            "tax_amount": "15.00",
+            "payment_source": "payable",
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        exp_id = res.data["id"]
+        self.assertEqual(res.data["total_amount"], "165.00")
+
+        # List
+        list_res = self.client.get("/api/accounting/expenses/")
+        self.assertEqual(list_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(list_res.data), 1)
+
+        # Retrieve detail
+        det_res = self.client.get(f"/api/accounting/expenses/{exp_id}/")
+        self.assertEqual(det_res.status_code, status.HTTP_200_OK)
+        self.assertIn("audit_logs", det_res.data)
+
+    def test_expense_workflow_actions_api(self):
+        """Tests submit, approve, preview, post, and reverse via REST API."""
+        create_res = self.client.post("/api/accounting/expenses/", {
+            "expense_type": "employee",
+            "employee": self.employee.id,
+            "category": self.travel_category.id,
+            "title": "Taxi to Airport",
+            "expense_date": "2026-03-15",
+            "amount_before_tax": "60.00",
+            "tax_amount": "0.00",
+            "payment_source": "cash",
+        })
+        exp_id = create_res.data["id"]
+
+        # 1. Submit
+        sub_res = self.client.post(f"/api/accounting/expenses/{exp_id}/submit/")
+        self.assertEqual(sub_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(sub_res.data["approval_status"], "submitted")
+
+        # 2. Approve
+        app_res = self.client.post(f"/api/accounting/expenses/{exp_id}/approve/", {"notes": "Approved by manager"})
+        self.assertEqual(app_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(app_res.data["approval_status"], "approved")
+
+        # 3. Preview
+        prev_res = self.client.post(f"/api/accounting/expenses/{exp_id}/preview/")
+        self.assertEqual(prev_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(prev_res.data["balanced"])
+        self.assertEqual(prev_res.data["total_debit"], 60.0)
+
+        # 4. Post
+        post_res = self.client.post(f"/api/accounting/expenses/{exp_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(post_res.data["status"], "posted")
+        je_num = post_res.data["journal_entry_number"]
+        self.assertTrue(bool(je_num))
+
+        # 5. Reverse
+        rev_res = self.client.post(f"/api/accounting/expenses/{exp_id}/reverse/", {"reason": "Duplicate claim"})
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "posted")
+
+    def test_expense_receipt_upload_api(self):
+        """Tests multipart receipt file upload via REST API."""
+        exp = Expense.objects.create(
+            company=self.company,
+            expense_type="employee",
+            employee=self.employee,
+            category=self.travel_category,
+            title="Subway Pass",
+            expense_date=date(2026, 3, 15),
+            amount_before_tax=Decimal("25.00"),
+        )
+        sample_file = SimpleUploadedFile("subway_receipt.png", b"fake image bytes", content_type="image/png")
+        res = self.client.post(
+            f"/api/accounting/expenses/{exp.id}/receipt/",
+            {"file": sample_file},
+            format="multipart",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["receipt_name"], "subway_receipt.png")
+
+    def test_expense_summary_api(self):
+        """Tests the summary KPI endpoint."""
+        res = self.client.get("/api/accounting/expenses/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("total_expenses_count", res.data)
+        self.assertIn("gl_operating_expense_net", res.data)
+
+    def test_expense_categories_seed_api(self):
+        """Tests the seed-defaults endpoint for expense categories."""
+        res = self.client.post("/api/accounting/expense-categories/seed-defaults/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("Successfully seeded", res.data["message"])
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #17 — CASH & BANK TESTS
+# ==============================================================================
+
+from accounting.models import BankAccount, BankReconciliation, BankTransaction, BankAuditLog
+from accounting.cash_bank import (
+    record_opening_balance,
+    record_deposit,
+    record_withdrawal,
+    record_transfer,
+    import_bank_statement_csv,
+    get_unreconciled_transactions_queue,
+    reconcile_bank_account,
+    reopen_reconciliation,
+    get_cash_bank_summary,
+)
+
+
+class CashAndBankTests(TestCase):
+    """
+    Blueprint Section #17 — Cash & Bank Unit & Domain Service Tests.
+    Tests Bank Account Master, Opening Balances, Deposits, Withdrawals,
+    Internal Transfers, Statement CSV Imports with idempotency,
+    Reconciliation Workflows, Reopening, and Audit Trails.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="ApexForge Bank Co", slug="apexforge-bank")
+        self.user = User.objects.create_user(
+            username="treasury_admin",
+            email="treasury@apexforge.com",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+        )
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+
+        self.operating_gl = Account.objects.get(company=self.company, code="1010")
+        self.payroll_gl = Account.objects.get(company=self.company, code="1020")
+        self.petty_cash_gl = Account.objects.get(company=self.company, code="1030")
+        self.sales_gl = Account.objects.get(company=self.company, code="4010")
+        self.equity_gl = Account.objects.get(company=self.company, code="3010")
+        self.bank_fee_gl = Account.objects.filter(company=self.company, account_type__category="expense").exclude(children__isnull=False).first()
+
+        self.bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Main Operating Account",
+            bank_name="JPMorgan Chase",
+            account_number="123456789012",
+            routing_number="021000021",
+            account_type="checking",
+            currency="USD",
+            gl_account=self.operating_gl,
+        )
+
+        self.payroll_bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Payroll Clearing",
+            bank_name="Wells Fargo",
+            account_number="987654321098",
+            routing_number="121000247",
+            account_type="checking",
+            currency="USD",
+            gl_account=self.payroll_gl,
+        )
+
+    def test_bank_account_creation_and_masking(self):
+        """Verifies account number masking and default balances."""
+        self.assertEqual(self.bank_account.masked_account_number, "****9012")
+        self.assertEqual(self.bank_account.opening_balance, Decimal("0.00"))
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("0.00"))
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("0.00"))
+        self.assertTrue(self.bank_account.is_active)
+
+    def test_bank_account_header_account_rejection(self):
+        """Bank Account cannot link to a parent header account."""
+        header_acc = Account.objects.get(company=self.company, code="1000")  # Current Assets header
+        with self.assertRaises(ValidationError):
+            BankAccount.objects.create(
+                company=self.company,
+                account_name="Invalid Header Bank",
+                bank_name="Test Bank",
+                account_number="111122223333",
+                gl_account=header_acc,
+            )
+
+    def test_bank_account_company_isolation(self):
+        """Bank Account cannot link to another company's GL account."""
+        comp_b = Company.objects.create(name="Other Co", slug="other-co")
+        seed_standard_chart_of_accounts(comp_b)
+        foreign_gl = Account.objects.get(company=comp_b, code="1010")
+
+        with self.assertRaises(ValidationError):
+            BankAccount.objects.create(
+                company=self.company,
+                account_name="Cross Company Bank",
+                bank_name="Test Bank",
+                account_number="555566667777",
+                gl_account=foreign_gl,
+            )
+
+    def test_opening_balance_positive_posting(self):
+        """
+        Positive opening balance:
+        DR 1010 Bank Asset = $25,000.00
+        CR 3010 Equity = $25,000.00
+        """
+        res = record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("25000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+            notes="Initial capital deposit",
+        )
+        je = res["journal_entry"]
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+        self.assertEqual(je.total_debit, Decimal("25000.00"))
+        self.assertEqual(je.total_credit, Decimal("25000.00"))
+
+        # BankAccount state
+        self.bank_account.refresh_from_db()
+        self.assertTrue(self.bank_account.opening_balance_posted)
+        self.assertEqual(self.bank_account.opening_balance, Decimal("25000.00"))
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("25000.00"))
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("25000.00"))
+        self.assertEqual(self.bank_account.unreconciled_difference, Decimal("0.00"))
+
+        # BankTransaction record created
+        bt = res["transaction"]
+        self.assertEqual(bt.direction, "inflow")
+        self.assertEqual(bt.transaction_type, "opening_balance")
+        self.assertEqual(bt.reconciliation_status, "reconciled")
+
+        # Audit trail
+        log = BankAuditLog.objects.filter(bank_account=self.bank_account, action="opening_balance_posted").first()
+        self.assertIsNotNone(log)
+
+    def test_opening_balance_overdraft_posting(self):
+        """
+        Overdraft/negative opening balance:
+        DR 3010 Equity = $1,500.00
+        CR 1010 Bank Asset = $1,500.00
+        """
+        res = record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("-1500.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+        je = res["journal_entry"]
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+        self.assertEqual(je.total_debit, Decimal("1500.00"))
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("-1500.00"))
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("-1500.00"))
+
+    def test_opening_balance_duplicate_prevention(self):
+        """Cannot post opening balance twice for the same account."""
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("10000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            record_opening_balance(
+                bank_account_id=self.bank_account.id,
+                amount=Decimal("5000.00"),
+                balance_date=date(2026, 1, 1),
+                user=self.user,
+            )
+        self.assertIn("already been posted", str(ctx.exception))
+
+    def test_opening_balance_lock_date_rejection(self):
+        """Cannot post opening balance on or before lock date."""
+        self.settings.lock_date = date(2026, 1, 15)
+        self.settings.save()
+
+        with self.assertRaises(ValidationError) as ctx:
+            record_opening_balance(
+                bank_account_id=self.bank_account.id,
+                amount=Decimal("5000.00"),
+                balance_date=date(2026, 1, 10),
+                user=self.user,
+            )
+        self.assertIn("lock date", str(ctx.exception))
+
+    def test_manual_deposit(self):
+        """
+        Money In:
+        DR 1010 Bank = $4,500.00
+        CR 4010 Revenue = $4,500.00
+        """
+        bt = record_deposit(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("4500.00"),
+            txn_date=date(2026, 2, 1),
+            offset_account_id=self.sales_gl.id,
+            user=self.user,
+            description="Client upfront payment",
+            reference="DEP-001",
+            counterparty="Acme Corp",
+        )
+        self.assertEqual(bt.direction, "inflow")
+        self.assertEqual(bt.transaction_type, "deposit")
+        self.assertEqual(bt.amount, Decimal("4500.00"))
+        self.assertEqual(bt.reconciliation_status, "unreconciled")
+        self.assertIsNotNone(bt.journal_entry)
+        self.assertEqual(bt.journal_entry.status, "posted")
+        self.assertTrue(bt.journal_entry.is_balanced)
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("4500.00"))
+
+    def test_manual_withdrawal(self):
+        """
+        Money Out:
+        DR 6050 Expense = $35.00
+        CR 1010 Bank = $35.00
+        """
+        bt = record_withdrawal(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("35.00"),
+            txn_date=date(2026, 2, 5),
+            offset_account_id=self.bank_fee_gl.id,
+            user=self.user,
+            description="Monthly wire maintenance fee",
+            reference="FEE-001",
+            counterparty="JPMorgan Chase",
+            transaction_type="fee",
+        )
+        self.assertEqual(bt.direction, "outflow")
+        self.assertEqual(bt.transaction_type, "fee")
+        self.assertEqual(bt.amount, Decimal("35.00"))
+        self.assertEqual(bt.reconciliation_status, "unreconciled")
+        self.assertEqual(bt.journal_entry.status, "posted")
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("-35.00"))
+
+    def test_internal_transfer_between_bank_accounts(self):
+        """
+        Internal Transfer:
+        DR 1020 Payroll Clearing = $12,000.00
+        CR 1010 Operating Checking = $12,000.00
+        """
+        # First fund operating account
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("50000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+
+        res = record_transfer(
+            from_account_id=self.bank_account.id,
+            to_account_id=self.payroll_bank_account.id,
+            amount=Decimal("12000.00"),
+            txn_date=date(2026, 2, 10),
+            user=self.user,
+            description="Fund bi-weekly payroll",
+            reference="TRF-PAYROLL-01",
+        )
+
+        je = res["journal_entry"]
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+
+        out_txn = res["outflow_transaction"]
+        in_txn = res["inflow_transaction"]
+
+        self.assertEqual(out_txn.bank_account, self.bank_account)
+        self.assertEqual(out_txn.direction, "outflow")
+        self.assertEqual(out_txn.amount, Decimal("12000.00"))
+        self.assertEqual(out_txn.transfer_counterpart, in_txn)
+
+        self.assertEqual(in_txn.bank_account, self.payroll_bank_account)
+        self.assertEqual(in_txn.direction, "inflow")
+        self.assertEqual(in_txn.amount, Decimal("12000.00"))
+        self.assertEqual(in_txn.transfer_counterpart, out_txn)
+
+        self.bank_account.refresh_from_db()
+        self.payroll_bank_account.refresh_from_db()
+
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("38000.00"))
+        self.assertEqual(self.payroll_bank_account.current_gl_balance, Decimal("12000.00"))
+
+    def test_transfer_same_account_rejection(self):
+        """Cannot transfer from an account to itself."""
+        with self.assertRaises(ValidationError):
+            record_transfer(
+                from_account_id=self.bank_account.id,
+                to_account_id=self.bank_account.id,
+                amount=Decimal("100.00"),
+                txn_date=date(2026, 2, 1),
+                user=self.user,
+            )
+
+    def test_statement_csv_import_valid_and_idempotent(self):
+        """
+        Validates CSV statement import with positive/negative amounts,
+        deterministic external IDs, and duplicate idempotency skipping.
+        """
+        csv_data = """Date,Description,Amount,Reference,Transaction ID
+2026-02-01,Customer Wire ACME,5000.00,WIRE-1001,TXN-901
+2026-02-03,Office Supplies Amazon,-245.50,CARD-4421,TXN-902
+2026-02-05,Utility Electric,-150.00,ACH-5561,TXN-903
+"""
+        res1 = import_bank_statement_csv(
+            bank_account_id=self.bank_account.id,
+            csv_text_or_file=csv_data,
+            user=self.user,
+        )
+        self.assertEqual(res1["imported_count"], 3)
+        self.assertEqual(res1["skipped_count"], 0)
+        self.assertEqual(len(res1["errors"]), 0)
+
+        txns = list(BankTransaction.objects.filter(bank_account=self.bank_account, source="import"))
+        self.assertEqual(len(txns), 3)
+
+        txn_in = next(t for t in txns if t.external_id == "TXN-901")
+        self.assertEqual(txn_in.direction, "inflow")
+        self.assertEqual(txn_in.amount, Decimal("5000.00"))
+
+        txn_out = next(t for t in txns if t.external_id == "TXN-902")
+        self.assertEqual(txn_out.direction, "outflow")
+        self.assertEqual(txn_out.amount, Decimal("245.50"))
+
+        # Re-import identical statement: must skip duplicates safely (idempotency)
+        res2 = import_bank_statement_csv(
+            bank_account_id=self.bank_account.id,
+            csv_text_or_file=csv_data,
+            user=self.user,
+        )
+        self.assertEqual(res2["imported_count"], 0)
+        self.assertEqual(res2["skipped_count"], 3)
+        self.assertEqual(BankTransaction.objects.filter(bank_account=self.bank_account, source="import").count(), 3)
+
+    def test_statement_csv_import_debit_credit_columns(self):
+        """Tests statement with separate Debit and Credit columns."""
+        csv_data = """Date,Memo,Debit,Credit,Check
+2026-02-10,Vendor payment,1200.00,,CHK-101
+2026-02-12,Merchant batch deposit,,3500.00,BATCH-202
+"""
+        res = import_bank_statement_csv(
+            bank_account_id=self.bank_account.id,
+            csv_text_or_file=csv_data,
+            user=self.user,
+        )
+        self.assertEqual(res["imported_count"], 2)
+
+        dr_txn = BankTransaction.objects.get(bank_account=self.bank_account, reference="CHK-101")
+        self.assertEqual(dr_txn.direction, "outflow")
+        self.assertEqual(dr_txn.amount, Decimal("1200.00"))
+
+        cr_txn = BankTransaction.objects.get(bank_account=self.bank_account, reference="BATCH-202")
+        self.assertEqual(cr_txn.direction, "inflow")
+        self.assertEqual(cr_txn.amount, Decimal("3500.00"))
+
+    def test_bank_reconciliation_workflow_and_reopening(self):
+        """
+        Complete bank reconciliation lifecycle:
+        1. Setup Opening Balance ($10,000.00)
+        2. Deposit ($3,000.00) & Withdrawal ($1,000.00)
+        3. Check Unreconciled Queue
+        4. Reconcile matching transactions to Statement Ending Balance ($12,000.00)
+        5. Verify Reconciled Balance is updated
+        6. Reopen reconciliation and verify restoration of original balances.
+        """
+        # 1. Opening balance
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("10000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+
+        # 2. Deposit & Withdrawal
+        dep_txn = record_deposit(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("3000.00"),
+            txn_date=date(2026, 1, 15),
+            offset_account_id=self.sales_gl.id,
+            user=self.user,
+            description="January Sales",
+        )
+        wth_txn = record_withdrawal(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("1000.00"),
+            txn_date=date(2026, 1, 20),
+            offset_account_id=self.bank_fee_gl.id,
+            user=self.user,
+            description="Service Fee",
+        )
+
+        # 3. Unreconciled queue
+        queue = get_unreconciled_transactions_queue(self.bank_account.id)
+        self.assertEqual(queue["bank_transactions"].count(), 2)
+
+        # 4. Perform reconciliation
+        rec = reconcile_bank_account(
+            bank_account_id=self.bank_account.id,
+            statement_date=date(2026, 1, 31),
+            statement_balance=Decimal("12000.00"),
+            transaction_ids=[dep_txn.id, wth_txn.id],
+            journal_line_ids=[dep_txn.journal_entry_line.id, wth_txn.journal_entry_line.id],
+            user=self.user,
+            notes="January bank statement reconciliation completed",
+        )
+
+        self.assertEqual(rec.status, "completed")
+        self.assertEqual(rec.reconciled_balance, Decimal("12000.00"))
+        self.assertEqual(rec.starting_balance, Decimal("10000.00"))
+
+        dep_txn.refresh_from_db()
+        wth_txn.refresh_from_db()
+        self.assertEqual(dep_txn.reconciliation_status, "reconciled")
+        self.assertEqual(wth_txn.reconciliation_status, "reconciled")
+        self.assertEqual(dep_txn.reconciliation, rec)
+        self.assertTrue(dep_txn.journal_entry_line.is_reconciled)
+        self.assertTrue(wth_txn.journal_entry_line.is_reconciled)
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("12000.00"))
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("12000.00"))
+        self.assertEqual(self.bank_account.unreconciled_difference, Decimal("0.00"))
+
+        # Cannot reconcile already reconciled transaction
+        with self.assertRaises(ValidationError):
+            reconcile_bank_account(
+                bank_account_id=self.bank_account.id,
+                statement_date=date(2026, 1, 31),
+                statement_balance=Decimal("12000.00"),
+                transaction_ids=[dep_txn.id],
+                journal_line_ids=[],
+                user=self.user,
+            )
+
+        # 5. Reopen reconciliation
+        reopened = reopen_reconciliation(rec.id, user=self.user, reason="Need to re-match unrecorded check")
+        self.assertEqual(reopened.status, "reopened")
+
+        dep_txn.refresh_from_db()
+        wth_txn.refresh_from_db()
+        self.assertEqual(dep_txn.reconciliation_status, "unreconciled")
+        self.assertEqual(wth_txn.reconciliation_status, "unreconciled")
+        self.assertIsNone(dep_txn.reconciliation)
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("10000.00"))
+
+    def test_cash_bank_summary(self):
+        """Tests tenant-level KPI summary aggregation."""
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("10000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+        record_deposit(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("2500.00"),
+            txn_date=date(2026, 1, 15),
+            offset_account_id=self.sales_gl.id,
+            user=self.user,
+        )
+
+        summary = get_cash_bank_summary(self.company)
+        self.assertEqual(summary["active_accounts_count"], 2)
+        self.assertEqual(summary["total_book_balance"], Decimal("12500.00"))
+        self.assertEqual(summary["total_reconciled_balance"], Decimal("10000.00"))
+        self.assertEqual(summary["total_unreconciled_difference"], Decimal("2500.00"))
+        self.assertEqual(summary["unreconciled_transactions_count"], 1)
+
+
+class CashAndBankAPITests(APITestCase):
+    """
+    Blueprint Section #17 — REST API Integration Tests.
+    Tests Bank Account endpoints, Opening Balance, Import, Transactions,
+    Reconciliations, and Summary endpoints.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="ApexForge API Co", slug="apexforge-api")
+        self.user = User.objects.create_user(
+            username="treasury_api_admin",
+            email="treasury_api@apexforge.com",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+        )
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+
+        self.operating_gl = Account.objects.get(company=self.company, code="1010")
+        self.payroll_gl = Account.objects.get(company=self.company, code="1020")
+        self.sales_gl = Account.objects.get(company=self.company, code="4010")
+        self.fee_gl = Account.objects.filter(company=self.company, account_type__category="expense").exclude(children__isnull=False).first()
+
+        self.bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Primary Checking",
+            bank_name="Silicon Valley Bank",
+            account_number="987612345678",
+            account_type="checking",
+            gl_account=self.operating_gl,
+        )
+
+    def test_bank_account_crud_api(self):
+        """Tests bank account creation, list, retrieve, and masking via API."""
+        res = self.client.post("/api/accounting/bank-accounts/", {
+            "account_name": "Investment Savings",
+            "bank_name": "Goldman Sachs",
+            "account_number": "5555444433332222",
+            "routing_number": "021000089",
+            "account_type": "savings",
+            "currency": "USD",
+            "gl_account": self.payroll_gl.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        acc_id = res.data["id"]
+
+        # List
+        list_res = self.client.get("/api/accounting/bank-accounts/")
+        self.assertEqual(list_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(list_res.data), 2)
+
+        # Retrieve detail - verify raw account number is NOT exposed
+        det_res = self.client.get(f"/api/accounting/bank-accounts/{acc_id}/")
+        self.assertEqual(det_res.status_code, status.HTTP_200_OK)
+        self.assertNotIn("account_number", det_res.data)
+        self.assertEqual(det_res.data["masked_account_number"], "****2222")
+
+    def test_opening_balance_api(self):
+        """Tests opening balance posting endpoint."""
+        res = self.client.post(f"/api/accounting/bank-accounts/{self.bank_account.id}/opening-balance/", {
+            "amount": "15000.00",
+            "date": "2026-01-01",
+            "notes": "Starting balance 2026",
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.opening_balance, Decimal("15000.00"))
+
+    def test_deposit_and_withdrawal_api(self):
+        """Tests deposit and withdrawal endpoints."""
+        # Deposit
+        dep_res = self.client.post("/api/accounting/bank-transactions/deposit/", {
+            "bank_account": self.bank_account.id,
+            "amount": "5000.00",
+            "date": "2026-02-01",
+            "offset_account": self.sales_gl.id,
+            "description": "Customer invoice payment deposit",
+            "reference": "DEP-API-01",
+        })
+        self.assertEqual(dep_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(dep_res.data["direction"], "inflow")
+
+        # Withdrawal
+        wth_res = self.client.post("/api/accounting/bank-transactions/withdrawal/", {
+            "bank_account": self.bank_account.id,
+            "amount": "250.00",
+            "date": "2026-02-05",
+            "offset_account": self.fee_gl.id,
+            "description": "Monthly Account Maintenance Fee",
+            "transaction_type": "fee",
+        })
+        self.assertEqual(wth_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(wth_res.data["direction"], "outflow")
+
+    def test_import_statement_api(self):
+        """Tests statement CSV upload via API."""
+        csv_file = SimpleUploadedFile(
+            "statement.csv",
+            b"Date,Amount,Description,Reference\n2026-02-01,1500.00,Deposit,REF1\n2026-02-02,-300.00,Payment,REF2\n",
+            content_type="text/csv"
+        )
+        res = self.client.post(
+            f"/api/accounting/bank-accounts/{self.bank_account.id}/import-statement/",
+            {"file": csv_file},
+            format="multipart"
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["imported_count"], 2)
+
+    def test_unreconciled_queue_and_reconciliation_api(self):
+        """Tests unreconciled queue and reconciliation execution via API."""
+        # Create deposit
+        self.client.post("/api/accounting/bank-transactions/deposit/", {
+            "bank_account": self.bank_account.id,
+            "amount": "2000.00",
+            "date": "2026-02-01",
+            "offset_account": self.sales_gl.id,
+            "description": "Sales deposit",
+        })
+
+        # Check queue
+        q_res = self.client.get(f"/api/accounting/bank-accounts/{self.bank_account.id}/unreconciled-queue/")
+        self.assertEqual(q_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(q_res.data["bank_transactions"]), 1)
+        txn_id = q_res.data["bank_transactions"][0]["id"]
+        jl_id = q_res.data["journal_lines"][0]["id"]
+
+        # Reconcile
+        rec_res = self.client.post("/api/accounting/bank-reconciliations/reconcile/", {
+            "bank_account": self.bank_account.id,
+            "statement_date": "2026-02-28",
+            "statement_balance": "2000.00",
+            "transaction_ids": [txn_id],
+            "journal_line_ids": [jl_id],
+            "notes": "Feb Reconciliation",
+        })
+        self.assertEqual(rec_res.status_code, status.HTTP_201_CREATED)
+        rec_id = rec_res.data["reconciliation"]["id"]
+
+        # Cleared items
+        det_res = self.client.get(f"/api/accounting/bank-reconciliations/{rec_id}/cleared-items/")
+        self.assertEqual(det_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(det_res.data["transactions"]), 1)
+
+        # Reopen
+        reopen_res = self.client.post(f"/api/accounting/bank-reconciliations/{rec_id}/reopen/", {
+            "reason": "Audit adjustment"
+        })
+        self.assertEqual(reopen_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(reopen_res.data["reconciliation"]["status"], "reopened")
+
+    def test_banking_summary_api(self):
+        """Tests summary KPI endpoint."""
+        res = self.client.get("/api/accounting/banking/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("active_accounts_count", res.data)
+        self.assertIn("total_book_balance", res.data)
+        self.assertIn("total_reconciled_balance", res.data)
+
+    def test_toggle_active_api(self):
+        """Tests toggling account active/inactive status."""
+        res = self.client.post(f"/api/accounting/bank-accounts/{self.bank_account.id}/toggle-active/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["is_active"])
+
+    def test_unauthorized_access(self):
+        """Non-finance/non-admin user is rejected with 403."""
+        unauth_user = User.objects.create_user(
+            username="shopfloor_worker",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.client.force_authenticate(user=unauth_user)
+        res = self.client.get("/api/accounting/bank-accounts/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #18 — PAYMENTS & ALLOCATIONS TEST SUITE
+# ==============================================================================
+
+from sales.models import Customer, Invoice, CustomerPayment
+from procurement.models import Vendor, Bill, VendorPayment
+from .models import Payment, PaymentAllocation, PaymentAuditLog
+from .payments_allocations import (
+    create_payment,
+    post_payment,
+    allocate_payment,
+    unallocate_allocation,
+    reverse_payment,
+    cancel_payment,
+    get_available_documents_for_allocation,
+    get_payments_summary,
+)
+
+
+class PaymentsAllocationsTestCase(TestCase):
+    """
+    Blueprint Section #18 comprehensive test suite:
+      - Payment creation, validation, idempotency, company isolation
+      - Atomic double-entry GL journal posting (#8, #9)
+      - Cash & Bank integration (#17)
+      - Single, partial, and multi-document allocation
+      - Unallocation & allocation reversal (balance restoration)
+      - Payment cancellation and reversal (#8 reversal engine)
+      - Available documents query and summary KPIs
+      - REST API endpoints and permission controls
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Brewing Master Co", slug="brewing-master-co")
+        self.user = User.objects.create_user(
+            username="finance_lead",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+        )
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+
+        self.bank_gl = Account.objects.get(company=self.company, code="1010")
+        self.ar_gl = Account.objects.get(company=self.company, code="1100")
+        self.ap_gl = Account.objects.get(company=self.company, code="2010")
+
+        self.bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Operating Account",
+            bank_name="JPMorgan Chase",
+            account_number="111122223333",
+            account_type="checking",
+            currency="USD",
+            gl_account=self.bank_gl,
+        )
+
+        self.customer = Customer.objects.create(
+            company=self.company,
+            name="Downtown Bistro",
+        )
+        self.vendor = Vendor.objects.create(
+            company=self.company,
+            name="Quality Malts Ltd",
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_create_customer_receipt_draft(self):
+        """Creates a valid Customer Receipt in draft status."""
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1500.00"),
+            payment_date=date(2026, 2, 10),
+            customer_id=self.customer.id,
+            payment_source_type="bank",
+            bank_account_id=self.bank_account.id,
+            reference="CHK-4501",
+            notes="Invoice prepayment",
+        )
+        self.assertEqual(pmt.status, "draft")
+        self.assertEqual(pmt.allocation_status, "unallocated")
+        self.assertEqual(pmt.amount, Decimal("1500.00"))
+        self.assertEqual(pmt.unallocated_amount, Decimal("1500.00"))
+        self.assertTrue(pmt.payment_number.startswith("REC-2026-"))
+        self.assertIsNone(pmt.journal_entry)
+        self.assertIsNone(pmt.bank_transaction)
+
+    def test_create_vendor_payment_draft(self):
+        """Creates a valid Vendor Payment in draft status."""
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="vendor_payment",
+            amount=Decimal("3200.00"),
+            payment_date=date(2026, 2, 12),
+            vendor_id=self.vendor.id,
+            payment_source_type="bank",
+            bank_account_id=self.bank_account.id,
+            reference="WIRE-8812",
+        )
+        self.assertEqual(pmt.status, "draft")
+        self.assertEqual(pmt.amount, Decimal("3200.00"))
+        self.assertTrue(pmt.payment_number.startswith("PAY-2026-"))
+
+    def test_create_payment_invalid_amount_rejection(self):
+        """Zero or negative amount is rejected."""
+        with self.assertRaises(ValidationError):
+            create_payment(
+                company=self.company,
+                user=self.user,
+                payment_type="customer_receipt",
+                amount=Decimal("0.00"),
+                customer_id=self.customer.id,
+                bank_account_id=self.bank_account.id,
+            )
+
+    def test_create_payment_cross_company_party_rejection(self):
+        """Customer belonging to another company cannot be used."""
+        other_co = Company.objects.create(name="Other Co", slug="other-co-pmt")
+        other_cust = Customer.objects.create(company=other_co, name="Foreign Customer")
+
+        with self.assertRaises(ValidationError):
+            create_payment(
+                company=self.company,
+                user=self.user,
+                payment_type="customer_receipt",
+                amount=Decimal("100.00"),
+                customer_id=other_cust.id,
+                bank_account_id=self.bank_account.id,
+            )
+
+    def test_create_payment_inactive_bank_account_rejection(self):
+        """Inactive bank account cannot be selected."""
+        self.bank_account.is_active = False
+        self.bank_account.save()
+
+        with self.assertRaises(ValidationError):
+            create_payment(
+                company=self.company,
+                user=self.user,
+                payment_type="customer_receipt",
+                amount=Decimal("200.00"),
+                customer_id=self.customer.id,
+                bank_account_id=self.bank_account.id,
+            )
+
+    def test_create_payment_duplicate_external_reference_rejection(self):
+        """Idempotency check prevents duplicate payments with same external reference."""
+        create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("500.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            external_reference="EXT-IDEM-001",
+        )
+        with self.assertRaises(ValidationError):
+            create_payment(
+                company=self.company,
+                user=self.user,
+                payment_type="customer_receipt",
+                amount=Decimal("500.00"),
+                customer_id=self.customer.id,
+                bank_account_id=self.bank_account.id,
+                external_reference="EXT-IDEM-001",
+            )
+
+    def test_post_customer_receipt_journal_and_banking(self):
+        """
+        Customer Receipt posting:
+        DR 1010 Bank Asset = $2,000.00
+        CR 1100 AR Asset = $2,000.00
+        Creates linked BankTransaction in Cash & Bank (#17).
+        """
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("2000.00"),
+            payment_date=date(2026, 2, 1),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            reference="WIRE-CR-01",
+        )
+        posted_pmt = post_payment(pmt.id, user=self.user, company=self.company)
+        self.assertEqual(posted_pmt.status, "posted")
+        self.assertIsNotNone(posted_pmt.posted_at)
+
+        # Journal Entry
+        je = posted_pmt.journal_entry
+        self.assertIsNotNone(je)
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+        self.assertEqual(je.total_debit, Decimal("2000.00"))
+        self.assertEqual(je.total_credit, Decimal("2000.00"))
+
+        bank_lines = je.lines.filter(account=self.bank_gl)
+        ar_lines = je.lines.filter(account=self.ar_gl)
+        self.assertEqual(bank_lines.first().debit, Decimal("2000.00"))
+        self.assertEqual(ar_lines.first().credit, Decimal("2000.00"))
+
+        # Cash & Bank Transaction
+        bt = posted_pmt.bank_transaction
+        self.assertIsNotNone(bt)
+        self.assertEqual(bt.direction, "inflow")
+        self.assertEqual(bt.transaction_type, "customer_receipt")
+        self.assertEqual(bt.amount, Decimal("2000.00"))
+        self.assertEqual(bt.matching_status, "matched")
+        self.assertEqual(bt.reconciliation_status, "unreconciled")
+
+        # Bank Account GL balance updated
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("2000.00"))
+
+    def test_post_vendor_payment_journal_and_banking(self):
+        """
+        Vendor Payment posting:
+        DR 2010 AP Liability = $1,200.00
+        CR 1010 Bank Asset = $1,200.00
+        Creates linked BankTransaction with outflow direction.
+        """
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="vendor_payment",
+            amount=Decimal("1200.00"),
+            payment_date=date(2026, 2, 2),
+            vendor_id=self.vendor.id,
+            bank_account_id=self.bank_account.id,
+            reference="CHK-VP-01",
+        )
+        posted_pmt = post_payment(pmt.id, user=self.user, company=self.company)
+        self.assertEqual(posted_pmt.status, "posted")
+
+        je = posted_pmt.journal_entry
+        self.assertTrue(je.is_balanced)
+        ap_lines = je.lines.filter(account=self.ap_gl)
+        bank_lines = je.lines.filter(account=self.bank_gl)
+        self.assertEqual(ap_lines.first().debit, Decimal("1200.00"))
+        self.assertEqual(bank_lines.first().credit, Decimal("1200.00"))
+
+        bt = posted_pmt.bank_transaction
+        self.assertEqual(bt.direction, "outflow")
+        self.assertEqual(bt.transaction_type, "vendor_payment")
+
+    def test_post_payment_closed_period_rejection(self):
+        """Payment date falling in a closed period cannot be posted."""
+        period = AccountingPeriod.objects.filter(
+            fiscal_year__company=self.company,
+            start_date__lte=date(2026, 2, 1),
+            end_date__gte=date(2026, 2, 1),
+        ).first()
+        period.status = "closed"
+        period.save()
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1000.00"),
+            payment_date=date(2026, 2, 1),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+        )
+        with self.assertRaises(ValidationError):
+            post_payment(pmt.id, user=self.user, company=self.company)
+
+    def test_post_payment_lock_date_rejection(self):
+        """Payment date on or before global lock date cannot be posted."""
+        self.settings.lock_date = date(2026, 2, 15)
+        self.settings.save()
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("500.00"),
+            payment_date=date(2026, 2, 10),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+        )
+        with self.assertRaises(ValidationError):
+            post_payment(pmt.id, user=self.user, company=self.company)
+
+    def test_allocate_customer_receipt_full_and_partial(self):
+        """
+        Tests allocating a customer payment against an invoice:
+          1. Partial allocation leaving invoice with remaining balance
+          2. Second allocation fully settling the invoice
+        """
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("1000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1000.00"),
+            payment_date=date(2026, 2, 5),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        # 1. Partial allocation of $400
+        allocate_payment(
+            payment_id=pmt.id,
+            allocations=[{"invoice_id": inv.id, "amount": "400.00"}],
+            user=self.user,
+            company=self.company,
+        )
+
+        pmt.refresh_from_db()
+        inv.refresh_from_db()
+        self.assertEqual(pmt.allocation_status, "partially_allocated")
+        self.assertEqual(pmt.allocated_amount, Decimal("400.00"))
+        self.assertEqual(pmt.unallocated_amount, Decimal("600.00"))
+        self.assertEqual(inv.status, "partial")
+        self.assertEqual(inv.amount_paid, Decimal("400.00"))
+        self.assertEqual(inv.balance_due, Decimal("600.00"))
+
+        # Legacy CustomerPayment created for statement queries
+        self.assertTrue(CustomerPayment.objects.filter(customer=self.customer, invoice=inv, amount=Decimal("400.00")).exists())
+
+        # 2. Second allocation of remaining $600
+        allocate_payment(
+            payment_id=pmt.id,
+            allocations=[{"invoice_id": inv.id, "amount": "600.00"}],
+            user=self.user,
+            company=self.company,
+        )
+
+        pmt.refresh_from_db()
+        inv.refresh_from_db()
+        self.assertEqual(pmt.allocation_status, "fully_allocated")
+        self.assertEqual(pmt.allocated_amount, Decimal("1000.00"))
+        self.assertEqual(pmt.unallocated_amount, Decimal("0.00"))
+        self.assertEqual(inv.status, "paid")
+        self.assertEqual(inv.amount_paid, Decimal("1000.00"))
+        self.assertEqual(inv.balance_due, Decimal("0.00"))
+
+    def test_allocate_multi_document_allocation(self):
+        """A single payment allocated across multiple invoices atomically."""
+        inv1 = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("600.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        inv2 = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 2),
+            total_amount=Decimal("400.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1000.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        allocate_payment(
+            payment_id=pmt.id,
+            allocations=[
+                {"invoice_id": inv1.id, "amount": "600.00"},
+                {"invoice_id": inv2.id, "amount": "400.00"},
+            ],
+            user=self.user,
+            company=self.company,
+        )
+
+        inv1.refresh_from_db()
+        inv2.refresh_from_db()
+        pmt.refresh_from_db()
+
+        self.assertEqual(inv1.status, "paid")
+        self.assertEqual(inv2.status, "paid")
+        self.assertEqual(pmt.allocation_status, "fully_allocated")
+        self.assertEqual(pmt.allocations.filter(status="active").count(), 2)
+
+    def test_allocate_exceeding_payment_unallocated_amount_rejection(self):
+        """Allocation exceeding available payment unallocated funds is rejected."""
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("1000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("300.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        with self.assertRaises(ValidationError) as ctx:
+            allocate_payment(
+                payment_id=pmt.id,
+                allocations=[{"invoice_id": inv.id, "amount": "500.00"}],
+                user=self.user,
+                company=self.company,
+            )
+        self.assertIn("exceeds available unallocated amount", str(ctx.exception))
+
+    def test_allocate_exceeding_invoice_balance_due_rejection(self):
+        """Allocation exceeding document balance due is rejected."""
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("200.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("500.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        with self.assertRaises(ValidationError) as ctx:
+            allocate_payment(
+                payment_id=pmt.id,
+                allocations=[{"invoice_id": inv.id, "amount": "300.00"}],
+                user=self.user,
+                company=self.company,
+            )
+        self.assertIn("exceeds balance due", str(ctx.exception))
+
+    def test_allocate_vendor_payment_to_bills(self):
+        """Vendor payment allocated across bills."""
+        bill1 = Bill.objects.create(
+            company=self.company,
+            vendor=self.vendor,
+            bill_number="BILL-101",
+            bill_date=date(2026, 2, 1),
+            total_amount=Decimal("800.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        bill2 = Bill.objects.create(
+            company=self.company,
+            vendor=self.vendor,
+            bill_number="BILL-102",
+            bill_date=date(2026, 2, 2),
+            total_amount=Decimal("500.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="vendor_payment",
+            amount=Decimal("1100.00"),
+            vendor_id=self.vendor.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+
+        allocate_payment(
+            payment_id=pmt.id,
+            allocations=[
+                {"bill_id": bill1.id, "amount": "800.00"},
+                {"bill_id": bill2.id, "amount": "300.00"},
+            ],
+            user=self.user,
+            company=self.company,
+        )
+
+        bill1.refresh_from_db()
+        bill2.refresh_from_db()
+        pmt.refresh_from_db()
+
+        self.assertEqual(bill1.status, "paid")
+        self.assertEqual(bill2.status, "partial")
+        self.assertEqual(bill2.balance_due, Decimal("200.00"))
+        self.assertEqual(pmt.allocation_status, "fully_allocated")
+        self.assertTrue(VendorPayment.objects.filter(vendor=self.vendor, bill=bill1, amount=Decimal("800.00")).exists())
+
+    def test_unallocate_restores_document_and_payment_balances(self):
+        """
+        Unallocating an active allocation:
+          - Decrements document amount_paid
+          - Restores document status (open or partial)
+          - Restores payment unallocated amount
+          - Marks allocation reversed
+          - Does not alter posted journal entry
+        """
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("500.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("500.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+            allocations=[{"invoice_id": inv.id, "amount": "500.00"}],
+        )
+
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "paid")
+        alloc = pmt.allocations.filter(status="active").first()
+        self.assertIsNotNone(alloc)
+
+        # Unallocate
+        unallocate_allocation(alloc.id, user=self.user, company=self.company)
+
+        inv.refresh_from_db()
+        pmt.refresh_from_db()
+        alloc.refresh_from_db()
+
+        self.assertEqual(alloc.status, "reversed")
+        self.assertEqual(inv.status, "open")
+        self.assertEqual(inv.amount_paid, Decimal("0.00"))
+        self.assertEqual(inv.balance_due, Decimal("500.00"))
+        self.assertEqual(pmt.allocation_status, "unallocated")
+        self.assertEqual(pmt.unallocated_amount, Decimal("500.00"))
+        self.assertEqual(pmt.journal_entry.status, "posted")  # GL remains intact!
+
+    def test_reverse_posted_payment_pipeline(self):
+        """
+        Reversing a posted payment:
+          1. Reverses active allocations (restoring invoices)
+          2. Inverts journal entry using Blueprint #8 reverse_journal_entry
+          3. Updates bank transaction
+          4. Marks payment reversed
+        """
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("750.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("750.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+            allocations=[{"invoice_id": inv.id, "amount": "750.00"}],
+        )
+
+        orig_je = pmt.journal_entry
+
+        # Execute Reversal
+        rev_pmt = reverse_payment(
+            payment_id=pmt.id,
+            reason="Customer check bounced (NSF)",
+            user=self.user,
+            company=self.company,
+        )
+
+        self.assertEqual(rev_pmt.status, "reversed")
+        self.assertIsNotNone(rev_pmt.reversal_journal_entry)
+        self.assertEqual(rev_pmt.reversal_journal_entry.status, "posted")
+        self.assertTrue(rev_pmt.reversal_journal_entry.is_balanced)
+
+        # Original JE marked reversed
+        orig_je.refresh_from_db()
+        self.assertEqual(orig_je.status, "reversed")
+
+        # Invoice restored to open
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "open")
+        self.assertEqual(inv.amount_paid, Decimal("0.00"))
+
+        # Bank transaction updated
+        pmt.bank_transaction.refresh_from_db()
+        self.assertEqual(pmt.bank_transaction.matching_status, "unmatched")
+        self.assertIn("Reversed:", pmt.bank_transaction.description)
+
+    def test_cancel_draft_payment(self):
+        """Draft payments can be cancelled."""
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("300.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+        )
+        cancelled = cancel_payment(pmt.id, user=self.user, company=self.company)
+        self.assertEqual(cancelled.status, "cancelled")
+
+        # Cannot post cancelled payment
+        with self.assertRaises(ValidationError):
+            post_payment(pmt.id, user=self.user, company=self.company)
+
+    def test_get_available_documents_query(self):
+        """Returns open/partial invoices for customer or bills for vendor."""
+        Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("1200.00"),
+            amount_paid=Decimal("200.00"),
+            status="partial",
+        )
+        pmt = create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("1000.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+        )
+        docs = get_available_documents_for_allocation(pmt.id, company=self.company)
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0]["balance_due"], "1000.00")
+        self.assertEqual(docs[0]["document_type"], "invoice")
+
+    def test_payments_summary_kpi(self):
+        """Calculates tenant-level KPI aggregations for Payments & Allocations."""
+        create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="customer_receipt",
+            amount=Decimal("5000.00"),
+            customer_id=self.customer.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+        create_payment(
+            company=self.company,
+            user=self.user,
+            payment_type="vendor_payment",
+            amount=Decimal("2000.00"),
+            vendor_id=self.vendor.id,
+            bank_account_id=self.bank_account.id,
+            auto_post=True,
+        )
+        summary = get_payments_summary(company=self.company)
+        self.assertEqual(summary["posted_count"], 2)
+        self.assertEqual(summary["total_receipts_amount"], "5000.00")
+        self.assertEqual(summary["total_disbursements_amount"], "2000.00")
+        self.assertEqual(summary["total_unallocated_amount"], "7000.00")
+
+    def test_payment_api_flow(self):
+        """
+        Verifies end-to-end REST API endpoints:
+          - POST /api/accounting/payments/
+          - POST /api/accounting/payments/{id}/post/
+          - GET  /api/accounting/payments/{id}/available-documents/
+          - POST /api/accounting/payments/{id}/allocate/
+          - POST /api/accounting/payment-allocations/{id}/unallocate/
+          - POST /api/accounting/payments/{id}/reverse/
+          - GET  /api/accounting/payments/{id}/audit-trail/
+          - GET  /api/accounting/payments/summary/
+        """
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 2, 1),
+            total_amount=Decimal("800.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+
+        # 1. Create Payment via API
+        create_res = self.client.post("/api/accounting/payments/", {
+            "payment_type": "customer_receipt",
+            "amount": "800.00",
+            "payment_date": "2026-02-15",
+            "customer_id": self.customer.id,
+            "bank_account_id": self.bank_account.id,
+            "reference": "API-CHK-100",
+        })
+        self.assertEqual(create_res.status_code, status.HTTP_201_CREATED)
+        pmt_id = create_res.data["id"]
+        self.assertEqual(create_res.data["status"], "draft")
+
+        # 2. Post Payment via API
+        post_res = self.client.post(f"/api/accounting/payments/{pmt_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(post_res.data["status"], "posted")
+
+        # 3. Available documents
+        docs_res = self.client.get(f"/api/accounting/payments/{pmt_id}/available-documents/")
+        self.assertEqual(docs_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(docs_res.data), 1)
+
+        # 4. Allocate via API
+        alloc_res = self.client.post(
+            f"/api/accounting/payments/{pmt_id}/allocate/",
+            {"allocations": [{"invoice_id": inv.id, "amount": "800.00"}]},
+            format="json"
+        )
+        self.assertEqual(alloc_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(alloc_res.data["allocation_status"], "fully_allocated")
+        alloc_id = alloc_res.data["allocations"][0]["id"]
+
+        # 5. Unallocate via API
+        unalloc_res = self.client.post(f"/api/accounting/payment-allocations/{alloc_id}/unallocate/")
+        self.assertEqual(unalloc_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(unalloc_res.data["payment"]["allocation_status"], "unallocated")
+
+        # 6. Reverse Payment via API
+        rev_res = self.client.post(f"/api/accounting/payments/{pmt_id}/reverse/", {
+            "reason": "Payment issued in error"
+        })
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "reversed")
+
+        # 7. Audit trail
+        audit_res = self.client.get(f"/api/accounting/payments/{pmt_id}/audit-trail/")
+        self.assertEqual(audit_res.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(audit_res.data), 3)
+
+        # 8. Summary
+        sum_res = self.client.get("/api/accounting/payments/summary/")
+        self.assertEqual(sum_res.status_code, status.HTTP_200_OK)
+        self.assertIn("total_payments_count", sum_res.data)
+
+    def test_payment_unauthorized_forbidden(self):
+        """Non-finance role is rejected with 403."""
+        operator = User.objects.create_user(
+            username="forklift_driver",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.client.force_authenticate(user=operator)
+        res = self.client.get("/api/accounting/payments/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+# =============================================================================
+# BLUEPRINT SECTION #19 — TAX LAYER TESTS
+# =============================================================================
+
+from decimal import Decimal
+from accounting.models import (
+    TaxCode,
+    TaxTransactionLine,
+    TaxAdjustment,
+    TaxAuditLog,
+)
+from accounting.tax import (
+    calculate_tax,
+    calculate_lines_tax,
+    record_tax_line,
+    create_tax_adjustment,
+    post_tax_adjustment,
+    reverse_tax_adjustment,
+    reverse_tax_transaction_line,
+    get_tax_summary,
+    get_tax_report,
+    seed_default_tax_codes,
+)
+from sales.models import Customer, Invoice
+from procurement.models import Vendor, Bill
+from accounting.sales_accounting import post_sales_invoice_to_accounting, reverse_sales_invoice_accounting
+from accounting.purchase_accounting import post_purchase_to_accounting, reverse_purchase_accounting
+
+
+class TaxLayerTestCase(APITestCase):
+    """
+    Blueprint Section #19 — Comprehensive Tests for Tax Layer.
+    Tests tax calculations (inclusive/exclusive), master data, account mappings,
+    transaction lines, adjustments, reversals, period controls, GL reconciliation,
+    and company isolation.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Apex Brewing Corp", slug="apex-brew")
+        self.other_company = Company.objects.create(name="Rival Beverages", slug="rival-bev")
+
+        self.types = ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_chart_of_accounts(self.other_company)
+
+        self.fy = seed_standard_fiscal_year(self.company, year=2026)
+        self.other_fy = seed_standard_fiscal_year(self.other_company, year=2026)
+
+        self.finance_user = User.objects.create_user(
+            username="tax_officer",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.finance_user)
+
+        self.sales_tax_acc = Account.objects.filter(company=self.company, code="2200").first()
+        if not self.sales_tax_acc:
+            from accounting.sales_accounting import get_tax_payable_account
+            self.sales_tax_acc = get_tax_payable_account(self.company)
+
+        self.input_tax_acc = Account.objects.filter(company=self.company, code="1310").first()
+        if not self.input_tax_acc:
+            from accounting.purchase_accounting import get_input_tax_account
+            self.input_tax_acc = get_input_tax_account(self.company)
+
+        self.expense_offset_acc = Account.objects.filter(company=self.company, code="2110").first()
+        if not self.expense_offset_acc:
+            self.expense_offset_acc = Account.objects.filter(company=self.company, children__isnull=True).exclude(id=self.sales_tax_acc.id).first()
+
+        # Seed standard default codes
+        seed_default_tax_codes(self.company, user=self.finance_user)
+        self.std_code = TaxCode.objects.filter(company=self.company, code="STD-10").first()
+
+    def test_tax_calculation_exclusive(self):
+        """Standard tax exclusive: amount=100, rate=18% -> base=100, tax=18, gross=118."""
+        res = calculate_tax(
+            amount=Decimal("100.00"),
+            tax_rate=Decimal("18.0000"),
+            calculation_mode="exclusive"
+        )
+        self.assertEqual(res["taxable_amount"], Decimal("100.00"))
+        self.assertEqual(res["tax_amount"], Decimal("18.00"))
+        self.assertEqual(res["total_amount"], Decimal("118.00"))
+        self.assertEqual(res["calculation_mode"], "exclusive")
+
+    def test_tax_calculation_inclusive(self):
+        """Tax inclusive: gross=118, rate=18% -> base=100, tax=18, gross=118."""
+        res = calculate_tax(
+            amount=Decimal("118.00"),
+            tax_rate=Decimal("18.0000"),
+            calculation_mode="inclusive"
+        )
+        self.assertEqual(res["taxable_amount"], Decimal("100.00"))
+        self.assertEqual(res["tax_amount"], Decimal("18.00"))
+        self.assertEqual(res["total_amount"], Decimal("118.00"))
+        self.assertEqual(res["calculation_mode"], "inclusive")
+
+    def test_tax_calculation_zero_rate(self):
+        """Zero rated or exempt calculation: rate=0% -> tax=0, total=amount."""
+        res = calculate_tax(
+            amount=Decimal("250.50"),
+            tax_rate=Decimal("0.0000"),
+            calculation_mode="exclusive"
+        )
+        self.assertEqual(res["taxable_amount"], Decimal("250.50"))
+        self.assertEqual(res["tax_amount"], Decimal("0.00"))
+        self.assertEqual(res["total_amount"], Decimal("250.50"))
+
+    def test_tax_calculation_decimal_rate_and_rounding(self):
+        """Fractional rate (7.25%) with deterministic ROUND_HALF_UP rounding."""
+        res = calculate_tax(
+            amount=Decimal("99.99"),
+            tax_rate=Decimal("7.2500"),
+            calculation_mode="exclusive"
+        )
+        # 99.99 * 0.0725 = 7.249275 -> 7.25
+        self.assertEqual(res["taxable_amount"], Decimal("99.99"))
+        self.assertEqual(res["tax_amount"], Decimal("7.25"))
+        self.assertEqual(res["total_amount"], Decimal("107.24"))
+
+    def test_calculate_lines_tax_multi(self):
+        """Aggregates multiple line calculations into document totals."""
+        lines = [
+            {"amount": Decimal("100.00"), "tax_rate": Decimal("10.0000"), "calculation_mode": "exclusive"},
+            {"amount": Decimal("200.00"), "tax_rate": Decimal("5.0000"), "calculation_mode": "exclusive"},
+            {"amount": Decimal("50.00"), "tax_rate": Decimal("0.0000"), "calculation_mode": "exclusive"},
+        ]
+        res = calculate_lines_tax(lines)
+        self.assertEqual(res["total_taxable_amount"], Decimal("350.00"))
+        # 10.00 + 10.00 + 0 = 20.00
+        self.assertEqual(res["total_tax_amount"], Decimal("20.00"))
+        self.assertEqual(res["grand_total"], Decimal("370.00"))
+        self.assertEqual(len(res["lines"]), 3)
+
+    def test_tax_code_validations(self):
+        """TaxCode clean() rejects negative rate, header account, and wrong company."""
+        # Negative rate
+        with self.assertRaises(ValidationError):
+            TaxCode.objects.create(
+                company=self.company,
+                code="BAD-NEG",
+                name="Negative Rate",
+                rate=Decimal("-5.0000"),
+                tax_account=self.sales_tax_acc,
+            )
+
+        # Header account
+        header_acc = Account.objects.filter(company=self.company, children__isnull=False).first()
+        if header_acc:
+            with self.assertRaises(ValidationError):
+                TaxCode.objects.create(
+                    company=self.company,
+                    code="BAD-HDR",
+                    name="Header Account",
+                    rate=Decimal("10.0000"),
+                    tax_account=header_acc,
+                )
+
+        # Other company account
+        other_acc = Account.objects.filter(company=self.other_company, children__isnull=True).first()
+        with self.assertRaises(ValidationError):
+            TaxCode.objects.create(
+                company=self.company,
+                code="BAD-COMP",
+                name="Wrong Company",
+                rate=Decimal("10.0000"),
+                tax_account=other_acc,
+            )
+
+    def test_tax_code_api_crud_and_toggle(self):
+        """CRUD operations and active toggle via REST API."""
+        # Create
+        create_payload = {
+            "code": "VAT-20",
+            "name": "Standard Value Added Tax 20%",
+            "rate": "20.0000",
+            "tax_type": "sales",
+            "calculation_mode": "exclusive",
+            "tax_account": self.sales_tax_acc.id,
+            "is_recoverable": True,
+        }
+        res = self.client.post("/api/accounting/tax-codes/", create_payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        tax_id = res.data["id"]
+
+        # Retrieve
+        get_res = self.client.get(f"/api/accounting/tax-codes/{tax_id}/")
+        self.assertEqual(get_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(get_res.data["code"], "VAT-20")
+
+        # Update
+        patch_res = self.client.patch(f"/api/accounting/tax-codes/{tax_id}/", {"name": "Updated VAT 20%"}, format="json")
+        self.assertEqual(patch_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(patch_res.data["name"], "Updated VAT 20%")
+
+        # Toggle Active
+        toggle_res = self.client.post(f"/api/accounting/tax-codes/{tax_id}/toggle-active/")
+        self.assertEqual(toggle_res.status_code, status.HTTP_200_OK)
+        self.assertFalse(toggle_res.data["is_active"])
+
+    def test_calculate_tax_api_endpoint(self):
+        """POST /api/accounting/taxes/calculate/ returns authoritative values."""
+        payload = {
+            "amount": "500.00",
+            "tax_rate": "12.5000",
+            "calculation_mode": "exclusive",
+        }
+        res = self.client.post("/api/accounting/taxes/calculate/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["taxable_amount"], 500.0)
+        self.assertEqual(res.data["tax_amount"], 62.5)
+        self.assertEqual(res.data["total_amount"], 562.5)
+
+    def test_record_tax_line_and_audit(self):
+        """Records granular tax transaction line and immutable audit log."""
+        line = record_tax_line(
+            company=self.company,
+            source_module="sales",
+            source_id="101",
+            source_reference="INV-TEST-001",
+            taxable_amount=Decimal("1000.00"),
+            tax_rate=Decimal("10.0000"),
+            tax_amount=Decimal("100.00"),
+            transaction_date=date(2026, 3, 15),
+            tax_code=self.std_code,
+            tax_account=self.sales_tax_acc,
+            actor=self.finance_user,
+        )
+        self.assertEqual(line.source_reference, "INV-TEST-001")
+        self.assertEqual(line.tax_amount, Decimal("100.00"))
+        self.assertEqual(line.total_amount, Decimal("1100.00"))
+
+        audit_exists = TaxAuditLog.objects.filter(company=self.company, tax_line=line).exists()
+        self.assertTrue(audit_exists)
+
+    def test_sales_invoice_tax_integration(self):
+        """Sales invoice posting registers a TaxTransactionLine and reconciles with journal."""
+        customer = Customer.objects.create(company=self.company, name="Galaxy Mart")
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=customer,
+            invoice_date=date(2026, 4, 10),
+            due_date=date(2026, 5, 10),
+            status="draft",
+            total_amount=Decimal("1100.00"),
+        )
+
+        je = post_sales_invoice_to_accounting(
+            invoice_id=inv.id,
+            user=self.finance_user,
+            company=self.company,
+            tax_amount=Decimal("100.00"),
+            tax_account_id=self.sales_tax_acc.id,
+        )
+        self.assertEqual(je.status, "posted")
+
+        # Verify TaxTransactionLine was created
+        tax_line = TaxTransactionLine.objects.filter(
+            company=self.company,
+            source_module="sales",
+            source_id=str(inv.id),
+        ).first()
+        self.assertIsNotNone(tax_line)
+        self.assertEqual(tax_line.tax_amount, Decimal("100.00"))
+        self.assertEqual(tax_line.taxable_amount, Decimal("1000.00"))
+        self.assertFalse(tax_line.is_reversed)
+
+        # Reverse invoice and verify tax line is reversed
+        reverse_sales_invoice_accounting(
+            invoice_id=inv.id,
+            user=self.finance_user,
+            company=self.company,
+            reason="Customer cancelled",
+        )
+        tax_line.refresh_from_db()
+        self.assertTrue(tax_line.is_reversed)
+
+    def test_purchase_bill_tax_integration(self):
+        """Purchase bill posting registers a TaxTransactionLine and reconciles with journal."""
+        vendor = Vendor.objects.create(company=self.company, name="Hops & Malt Co")
+        bill = Bill.objects.create(
+            company=self.company,
+            vendor=vendor,
+            bill_number="BILL-HOP-001",
+            bill_date=date(2026, 4, 12),
+            due_date=date(2026, 5, 12),
+            status="draft",
+            total_amount=Decimal("550.00"),
+        )
+
+        je = post_purchase_to_accounting(
+            bill_id=bill.id,
+            user=self.finance_user,
+            company=self.company,
+            tax_amount=Decimal("50.00"),
+            tax_account_id=self.input_tax_acc.id,
+        )
+        self.assertEqual(je.status, "posted")
+
+        tax_line = TaxTransactionLine.objects.filter(
+            company=self.company,
+            source_module="purchases",
+            source_id=str(bill.id),
+        ).first()
+        self.assertIsNotNone(tax_line)
+        self.assertEqual(tax_line.tax_amount, Decimal("50.00"))
+        self.assertFalse(tax_line.is_reversed)
+
+        # Reverse bill and verify tax line is reversed
+        reverse_purchase_accounting(
+            bill_id=bill.id,
+            user=self.finance_user,
+            company=self.company,
+            reason="Damaged goods returned",
+        )
+        tax_line.refresh_from_db()
+        self.assertTrue(tax_line.is_reversed)
+
+    def test_tax_adjustment_lifecycle_and_reversal(self):
+        """Tax adjustment: create draft -> post to journal -> reverse via #8 engine."""
+        data = {
+            "tax_code_id": self.std_code.id,
+            "tax_account_id": self.sales_tax_acc.id,
+            "offset_account_id": self.expense_offset_acc.id,
+            "adjustment_direction": "increase_liability",
+            "taxable_amount": Decimal("1000.00"),
+            "tax_amount": Decimal("100.00"),
+            "adjustment_date": date(2026, 3, 20),
+            "reason": "Quarterly audit assessment adjustment",
+        }
+        adj = create_tax_adjustment(company=self.company, user=self.finance_user, data=data)
+        self.assertEqual(adj.status, "draft")
+        self.assertTrue(adj.adjustment_number.startswith("TAX-ADJ-2026-"))
+
+        # Post adjustment
+        posted_adj = post_tax_adjustment(adj.id, user=self.finance_user, company=self.company)
+        self.assertEqual(posted_adj.status, "posted")
+        self.assertIsNotNone(posted_adj.journal_entry)
+        self.assertEqual(posted_adj.journal_entry.status, "posted")
+
+        # Verify tax line created
+        adj_line = TaxTransactionLine.objects.filter(
+            company=self.company,
+            source_module="tax_adjustment",
+            source_id=str(adj.id),
+        ).first()
+        self.assertIsNotNone(adj_line)
+        self.assertEqual(adj_line.tax_amount, Decimal("100.00"))
+
+        # Reverse adjustment
+        rev_adj = reverse_tax_adjustment(
+            adjustment_id=adj.id,
+            reason="Incorrect audit calculation",
+            user=self.finance_user,
+            company=self.company,
+        )
+        self.assertEqual(rev_adj.status, "reversed")
+        self.assertIsNotNone(rev_adj.reversal_journal_entry)
+
+        adj_line.refresh_from_db()
+        self.assertTrue(adj_line.is_reversed)
+
+        # Duplicate reversal raises error
+        with self.assertRaises(ValidationError):
+            reverse_tax_adjustment(
+                adjustment_id=adj.id,
+                reason="Duplicate reversal attempt",
+                user=self.finance_user,
+                company=self.company,
+            )
+
+    def test_tax_adjustment_closed_period_rejected(self):
+        """Adjustment posting is rejected if period is closed."""
+        period = AccountingPeriod.objects.filter(
+            fiscal_year__company=self.company,
+            start_date__lte=date(2026, 1, 15),
+            end_date__gte=date(2026, 1, 15),
+        ).first()
+        self.assertIsNotNone(period)
+        period.status = "closed"
+        period.save()
+
+        data = {
+            "tax_account_id": self.sales_tax_acc.id,
+            "offset_account_id": self.expense_offset_acc.id,
+            "adjustment_direction": "decrease_liability",
+            "tax_amount": Decimal("50.00"),
+            "adjustment_date": date(2026, 1, 15),
+            "reason": "Closed period test",
+        }
+        adj = create_tax_adjustment(company=self.company, user=self.finance_user, data=data)
+
+        with self.assertRaises(ValidationError):
+            post_tax_adjustment(adj.id, user=self.finance_user, company=self.company)
+
+    def test_tax_line_reversal_api(self):
+        """POST /api/accounting/tax-lines/{id}/reverse/ reverses transaction tax line."""
+        line = record_tax_line(
+            company=self.company,
+            source_module="manual",
+            source_id="888",
+            source_reference="MAN-TAX-01",
+            taxable_amount=Decimal("500.00"),
+            tax_rate=Decimal("10.0000"),
+            tax_amount=Decimal("50.00"),
+            transaction_date=date(2026, 3, 10),
+            tax_account=self.sales_tax_acc,
+            actor=self.finance_user,
+        )
+        res = self.client.post(f"/api/accounting/tax-lines/{line.id}/reverse/", {"reason": "Manual error corrected"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data["is_reversed"])
+
+    def test_tax_summary_and_report_endpoints(self):
+        """GET /api/accounting/taxes/summary/ and report/ return valid aggregates."""
+        record_tax_line(
+            company=self.company,
+            source_module="sales",
+            source_id="1",
+            source_reference="INV-SUM-1",
+            taxable_amount=Decimal("1000.00"),
+            tax_rate=Decimal("10.0000"),
+            tax_amount=Decimal("100.00"),
+            transaction_date=date(2026, 3, 5),
+            tax_code=self.std_code,
+            tax_account=self.sales_tax_acc,
+            actor=self.finance_user,
+        )
+
+        sum_res = self.client.get("/api/accounting/taxes/summary/")
+        self.assertEqual(sum_res.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(sum_res.data["total_taxable_amount"], 1000.0)
+        self.assertGreaterEqual(sum_res.data["total_tax_amount"], 100.0)
+
+        rep_res = self.client.get("/api/accounting/taxes/report/")
+        self.assertEqual(rep_res.status_code, status.HTTP_200_OK)
+        self.assertIn("records", rep_res.data)
+        self.assertIn("account_reconciliations", rep_res.data)
+
+    def test_tax_audit_trail_endpoint(self):
+        """GET /api/accounting/taxes/audit-trail/ returns immutable audit entries."""
+        res = self.client.get("/api/accounting/taxes/audit-trail/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(res.data, list)
+
+    def test_company_isolation(self):
+        """Company A cannot view or manipulate Company B's tax records."""
+        other_code = TaxCode.objects.create(
+            company=self.other_company,
+            code="RIVAL-15",
+            name="Rival 15%",
+            rate=Decimal("15.0000"),
+            tax_account=Account.objects.filter(company=self.other_company, children__isnull=True).first(),
+        )
+
+        res = self.client.get(f"/api/accounting/tax-codes/{other_code.id}/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unauthorized_user_forbidden(self):
+        """Non-finance users are rejected with 403 Forbidden."""
+        worker = User.objects.create_user(
+            username="brewer_sam",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.client.force_authenticate(user=worker)
+        res = self.client.get("/api/accounting/tax-codes/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class JournalEntryEnhancementsTestCase(APITestCase):
+    """
+    Blueprint Section #20: Journal Entries Enhancements Test Suite.
+    Verifies:
+    - Manual journal entry creation with entry types and explanations
+    - Draft editing and line manipulation
+    - Real-time double-entry equilibrium and validation
+    - Approval workflow: Draft -> Submitted -> Approved / Rejected -> Posted
+    - Rejection requires reason and allows re-drafting
+    - Posting approved journals to General Ledger
+    - Attachments upload and deletion with audit trail
+    - Controlled reversals with reason, custom date, and inverted lines
+    - Duplicate reversal prevention
+    - Immutable chronological audit trail
+    - Company isolation and multi-tenancy enforcement
+    - Permission controls (IsFinanceOrAdmin)
+    - Closed period and lock date posting protection
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Apex Brewing Co")
+        self.other_company = Company.objects.create(name="Rival Brewing Co")
+
+        self.user = User.objects.create_user(
+            username="finance_officer",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.client.force_authenticate(user=self.user)
+
+        ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_chart_of_accounts(self.other_company)
+
+        self.cash_account = Account.objects.get(company=self.company, code="1010")
+        self.expense_account = Account.objects.get(company=self.company, code="6010")
+        self.revenue_account = Account.objects.get(company=self.company, code="4010")
+
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+        self.period = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            name="Jan 2026",
+            period_number=1,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+
+    def test_manual_journal_creation_with_type_and_explanation(self):
+        """Creates draft journal entry with explicit entry_type and detailed explanation."""
+        payload = {
+            "entry_type": "adjusting",
+            "transaction_date": "2026-01-15",
+            "reference": "ADJ-2026-001",
+            "description": "Accrue month-end electricity utility",
+            "explanation": "Electricity invoice not received before cutoff; accrued based on prior meter reading.",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "450.00", "credit": "0.00", "description": "Utilities expense"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "450.00", "description": "Accrued utilities payable"},
+            ],
+        }
+        res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data["status"], "draft")
+        self.assertEqual(res.data["entry_type"], "adjusting")
+        self.assertEqual(res.data["explanation"], payload["explanation"])
+        self.assertEqual(res.data["total_debit"], "450.00")
+        self.assertEqual(res.data["total_credit"], "450.00")
+        self.assertTrue(res.data["is_balanced"])
+
+        # Verify audit log CREATED
+        entry = JournalEntry.objects.get(pk=res.data["id"])
+        self.assertTrue(entry.audit_logs.filter(action="CREATED").exists())
+
+    def test_draft_modification_and_line_updates(self):
+        """Draft journal entries can be modified and lines replaced prior to posting."""
+        payload = {
+            "entry_type": "manual",
+            "transaction_date": "2026-01-15",
+            "reference": "MJE-01",
+            "description": "Original narration",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "100.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "100.00"},
+            ],
+        }
+        create_res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = create_res.data["id"]
+
+        update_payload = {
+            "description": "Updated narration",
+            "explanation": "Added audit reasoning",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "200.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "200.00"},
+            ],
+        }
+        patch_res = self.client.patch(f"/api/accounting/journal-entries/{entry_id}/", update_payload, format="json")
+        self.assertEqual(patch_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(patch_res.data["description"], "Updated narration")
+        self.assertEqual(patch_res.data["total_debit"], "200.00")
+
+        # Verify audit log UPDATED
+        entry = JournalEntry.objects.get(pk=entry_id)
+        self.assertTrue(entry.audit_logs.filter(action="UPDATED").exists())
+
+    def test_unbalanced_manual_journal_rejected_on_submit(self):
+        """Unbalanced journal entries cannot be submitted for approval."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "500.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "400.00"},
+            ],
+        }
+        create_res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = create_res.data["id"]
+
+        submit_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/submit/")
+        self.assertEqual(submit_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("error", submit_res.data)
+
+    def test_full_approval_workflow_lifecycle(self):
+        """Tests complete workflow: Draft -> Submitted -> Approved -> Posted."""
+        payload = {
+            "entry_type": "manual",
+            "transaction_date": "2026-01-15",
+            "reference": "WF-001",
+            "description": "Office supplies purchase",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "300.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "300.00"},
+            ],
+        }
+        create_res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = create_res.data["id"]
+        self.assertEqual(create_res.data["status"], "draft")
+
+        # 1. Submit for approval
+        sub_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/submit/")
+        self.assertEqual(sub_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(sub_res.data["status"], "submitted")
+        self.assertIsNotNone(sub_res.data["submitted_at"])
+
+        # 2. Approve entry
+        app_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/approve/")
+        self.assertEqual(app_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(app_res.data["status"], "approved")
+        self.assertIsNotNone(app_res.data["approved_at"])
+
+        # 3. Post approved entry to General Ledger
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(post_res.data["status"], "posted")
+        self.assertIsNotNone(post_res.data["posted_at"])
+
+    def test_rejection_workflow_and_revision(self):
+        """Tests rejection requiring reason, reverting to draft, and resubmitting."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "150.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "150.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/submit/")
+
+        # Reject without reason fails
+        rej_fail = self.client.post(f"/api/accounting/journal-entries/{entry_id}/reject/", {"reason": ""}, format="json")
+        self.assertEqual(rej_fail.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Reject with valid reason
+        rej_ok = self.client.post(
+            f"/api/accounting/journal-entries/{entry_id}/reject/",
+            {"reason": "Expense category requires additional vendor invoice."},
+            format="json"
+        )
+        self.assertEqual(rej_ok.status_code, status.HTTP_200_OK)
+        self.assertEqual(rej_ok.data["status"], "rejected")
+        self.assertEqual(rej_ok.data["rejection_reason"], "Expense category requires additional vendor invoice.")
+
+        # Revert to draft for revision
+        rev_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/revert-draft/")
+        self.assertEqual(rev_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rev_res.data["status"], "draft")
+
+    def test_cannot_modify_or_delete_posted_entry(self):
+        """Posted journal entries are strictly immutable and cannot be patched or deleted."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "100.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "100.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        # Attempt to modify
+        patch_res = self.client.patch(f"/api/accounting/journal-entries/{entry_id}/", {"description": "Tampered"}, format="json")
+        self.assertEqual(patch_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Attempt to delete
+        del_res = self.client.delete(f"/api/accounting/journal-entries/{entry_id}/")
+        self.assertEqual(del_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reverse_posted_entry_with_tracking_and_audit(self):
+        """Reversing a posted journal entry creates an inverted entry, updates status, and logs audit."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "reference": "REV-ORIG-1",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "800.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "800.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        # Reverse with reason
+        rev_res = self.client.post(
+            f"/api/accounting/journal-entries/{entry_id}/reverse/",
+            {"reason": "Entry posted to wrong cost account", "transaction_date": "2026-01-20"},
+            format="json"
+        )
+        self.assertEqual(rev_res.status_code, status.HTTP_201_CREATED)
+        reversal_id = rev_res.data["id"]
+
+        # Check original entry
+        orig = JournalEntry.objects.get(pk=entry_id)
+        self.assertEqual(orig.status, "reversed")
+        self.assertIsNotNone(orig.reversed_at)
+        self.assertEqual(orig.reversal_reason, "Entry posted to wrong cost account")
+
+        # Check reversal entry
+        reversal = JournalEntry.objects.get(pk=reversal_id)
+        self.assertEqual(reversal.status, "posted")
+        self.assertEqual(reversal.entry_type, "reversal")
+        self.assertEqual(reversal.reversal_of_id, orig.id)
+
+        # Verify inverted lines: Expense has Credit 800, Cash has Debit 800
+        exp_line = reversal.lines.get(account=self.expense_account)
+        self.assertEqual(exp_line.credit, Decimal("800.00"))
+        self.assertEqual(exp_line.debit, Decimal("0.00"))
+
+        # Verify duplicate reversal is prevented
+        dup_rev = self.client.post(f"/api/accounting/journal-entries/{entry_id}/reverse/", {"reason": "Duplicate"}, format="json")
+        self.assertEqual(dup_rev.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_attachment_upload_and_deletion(self):
+        """Allows uploading and deleting supporting documentation attachments."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "50.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "50.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+
+        # Upload attachment
+        file_content = b"PDF invoice memo sample binary data"
+        uploaded_file = SimpleUploadedFile("vendor_receipt.pdf", file_content, content_type="application/pdf")
+
+        upload_res = self.client.post(
+            f"/api/accounting/journal-entries/{entry_id}/upload-attachment/",
+            {"file": uploaded_file, "description": "Original vendor receipt scanned"},
+            format="multipart"
+        )
+        self.assertEqual(upload_res.status_code, status.HTTP_201_CREATED)
+        attachment_id = upload_res.data["id"]
+        self.assertEqual(upload_res.data["filename"], "vendor_receipt.pdf")
+
+        # Verify audit log ATTACHMENT_ADDED
+        entry = JournalEntry.objects.get(pk=entry_id)
+        self.assertTrue(entry.audit_logs.filter(action="ATTACHMENT_ADDED").exists())
+
+        # Delete attachment
+        del_res = self.client.delete(f"/api/accounting/journal-entries/{entry_id}/attachments/{attachment_id}/")
+        self.assertEqual(del_res.status_code, status.HTTP_204_NO_CONTENT)
+
+        # Verify audit log ATTACHMENT_REMOVED
+        self.assertTrue(entry.audit_logs.filter(action="ATTACHMENT_REMOVED").exists())
+
+    def test_audit_trail_endpoint(self):
+        """GET /api/accounting/journal-entries/{id}/audit-trail/ returns immutable chronological history."""
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "75.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "75.00"},
+            ],
+        }
+        entry_id = self.client.post("/api/accounting/journal-entries/", payload, format="json").data["id"]
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/submit/")
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/approve/")
+        self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+
+        res = self.client.get(f"/api/accounting/journal-entries/{entry_id}/audit-trail/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        actions = [log["action"] for log in res.data]
+        self.assertIn("CREATED", actions)
+        self.assertIn("SUBMITTED", actions)
+        self.assertIn("APPROVED", actions)
+        self.assertIn("POSTED", actions)
+
+    def test_company_isolation(self):
+        """Company A users cannot view, submit, or manipulate Company B's journal entries."""
+        other_entry = JournalEntry.objects.create(
+            company=self.other_company,
+            entry_number="JE-RIVAL-001",
+            transaction_date=date(2026, 1, 15),
+            status="draft",
+        )
+        res = self.client.get(f"/api/accounting/journal-entries/{other_entry.id}/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+        post_res = self.client.post(f"/api/accounting/journal-entries/{other_entry.id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unauthorized_user_forbidden(self):
+        """Non-finance users are rejected with 403 Forbidden."""
+        operator = User.objects.create_user(
+            username="keg_filler",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.client.force_authenticate(user=operator)
+        res = self.client.get("/api/accounting/journal-entries/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_period_closed_prevents_posting(self):
+        """Posting to a closed accounting period is rejected."""
+        self.period.status = "closed"
+        self.period.save()
+
+        payload = {
+            "transaction_date": "2026-01-15",
+            "lines": [
+                {"account": self.expense_account.id, "debit": "100.00", "credit": "0.00"},
+                {"account": self.cash_account.id, "debit": "0.00", "credit": "100.00"},
+            ],
+        }
+        create_res = self.client.post("/api/accounting/journal-entries/", payload, format="json")
+        entry_id = create_res.data["id"]
+
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("accounting_period", str(post_res.data))
+
+
+class PeriodClosingTestCase(TestCase):
+    """
+    Blueprint #21: Period Closing Test Suite.
+    Verifies:
+    - Fiscal year and accounting period definition
+    - Open/locked/closed status tracking
+    - Unauthorized posting prevention into closed/locked periods
+    - Pre-closing verification checks (drafts, equilibrium, subledgers)
+    - Trial Balance generation and balance verification
+    - Closing adjustments tracking
+    - Controlled period reopening with authorized reasons
+    - Year-end closing with Retained Earnings entry generation
+    - Immutable period audit logging
+    - Multi-tenant company isolation & role-based permissions
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.company = Company.objects.create(name="BrewCo Period Closing Ltd")
+        self.other_company = Company.objects.create(name="Rival Brewing Ltd")
+
+        self.finance_user = User.objects.create_user(
+            username="period_manager",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.client.force_authenticate(user=self.finance_user)
+
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+
+        self.p1 = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+        self.p2 = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=2,
+            name="Feb 2026",
+            start_date=date(2026, 2, 1),
+            end_date=date(2026, 2, 28),
+            status="open",
+        )
+
+        ensure_account_types()
+        self.asset_type = AccountType.objects.get(name="Cash & Cash Equivalents")
+        self.equity_type = AccountType.objects.get(name="Retained Earnings")
+        self.rev_type = AccountType.objects.get(name="Operating Sales Revenue")
+        self.exp_type = AccountType.objects.get(name="Cost of Goods Sold (Raw Materials)")
+
+        self.bank_account = Account.objects.create(
+            company=self.company,
+            code="1010",
+            name="Operating Bank Account",
+            account_type=self.asset_type,
+            is_active=True,
+        )
+        self.revenue_account = Account.objects.create(
+            company=self.company,
+            code="4010",
+            name="Beer Sales Revenue",
+            account_type=self.rev_type,
+            is_active=True,
+        )
+        self.expense_account = Account.objects.create(
+            company=self.company,
+            code="5010",
+            name="Raw Materials Expense",
+            account_type=self.exp_type,
+            is_active=True,
+        )
+        self.retained_earnings = Account.objects.create(
+            company=self.company,
+            code="3200",
+            name="Retained Earnings",
+            account_type=self.equity_type,
+            is_active=True,
+        )
+
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+            current_fiscal_year=self.fy,
+            retained_earnings_account=self.retained_earnings,
+        )
+
+    def _create_and_post_entry(self, dt, dr_acc, cr_acc, amount, entry_type="manual", desc="Test Entry"):
+        entry = JournalEntry.objects.create(
+            company=self.company,
+            transaction_date=dt,
+            description=desc,
+            entry_type=entry_type,
+            status="draft",
+            created_by=self.finance_user,
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=dr_acc,
+            line_number=1,
+            debit=Decimal(amount),
+            credit=Decimal("0.00"),
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=cr_acc,
+            line_number=2,
+            debit=Decimal("0.00"),
+            credit=Decimal(amount),
+        )
+        return post_journal_entry(entry.id, self.finance_user, company=self.company)
+
+    def test_period_lock_and_unlock_lifecycle(self):
+        """Period can be locked and unlocked with status updates and audit logs."""
+        res = self.client.post(f"/api/accounting/periods/{self.p1.id}/lock/", {"reason": "End of month freeze"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.status, "locked")
+        self.assertIsNotNone(self.p1.locked_at)
+        self.assertEqual(self.p1.locked_by, self.finance_user)
+
+        # Unlock
+        res = self.client.post(f"/api/accounting/periods/{self.p1.id}/unlock/", format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.status, "open")
+
+    def test_locked_period_prevents_posting(self):
+        """Locked period prevents journal posting and submission."""
+        self.p1.lock_period(user=self.finance_user)
+
+        entry = JournalEntry.objects.create(
+            company=self.company,
+            transaction_date=date(2026, 1, 15),
+            status="draft",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=entry, account=self.expense_account, line_number=1, debit=Decimal("50.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=entry, account=self.bank_account, line_number=2, debit=Decimal("0.00"), credit=Decimal("50.00"))
+
+        # Submit should be rejected
+        sub_res = self.client.post(f"/api/accounting/journal-entries/{entry.id}/submit/")
+        self.assertEqual(sub_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("locked", str(sub_res.data))
+
+        # Direct post should also be rejected
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry.id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_period_closing_and_posting_rejection(self):
+        """Closing a period finalizes it and blocks all postings."""
+        close_res = self.client.post(f"/api/accounting/periods/{self.p1.id}/close/", format="json")
+        self.assertEqual(close_res.status_code, status.HTTP_200_OK)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.status, "closed")
+        self.assertIsNotNone(self.p1.closed_at)
+        self.assertEqual(self.p1.closed_by, self.finance_user)
+
+        # Attempt to post entry into closed period
+        entry = JournalEntry.objects.create(company=self.company, transaction_date=date(2026, 1, 20), status="draft")
+        JournalEntryLine.objects.create(company=self.company, journal_entry=entry, account=self.expense_account, line_number=1, debit=Decimal("100.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=entry, account=self.bank_account, line_number=2, debit=Decimal("0.00"), credit=Decimal("100.00"))
+
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry.id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("closed", str(post_res.data).lower())
+
+    def test_controlled_period_reopening_requires_reason(self):
+        """Reopening a closed period requires an authorized user and a non-empty reason."""
+        self.p1.close_period(user=self.finance_user)
+
+        # Attempt reopen without reason
+        res_no_reason = self.client.post(f"/api/accounting/periods/{self.p1.id}/reopen/", {"reason": ""}, format="json")
+        self.assertEqual(res_no_reason.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Attempt reopen with short reason
+        res_short = self.client.post(f"/api/accounting/periods/{self.p1.id}/reopen/", {"reason": "fix"}, format="json")
+        self.assertEqual(res_short.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Reopen with valid authorized reason
+        reopen_reason = "Auditor requested depreciation reclassification"
+        res_valid = self.client.post(f"/api/accounting/periods/{self.p1.id}/reopen/", {"reason": reopen_reason}, format="json")
+        self.assertEqual(res_valid.status_code, status.HTTP_200_OK)
+
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.status, "open")
+        self.assertEqual(self.p1.reopen_reason, reopen_reason)
+        self.assertIsNotNone(self.p1.reopened_at)
+        self.assertEqual(self.p1.reopened_by, self.finance_user)
+
+    def test_reopen_period_in_closed_fiscal_year_rejected(self):
+        """Cannot reopen an accounting period if the parent fiscal year is closed."""
+        self.p1.close_period(user=self.finance_user)
+        self.p2.close_period(user=self.finance_user)
+        self.fy.close_year(user=self.finance_user)
+
+        res = self.client.post(
+            f"/api/accounting/periods/{self.p1.id}/reopen/",
+            {"reason": "Attempting late post-closing audit entry"},
+            format="json"
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("fiscal year", str(res.data).lower())
+
+    def test_period_closing_checks_endpoint(self):
+        """Closing checks endpoint evaluates draft entries and trial balance."""
+        # Create unposted draft entry in period
+        JournalEntry.objects.create(
+            company=self.company,
+            transaction_date=date(2026, 1, 10),
+            status="draft",
+        )
+        res = self.client.get(f"/api/accounting/periods/{self.p1.id}/closing-checks/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+        self.assertTrue(data["has_warnings"])
+        draft_check = next(c for c in data["checks"] if c["id"] == "draft_journals")
+        self.assertEqual(draft_check["status"], "warning")
+        self.assertEqual(draft_check["count"], 1)
+
+    def test_period_trial_balance_equilibrium(self):
+        """Trial Balance endpoint accurately calculates debits, credits, and confirms equilibrium."""
+        # Post sales: Bank 1000 Dr, Revenue 1000 Cr
+        self._create_and_post_entry(date(2026, 1, 5), self.bank_account, self.revenue_account, "1000.00")
+        # Post expense: Expense 400 Dr, Bank 400 Cr
+        self._create_and_post_entry(date(2026, 1, 12), self.expense_account, self.bank_account, "400.00")
+
+        res = self.client.get(f"/api/accounting/periods/{self.p1.id}/trial-balance/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        tb = res.data
+        self.assertTrue(tb["totals"]["is_balanced"])
+        self.assertEqual(tb["totals"]["difference"], "0.00")
+        self.assertEqual(Decimal(tb["totals"]["total_period_debit"]), Decimal("1400.00"))
+        self.assertEqual(Decimal(tb["totals"]["total_period_credit"]), Decimal("1400.00"))
+
+    def test_period_adjustments_filtering(self):
+        """Adjustments endpoint returns only adjusting and closing entries for the period."""
+        # Create standard manual entry
+        self._create_and_post_entry(date(2026, 1, 10), self.bank_account, self.revenue_account, "200.00", entry_type="manual")
+        # Create adjusting entry
+        self._create_and_post_entry(date(2026, 1, 31), self.expense_account, self.bank_account, "50.00", entry_type="adjusting", desc="Accrued Utilities Adjustment")
+
+        res = self.client.get(f"/api/accounting/periods/{self.p1.id}/adjustments/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data), 1)
+        self.assertEqual(res.data[0]["entry_type"], "adjusting")
+
+    def test_period_audit_trail_recorded(self):
+        """All period lifecycle events (lock, unlock, close, reopen) are logged in the audit trail."""
+        self.client.post(f"/api/accounting/periods/{self.p1.id}/lock/", {"reason": "Monthly audit"}, format="json")
+        self.client.post(f"/api/accounting/periods/{self.p1.id}/unlock/", format="json")
+        self.client.post(f"/api/accounting/periods/{self.p1.id}/close/", format="json")
+        self.client.post(f"/api/accounting/periods/{self.p1.id}/reopen/", {"reason": "Quarterly reconciliations"}, format="json")
+
+        res = self.client.get(f"/api/accounting/periods/{self.p1.id}/audit-trail/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        actions = [log["action"] for log in res.data]
+        self.assertIn("LOCKED", actions)
+        self.assertIn("UNLOCKED", actions)
+        self.assertIn("CLOSED", actions)
+        self.assertIn("REOPENED", actions)
+
+    def test_fiscal_year_close_requires_all_periods_closed(self):
+        """Fiscal year cannot be closed while any of its periods remain open."""
+        # p1 is closed, p2 is open
+        self.p1.close_period(user=self.finance_user)
+
+        res = self.client.post(f"/api/accounting/fiscal-years/{self.fy.id}/close_year/", format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not closed", str(res.data).lower())
+
+    def test_fiscal_year_close_generates_retained_earnings_entry(self):
+        """Closing fiscal year generates closing entry zeroing out P&L accounts to Retained Earnings."""
+        # Post Net Profit of $1500: Revenue 2000 Cr, Expense 500 Dr
+        self._create_and_post_entry(date(2026, 1, 10), self.bank_account, self.revenue_account, "2000.00")
+        self._create_and_post_entry(date(2026, 2, 10), self.expense_account, self.bank_account, "500.00")
+
+        # Close all periods
+        self.p1.close_period(user=self.finance_user)
+        self.p2.close_period(user=self.finance_user)
+
+        res = self.client.post(
+            f"/api/accounting/fiscal-years/{self.fy.id}/close_year/",
+            {"generate_closing_entry": True},
+            format="json"
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.fy.refresh_from_db()
+        self.assertTrue(self.fy.is_closed)
+        self.assertIsNotNone(self.fy.closed_at)
+
+        # Check closing entry created
+        closing_entry = JournalEntry.objects.filter(
+            company=self.company,
+            entry_type="closing",
+            status="posted",
+        ).first()
+        self.assertIsNotNone(closing_entry)
+        self.assertEqual(closing_entry.reference, f"YE-CLOSE-{self.fy.name}")
+
+    def test_fiscal_year_reopen_with_reason(self):
+        """Fiscal year can be reopened with a valid reason."""
+        self.p1.close_period(user=self.finance_user)
+        self.p2.close_period(user=self.finance_user)
+        self.fy.close_year(user=self.finance_user)
+
+        # Reopen without reason -> fails
+        res_fail = self.client.post(f"/api/accounting/fiscal-years/{self.fy.id}/reopen_year/", {"reason": ""}, format="json")
+        self.assertEqual(res_fail.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Reopen with reason -> succeeds
+        res_ok = self.client.post(
+            f"/api/accounting/fiscal-years/{self.fy.id}/reopen_year/",
+            {"reason": "Board-approved restatement of fiscal year"},
+            format="json"
+        )
+        self.assertEqual(res_ok.status_code, status.HTTP_200_OK)
+        self.fy.refresh_from_db()
+        self.assertFalse(self.fy.is_closed)
+        self.assertIsNotNone(self.fy.reopened_at)
+
+    def test_company_isolation_on_periods(self):
+        """Users cannot access or modify periods belonging to another company."""
+        other_fy = FiscalYear.objects.create(
+            company=self.other_company,
+            name="Rival FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+        other_p = AccountingPeriod.objects.create(
+            company=self.other_company,
+            fiscal_year=other_fy,
+            period_number=1,
+            name="Rival Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+        )
+        res = self.client.post(f"/api/accounting/periods/{other_p.id}/lock/", format="json")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+        res_close = self.client.post(f"/api/accounting/periods/{other_p.id}/close/", format="json")
+        self.assertEqual(res_close.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unauthorized_user_period_operations_forbidden(self):
+        """Non-finance/admin users receive 403 Forbidden on period management actions."""
+        warehouse_user = User.objects.create_user(
+            username="forklift_joe",
+            password="password123",
+            company=self.company,
+            role="store",
+        )
+        self.client.force_authenticate(user=warehouse_user)
+
+        res = self.client.post(f"/api/accounting/periods/{self.p1.id}/lock/", format="json")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_close = self.client.post(f"/api/accounting/periods/{self.p1.id}/close/", format="json")
+        self.assertEqual(res_close.status_code, status.HTTP_403_FORBIDDEN)
 

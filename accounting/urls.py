@@ -15,6 +15,20 @@ from .views import (
     SalesAccountingViewSet,
     AutoPostingLogViewSet,
     PurchaseAccountingViewSet,
+    InventoryAccountingViewSet,
+    ManufacturingAccountingViewSet,
+    ExpenseCategoryViewSet,
+    ExpenseViewSet,
+    BankAccountViewSet,
+    BankTransactionViewSet,
+    BankReconciliationViewSet,
+    BankingSummaryViewSet,
+    PaymentViewSet,
+    PaymentAllocationViewSet,
+    TaxCodeViewSet,
+    TaxTransactionLineViewSet,
+    TaxAdjustmentViewSet,
+    TaxManagementViewSet,
 )
 
 router = DefaultRouter()
@@ -32,7 +46,23 @@ router.register(r'payables', AccountsPayableViewSet, basename='accounting-payabl
 router.register(r'sales', SalesAccountingViewSet, basename='accounting-sales')
 router.register(r'auto-posting', AutoPostingLogViewSet, basename='accounting-auto-posting')
 router.register(r'purchases', PurchaseAccountingViewSet, basename='accounting-purchases')
+router.register(r'inventory', InventoryAccountingViewSet, basename='accounting-inventory')
+router.register(r'manufacturing', ManufacturingAccountingViewSet, basename='accounting-manufacturing')
+router.register(r'expenses', ExpenseViewSet, basename='accounting-expenses')
+router.register(r'expense-categories', ExpenseCategoryViewSet, basename='accounting-expense-categories')
+router.register(r'bank-accounts', BankAccountViewSet, basename='accounting-bank-accounts')
+router.register(r'bank-transactions', BankTransactionViewSet, basename='accounting-bank-transactions')
+router.register(r'bank-reconciliations', BankReconciliationViewSet, basename='accounting-bank-reconciliations')
+router.register(r'banking', BankingSummaryViewSet, basename='accounting-banking')
+router.register(r'payments', PaymentViewSet, basename='accounting-payments')
+router.register(r'payment-allocations', PaymentAllocationViewSet, basename='accounting-payment-allocations')
+router.register(r'tax-codes', TaxCodeViewSet, basename='accounting-tax-codes')
+router.register(r'tax-lines', TaxTransactionLineViewSet, basename='accounting-tax-lines')
+router.register(r'tax-adjustments', TaxAdjustmentViewSet, basename='accounting-tax-adjustments')
+router.register(r'taxes', TaxManagementViewSet, basename='accounting-taxes')
 
 urlpatterns = [
     path('', include(router.urls)),
 ]
+
+

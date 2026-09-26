@@ -294,6 +294,29 @@ def post_sales_invoice_to_accounting(
         # Synchronize customer's balance_due
         sync_customer_balance(invoice.customer)
 
+        # Blueprint #19 Tax Layer Integration
+        if tax_val > Decimal("0.00") and tax_account:
+            try:
+                from .tax import record_tax_line
+                tax_rate_val = Decimal("0.0000")
+                if net_sales > Decimal("0.00"):
+                    tax_rate_val = (tax_val / net_sales * Decimal("100.0000")).quantize(Decimal("0.0001"))
+                record_tax_line(
+                    company=company,
+                    source_module="sales",
+                    source_id=str(invoice.id),
+                    source_reference=f"INV-{invoice.id}",
+                    taxable_amount=net_sales,
+                    tax_rate=tax_rate_val,
+                    tax_amount=tax_val,
+                    transaction_date=invoice.invoice_date,
+                    tax_account=tax_account,
+                    journal_entry=posted_entry,
+                    actor=user,
+                )
+            except Exception:
+                pass
+
         return posted_entry
 
 
@@ -339,6 +362,23 @@ def reverse_sales_invoice_accounting(invoice_id, user, company, reason=""):
 
         # Re-synchronize customer balance
         sync_customer_balance(invoice.customer)
+
+        # Blueprint #19 Tax Layer Integration: mark tax lines as reversed
+        try:
+            from .models import TaxTransactionLine
+            TaxTransactionLine.objects.filter(
+                company=company,
+                source_module="sales",
+                source_id=str(invoice.id),
+                is_reversed=False,
+            ).update(
+                is_reversed=True,
+                reversed_at=timezone.now(),
+                reversal_reference="Reversed via invoice cancellation",
+                reversal_journal_entry=reversal_je,
+            )
+        except Exception:
+            pass
 
         return {
             "invoice_id": invoice.id,

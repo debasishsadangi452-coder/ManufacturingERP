@@ -51,7 +51,12 @@ class FiscalYearLifecycleTests(APITestCase):
 
     def test_closing_the_year_allows_starting_the_next_one(self):
         current = self.client.get(URL).data[0]
-        self.assertEqual(self.client.post(f"{URL}{current['id']}/close_year/").status_code, status.HTTP_200_OK)
+        # A year can only be closed once every month in it is closed.
+        res = self.client.post(f"{URL}{current['id']}/close_year/")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        AccountingPeriod.objects.filter(fiscal_year_id=current["id"]).update(status="closed")
+        res = self.client.post(f"{URL}{current['id']}/close_year/", {"generate_closing_entry": False}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
 
         res = self.client.post(f"{URL}start_next_year/")
         self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
@@ -63,7 +68,7 @@ class FiscalYearLifecycleTests(APITestCase):
         self.assertEqual(AccountingSettings.objects.get(company=self.company).current_fiscal_year_id, res.data["id"])
 
         # Only one year can be open: the previous one can't be reopened now.
-        res = self.client.post(f"{URL}{current['id']}/reopen_year/")
+        res = self.client.post(f"{URL}{current['id']}/reopen_year/", {"reason": "Late supplier invoice"}, format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(f"FY {nxt} is open", res.data["error"])
 
