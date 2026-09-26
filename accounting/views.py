@@ -1,3 +1,4 @@
+from decimal import Decimal
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -3822,6 +3823,100 @@ class UIArchitectureViewSet(viewsets.ViewSet):
             return Response(data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #27 — ROLES & PERMISSIONS VIEWS
+# ==============================================================================
+
+from .roles_permissions import (
+    get_roles_permissions_metadata,
+    verify_roles_permissions_health,
+    evaluate_permission_pipeline,
+    resolve_accounting_role,
+)
+
+
+class RolesPermissionsViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #27 — Roles & Permissions API.
+    Provides complete definition of the 7 Accounting Roles, Action-Role matrix,
+    granular permission evaluation, and the 6-stage permission check pipeline
+    (User -> Role -> Permission -> Action -> Approval Rule -> Post/Reject).
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        """GET /api/accounting/roles-permissions/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_roles_permissions_metadata(company=company, user=request.user)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="my-permissions")
+    def my_permissions(self, request):
+        """GET /api/accounting/roles-permissions/my-permissions/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            meta = get_roles_permissions_metadata(company=company, user=request.user)
+            return Response(meta.get("current_user", {}), status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="check")
+    def check_permission(self, request):
+        """POST /api/accounting/roles-permissions/check/ - Evaluates permission check pipeline."""
+        action = request.data.get("action")
+        if not action:
+            return Response({"error": "Field 'action' is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Allow testing simulation with a target role if provided, else use current user
+        simulated_role = request.data.get("simulated_role")
+        user_to_check = request.user
+        if simulated_role and (request.user.role == "admin" or request.user.is_superuser):
+            # Create lightweight mock user for simulation
+            class SimulatedUser:
+                is_authenticated = True
+                id = 9999
+                username = f"simulated_{simulated_role}"
+                role = simulated_role
+                auto_approve_limit = Decimal("10000.00") if simulated_role == "finance" else Decimal("0.00")
+
+            user_to_check = SimulatedUser()
+
+        decision = evaluate_permission_pipeline(user=user_to_check, action=action)
+        return Response(decision, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"], url_path="health")
+    def health(self, request):
+        """GET /api/accounting/roles-permissions/health/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_roles_permissions_health(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="verify")
+    def verify(self, request):
+        """POST /api/accounting/roles-permissions/verify/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_roles_permissions_health(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 
 
 

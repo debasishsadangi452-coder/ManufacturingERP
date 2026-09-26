@@ -7809,5 +7809,237 @@ class UIArchitectureTestCase(TestCase):
         self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+class RolesPermissionsTestCase(TestCase):
+    """
+    Blueprint Section #27: Roles & Permissions Test Suite.
+    Verifies 7 Core Accounting Roles, Action-Role Matrix, 6-Stage Permission Pipeline,
+    Separation of Duties, DRF permission classes, company isolation, and health checks.
+    """
+    def setUp(self):
+        self.company = Company.objects.create(name="Roles Test Brewery Co", slug="roles-test-brewery-co")
+        self.company_b = Company.objects.create(name="Competitor Roles Co", slug="competitor-roles-co")
+
+        # Create users representing the personas
+        self.admin_user = User.objects.create_user(
+            username="acct_admin",
+            password="testpassword123",
+            company=self.company,
+            role="admin",
+        )
+        self.finance_mgr = User.objects.create_user(
+            username="finance_manager",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+            auto_approve_limit=Decimal("10000.00"),
+        )
+        self.accountant = User.objects.create_user(
+            username="staff_accountant",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+            auto_approve_limit=Decimal("0.00"),
+        )
+        self.sales_user = User.objects.create_user(
+            username="sales_rep",
+            password="testpassword123",
+            company=self.company,
+            role="sales",
+        )
+        self.store_user = User.objects.create_user(
+            username="store_keeper",
+            password="testpassword123",
+            company=self.company,
+            role="store",
+        )
+        self.operator_user = User.objects.create_user(
+            username="brewery_operator",
+            password="testpassword123",
+            company=self.company,
+            role="production",
+        )
+        self.user_b = User.objects.create_user(
+            username="tenant_b_finance",
+            password="testpassword123",
+            company=self.company_b,
+            role="finance",
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.admin_user)
+
+    def test_roles_permissions_metadata(self):
+        """GET /api/accounting/roles-permissions/ returns 7 roles, 13 actions, and 6 pipeline stages."""
+        res = self.client.get("/api/accounting/roles-permissions/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "OPERATIONAL")
+        self.assertIn("Blueprint Section #27", res.data["blueprint_section"])
+        self.assertEqual(res.data["company"]["id"], self.company.id)
+
+        metrics = res.data["metrics"]
+        self.assertEqual(metrics["total_accounting_roles"], 7)
+        self.assertEqual(metrics["total_matrix_actions"], 13)
+        self.assertEqual(metrics["total_pipeline_stages"], 6)
+        self.assertEqual(len(res.data["roles"]), 7)
+        self.assertEqual(len(res.data["action_matrix"]), 13)
+
+    def test_the_7_accounting_roles_defined(self):
+        """Verifies presence of all 7 roles specified in Blueprint Section #27 Page 32."""
+        res = self.client.get("/api/accounting/roles-permissions/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        role_ids = [r["role_id"] for r in res.data["roles"]]
+
+        expected_roles = [
+            "accounting_admin",
+            "finance_manager",
+            "accountant",
+            "ar_user",
+            "ap_user",
+            "auditor",
+            "operational_user",
+        ]
+        for role in expected_roles:
+            self.assertIn(role, role_ids)
+
+    def test_permission_pipeline_evaluation_admin(self):
+        """Admin has full privileges across all accounting actions."""
+        from accounting.roles_permissions import evaluate_permission_pipeline
+
+        for action in ["manage_coa", "post_reverse_journals", "close_reopen_periods", "manage_settings"]:
+            decision = evaluate_permission_pipeline(self.admin_user, action)
+            self.assertTrue(decision["allowed"])
+            self.assertEqual(decision["decision"], "ALLOW")
+            self.assertEqual(decision["role_id"], "accounting_admin")
+            self.assertEqual(len(decision["pipeline"]), 6)
+
+    def test_permission_pipeline_evaluation_accountant(self):
+        """Accountant can create & post journals, but cannot close periods or approve transactions."""
+        from accounting.roles_permissions import evaluate_permission_pipeline
+
+        # Allowed actions
+        for act in ["manage_coa", "create_manual_journals", "post_reverse_journals", "bank_reconciliation"]:
+            decision = evaluate_permission_pipeline(self.accountant, act)
+            self.assertTrue(decision["allowed"])
+            self.assertEqual(decision["decision"], "ALLOW")
+
+        # Disallowed actions
+        for forbidden in ["close_reopen_periods", "approve_transactions", "manage_settings"]:
+            decision = evaluate_permission_pipeline(self.accountant, forbidden)
+            self.assertFalse(decision["allowed"])
+            self.assertEqual(decision["decision"], "DENY")
+
+    def test_permission_pipeline_evaluation_ar_and_ap_users(self):
+        """AR user creates sales invoices; AP user creates supplier bills; both denied closing/COA."""
+        from accounting.roles_permissions import evaluate_permission_pipeline
+
+        # AR user
+        ar_sales = evaluate_permission_pipeline(self.sales_user, "create_sales_invoices")
+        self.assertTrue(ar_sales["allowed"])
+        ar_bills = evaluate_permission_pipeline(self.sales_user, "create_supplier_bills")
+        self.assertFalse(ar_bills["allowed"])
+        ar_close = evaluate_permission_pipeline(self.sales_user, "close_reopen_periods")
+        self.assertFalse(ar_close["allowed"])
+
+        # AP user
+        ap_bills = evaluate_permission_pipeline(self.store_user, "create_supplier_bills")
+        self.assertTrue(ap_bills["allowed"])
+        ap_sales = evaluate_permission_pipeline(self.store_user, "create_sales_invoices")
+        self.assertFalse(ap_sales["allowed"])
+        ap_close = evaluate_permission_pipeline(self.store_user, "close_reopen_periods")
+        self.assertFalse(ap_close["allowed"])
+
+    def test_permission_pipeline_evaluation_operational_user(self):
+        """Operational user (production) cannot post journals or manage COA directly."""
+        from accounting.roles_permissions import evaluate_permission_pipeline
+
+        decision = evaluate_permission_pipeline(self.operator_user, "post_reverse_journals")
+        self.assertFalse(decision["allowed"])
+        self.assertEqual(decision["decision"], "DENY")
+
+        decision_coa = evaluate_permission_pipeline(self.operator_user, "manage_coa")
+        self.assertFalse(decision_coa["allowed"])
+
+    def test_separation_of_duties_rule(self):
+        """Separation of duties rule: Document creator cannot approve their own entry."""
+        from accounting.roles_permissions import evaluate_permission_pipeline
+
+        class DummyJournalEntry:
+            def __init__(self, creator):
+                self.created_by = creator
+                self.id = 101
+
+        # Manager created entry -> attempting to approve own entry
+        own_entry = DummyJournalEntry(creator=self.finance_mgr)
+        decision_own = evaluate_permission_pipeline(
+            self.finance_mgr, "approve_transactions", target_object=own_entry
+        )
+        self.assertFalse(decision_own["allowed"])
+        self.assertIn("Separation of duties", decision_own["reason"])
+
+        # Other user created entry -> Manager can approve
+        other_entry = DummyJournalEntry(creator=self.accountant)
+        decision_other = evaluate_permission_pipeline(
+            self.finance_mgr, "approve_transactions", target_object=other_entry
+        )
+        self.assertTrue(decision_other["allowed"])
+
+    def test_my_permissions_endpoint(self):
+        """GET /api/accounting/roles-permissions/my-permissions/ returns current user's privileges."""
+        self.client.force_authenticate(user=self.accountant)
+        res = self.client.get("/api/accounting/roles-permissions/my-permissions/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["username"], "staff_accountant")
+        self.assertEqual(res.data["resolved_accounting_role"], "accountant")
+        self.assertTrue("effective_permissions" in res.data)
+        self.assertTrue(res.data["effective_permissions"]["manage_coa"]["can_execute"])
+        self.assertFalse(res.data["effective_permissions"]["close_reopen_periods"]["can_execute"])
+
+    def test_check_permission_endpoint(self):
+        """POST /api/accounting/roles-permissions/check/ executes pipeline simulation."""
+        res_allow = self.client.post("/api/accounting/roles-permissions/check/", {"action": "view_reports"})
+        self.assertEqual(res_allow.status_code, status.HTTP_200_OK)
+        self.assertTrue(res_allow.data["allowed"])
+        self.assertEqual(res_allow.data["decision"], "ALLOW")
+
+        # Test simulation with operational role
+        res_sim = self.client.post("/api/accounting/roles-permissions/check/", {
+            "action": "close_reopen_periods",
+            "simulated_role": "production",
+        })
+        self.assertEqual(res_sim.status_code, status.HTTP_200_OK)
+        self.assertFalse(res_sim.data["allowed"])
+        self.assertEqual(res_sim.data["decision"], "DENY")
+
+    def test_health_and_verify_endpoints(self):
+        """Health and verify endpoints return healthy telemetry across all 7 roles."""
+        res_health = self.client.get("/api/accounting/roles-permissions/health/")
+        self.assertEqual(res_health.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_health.data["status"], "HEALTHY")
+        self.assertTrue(res_health.data["total_checks"] >= 20)
+
+        res_verify = self.client.post("/api/accounting/roles-permissions/verify/")
+        self.assertEqual(res_verify.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_verify.data["status"], "HEALTHY")
+
+    def test_company_isolation(self):
+        """Company B only views its own tenant context and users count."""
+        self.client.force_authenticate(user=self.user_b)
+        res = self.client.get("/api/accounting/roles-permissions/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["company"]["id"], self.company_b.id)
+        self.assertEqual(res.data["metrics"]["company_users"], 1)
+
+    def test_permissions(self):
+        """Non-finance user receives 403 Forbidden; anonymous user receives 401 Unauthorized."""
+        self.client.force_authenticate(user=self.operator_user)
+        res_forbidden = self.client.get("/api/accounting/roles-permissions/")
+        self.assertEqual(res_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_unauth = self.client.get("/api/accounting/roles-permissions/")
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+
 
 
