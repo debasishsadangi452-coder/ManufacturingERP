@@ -442,6 +442,15 @@ class AccountingSettings(models.Model):
         related_name="+",
         help_text="Default leaf input tax recoverable account for expense taxes (e.g. 1310 Input Tax Recoverable)"
     )
+    # Section #17 — Cash & Bank Opening Balance Equity Account
+    opening_balance_equity_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Leaf equity account for opening balance offset (e.g. 3010 Common Stock / Owner Capital)"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -474,6 +483,7 @@ class AccountingSettings(models.Model):
             ("expenses_default_payable_account", self.expenses_default_payable_account),
             ("expenses_default_employee_payable_account", self.expenses_default_employee_payable_account),
             ("expenses_default_tax_account", self.expenses_default_tax_account),
+            ("opening_balance_equity_account", self.opening_balance_equity_account),
         ]
         for field_name, acc in inv_account_fields:
             if acc and self.company_id and acc.company_id != self.company_id:
@@ -743,6 +753,18 @@ class JournalEntryLine(models.Model):
         blank=True,
         default="",
         help_text="Line item memo or specific reference."
+    )
+    is_reconciled = models.BooleanField(
+        default=False,
+        help_text="Whether this line item has been matched and cleared in bank reconciliation."
+    )
+    reconciliation = models.ForeignKey(
+        "BankReconciliation",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reconciled_journal_lines",
+        help_text="Bank reconciliation cycle in which this line was cleared."
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -1107,5 +1129,358 @@ class ExpenseAuditLog(models.Model):
 
     def __str__(self):
         return f"Audit: {self.expense.expense_number} - {self.action} at {self.created_at}"
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #17 — CASH & BANK MODELS
+# ==============================================================================
+
+class BankAccount(models.Model):
+    """
+    Blueprint Section #17 — Bank Account Master.
+    Represents commercial bank, checking, savings, money market, credit card,
+    or petty cash vault accounts linked to Chart of Accounts leaf accounts.
+    """
+    ACCOUNT_TYPE_CHOICES = [
+        ("checking", "Checking Account"),
+        ("savings", "Savings Account"),
+        ("money_market", "Money Market"),
+        ("credit_card", "Credit Card"),
+        ("cash", "Petty Cash / Vault"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="bank_accounts",
+        help_text="Tenant company owning this bank account."
+    )
+    account_name = models.CharField(max_length=150, help_text="Descriptive title, e.g. Operating Checking, Payroll Account")
+    bank_name = models.CharField(max_length=150, help_text="Institution name, e.g. JPMorgan Chase, Silicon Valley Bank")
+    account_number = models.CharField(max_length=50, help_text="Account number (masked in API/UI)")
+    routing_number = models.CharField(max_length=50, blank=True, default="", help_text="ABA routing / sort code")
+    swift_bic = models.CharField(max_length=50, blank=True, default="", help_text="SWIFT / BIC code for wire transfers")
+    account_type = models.CharField(max_length=30, choices=ACCOUNT_TYPE_CHOICES, default="checking")
+    currency = models.CharField(max_length=10, default="USD")
+    gl_account = models.ForeignKey(
+        Account,
+        on_delete=models.PROTECT,
+        related_name="bank_accounts",
+        help_text="Linked leaf Chart of Accounts asset or liability account (e.g. 1010, 1020, 1030)"
+    )
+    opening_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    opening_balance_date = models.DateField(null=True, blank=True)
+    opening_balance_posted = models.BooleanField(default=False)
+    opening_balance_journal_entry = models.ForeignKey(
+        JournalEntry,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="General Ledger journal entry for the opening balance"
+    )
+    reconciled_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    last_reconciliation_date = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    description = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["bank_name", "account_name"]
+        indexes = [
+            models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["company", "gl_account"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.gl_account_id and self.company_id:
+            if self.gl_account.company_id != self.company_id:
+                raise ValidationError({"gl_account": _("GL account must belong to the same company.")})
+            if not self.gl_account.is_active:
+                raise ValidationError({"gl_account": _("GL account must be active.")})
+            if self.gl_account.is_header:
+                raise ValidationError({"gl_account": _("GL account must be a leaf account, not a header.")})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    @property
+    def masked_account_number(self):
+        if not self.account_number:
+            return ""
+        num = str(self.account_number).strip()
+        if len(num) <= 4:
+            return f"****{num}"
+        return f"****{num[-4:]}"
+
+    @property
+    def current_gl_balance(self):
+        """Calculates current General Ledger posted balance for linked GL account."""
+        if not self.gl_account_id:
+            return Decimal("0.00")
+        lines = JournalEntryLine.objects.filter(
+            company_id=self.company_id,
+            account_id=self.gl_account_id,
+            journal_entry__status="posted"
+        )
+        debit_sum = lines.aggregate(models.Sum("debit"))["debit__sum"] or Decimal("0.00")
+        credit_sum = lines.aggregate(models.Sum("credit"))["credit__sum"] or Decimal("0.00")
+        
+        # Credit cards are liabilities (credit balance normal), asset accounts are debit normal
+        if self.account_type == "credit_card" or (self.gl_account.account_type and self.gl_account.account_type.category == "liability"):
+            return credit_sum - debit_sum
+        return debit_sum - credit_sum
+
+    @property
+    def unreconciled_difference(self):
+        return self.current_gl_balance - self.reconciled_balance
+
+    def __str__(self):
+        return f"{self.bank_name} - {self.account_name} ({self.masked_account_number})"
+
+
+class BankReconciliation(models.Model):
+    """
+    Blueprint Section #17 — Bank Reconciliation.
+    Encapsulates bank statement reconciliation cycles matching external bank statement
+    balances and transactions against internal ERP General Ledger transactions.
+    """
+    STATUS_CHOICES = [
+        ("completed", "Completed"),
+        ("reopened", "Reopened"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="bank_reconciliations",
+        help_text="Tenant company owning this reconciliation cycle."
+    )
+    bank_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.CASCADE,
+        related_name="reconciliations",
+        help_text="Reconciled bank account."
+    )
+    reconciliation_number = models.CharField(max_length=64, db_index=True)
+    statement_date = models.DateField(help_text="Cut-off date of the external bank statement")
+    statement_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), help_text="Ending statement balance")
+    starting_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), help_text="Previous reconciled starting balance")
+    reconciled_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), help_text="Target reconciled balance after reconciliation")
+    difference = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), help_text="Difference between statement and reconciled items")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="completed")
+    notes = models.TextField(blank=True, default="")
+    reconciled_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="User executing the reconciliation"
+    )
+    reconciled_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-statement_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "bank_account"]),
+            models.Index(fields=["company", "statement_date"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.reconciliation_number and self.company_id:
+            year = self.statement_date.year if self.statement_date else timezone.now().year
+            prefix = f"REC-{year}-"
+            last = BankReconciliation.objects.filter(
+                company_id=self.company_id,
+                reconciliation_number__startswith=prefix
+            ).order_by("-id").first()
+            seq = (last.id + 1) if last else 1
+            self.reconciliation_number = f"{prefix}{seq:05d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.reconciliation_number} ({self.bank_account.account_name} - {self.statement_date})"
+
+
+class BankTransaction(models.Model):
+    """
+    Blueprint Section #17 — Bank Transaction Layer.
+    Represents deposits, withdrawals, internal transfers, statement imports,
+    and ERP-linked payments/receipts against a bank account.
+    """
+    DIRECTION_CHOICES = [
+        ("inflow", "Inflow / Deposit / DR"),
+        ("outflow", "Outflow / Withdrawal / CR"),
+    ]
+    TRANSACTION_TYPE_CHOICES = [
+        ("deposit", "Deposit"),
+        ("withdrawal", "Withdrawal"),
+        ("transfer", "Bank Transfer"),
+        ("customer_receipt", "Customer Receipt"),
+        ("vendor_payment", "Vendor Payment"),
+        ("expense_payment", "Expense Payment"),
+        ("fee", "Bank Fee / Charge"),
+        ("interest", "Interest Income"),
+        ("statement_line", "Imported Statement Line"),
+        ("opening_balance", "Opening Balance"),
+        ("other", "Other Transaction"),
+    ]
+    SOURCE_CHOICES = [
+        ("manual", "Manual Entry"),
+        ("import", "Statement Import"),
+        ("erp", "ERP Subledger Posting"),
+    ]
+    MATCHING_STATUS_CHOICES = [
+        ("unmatched", "Unmatched"),
+        ("suggested", "Suggested Match"),
+        ("matched", "Matched"),
+    ]
+    RECONCILIATION_STATUS_CHOICES = [
+        ("unreconciled", "Unreconciled"),
+        ("reconciled", "Reconciled"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="bank_transactions"
+    )
+    bank_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.CASCADE,
+        related_name="transactions"
+    )
+    transaction_date = models.DateField(default=timezone.now)
+    value_date = models.DateField(null=True, blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2, help_text="Absolute transaction amount")
+    direction = models.CharField(max_length=10, choices=DIRECTION_CHOICES, default="inflow")
+    transaction_type = models.CharField(max_length=30, choices=TRANSACTION_TYPE_CHOICES, default="deposit")
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="manual")
+    description = models.CharField(max_length=255, blank=True, default="")
+    reference = models.CharField(max_length=100, blank=True, default="", help_text="Cheque #, reference or memo")
+    counterparty = models.CharField(max_length=150, blank=True, default="", help_text="Payee or payer name")
+    external_id = models.CharField(max_length=100, blank=True, default="", db_index=True, help_text="Unique statement transaction identifier for idempotency")
+
+    matching_status = models.CharField(max_length=20, choices=MATCHING_STATUS_CHOICES, default="unmatched")
+    reconciliation_status = models.CharField(max_length=20, choices=RECONCILIATION_STATUS_CHOICES, default="unreconciled")
+    reconciliation = models.ForeignKey(
+        BankReconciliation,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="transactions",
+        help_text="Reconciliation cycle in which this transaction was cleared"
+    )
+
+    journal_entry = models.ForeignKey(
+        JournalEntry,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="bank_transactions",
+        help_text="Linked posted double-entry journal entry"
+    )
+    journal_entry_line = models.ForeignKey(
+        JournalEntryLine,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="bank_transactions",
+        help_text="Specific GL journal line for this bank account"
+    )
+    transfer_counterpart = models.OneToOneField(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="counterpart_transaction",
+        help_text="Linked matching transaction in destination/source bank account for internal transfers"
+    )
+    source_document_ref = models.CharField(max_length=100, blank=True, default="", help_text="Traceability to AR/AP/Expense document, e.g. REC-001, PAY-002, EXP-003")
+
+    created_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_bank_transactions"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-transaction_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "bank_account", "reconciliation_status"]),
+            models.Index(fields=["company", "transaction_date"]),
+            models.Index(fields=["bank_account", "external_id"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.amount is not None and self.amount < Decimal("0.00"):
+            raise ValidationError({"amount": _("Transaction amount must be positive.")})
+        if self.bank_account_id and self.company_id and self.bank_account.company_id != self.company_id:
+            raise ValidationError({"bank_account": _("Bank account belongs to a different company.")})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        symbol = "+" if self.direction == "inflow" else "-"
+        return f"{self.transaction_date} [{self.get_transaction_type_display()}] {symbol}${self.amount:.2f} - {self.description or self.bank_account.account_name}"
+
+
+class BankAuditLog(models.Model):
+    """
+    Blueprint Section #17 — Audit Trail for Cash & Bank events.
+    Tracks creation, modification, opening balances, statement imports,
+    reconciliations, matching, and reopenings.
+    """
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="bank_audit_logs"
+    )
+    bank_account = models.ForeignKey(
+        BankAccount,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="audit_logs"
+    )
+    reconciliation = models.ForeignKey(
+        BankReconciliation,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="audit_logs"
+    )
+    action = models.CharField(max_length=60, help_text="e.g. account_created, opening_balance_posted, deposit_recorded, withdrawal_recorded, transfer_recorded, statement_imported, reconciliation_completed, reconciliation_reopened")
+    actor = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    details = models.JSONField(default=dict, blank=True)
+    notes = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        acc = self.bank_account.account_name if self.bank_account else "All"
+        return f"BankAudit: {acc} - {self.action} at {self.created_at}"
+
 
 

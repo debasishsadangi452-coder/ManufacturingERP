@@ -1886,6 +1886,473 @@ class ExpenseViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #17 — CASH & BANK VIEWSETS
+# ==============================================================================
+
+from .models import BankAccount, BankReconciliation, BankTransaction, BankAuditLog
+from .serializers import (
+    BankAccountSerializer,
+    BankAccountCreateUpdateSerializer,
+    BankTransactionSerializer,
+    BankReconciliationSerializer,
+    BankAuditLogSerializer,
+    OpeningBalanceInputSerializer,
+    DepositInputSerializer,
+    WithdrawalInputSerializer,
+    BankTransferInputSerializer,
+    ReconciliationInputSerializer,
+)
+from .cash_bank import (
+    record_opening_balance,
+    record_deposit,
+    record_withdrawal,
+    record_transfer,
+    import_bank_statement_csv,
+    get_unreconciled_transactions_queue,
+    reconcile_bank_account,
+    reopen_reconciliation,
+    get_cash_bank_summary,
+)
+
+
+class BankAccountViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    Blueprint Section #17 — Bank Account Master API.
+    Manages checking, savings, money market, credit card, and petty cash accounts.
+    Supports opening balances, statement CSV import, unreconciled transaction queues,
+    and activation toggling.
+    """
+    company_field = "company"
+    queryset = BankAccount.objects.select_related("gl_account", "gl_account__account_type", "opening_balance_journal_entry").all()
+    serializer_class = BankAccountSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["account_type", "currency", "is_active"]
+    search_fields = ["account_name", "bank_name", "account_number", "routing_number", "swift_bic"]
+    ordering_fields = ["bank_name", "account_name", "created_at", "reconciled_balance"]
+    ordering = ["bank_name", "account_name"]
+
+    def get_serializer_class(self):
+        if self.action in ["create", "update", "partial_update"]:
+            return BankAccountCreateUpdateSerializer
+        return BankAccountSerializer
+
+    def perform_create(self, serializer):
+        company = self.request.user.company
+        user = self.request.user if self.request.user.is_authenticated else None
+        account = serializer.save(company=company)
+        BankAuditLog.objects.create(
+            company=company,
+            bank_account=account,
+            action="account_created",
+            actor=user,
+            details={
+                "bank_name": account.bank_name,
+                "account_name": account.account_name,
+                "account_type": account.account_type,
+                "gl_account": account.gl_account.code,
+            },
+            notes="Bank account created",
+        )
+
+    def perform_update(self, serializer):
+        company = self.request.user.company
+        user = self.request.user if self.request.user.is_authenticated else None
+        account = serializer.save()
+        BankAuditLog.objects.create(
+            company=company,
+            bank_account=account,
+            action="account_updated",
+            actor=user,
+            details={
+                "bank_name": account.bank_name,
+                "account_name": account.account_name,
+                "is_active": account.is_active,
+            },
+            notes="Bank account updated",
+        )
+
+    @action(detail=True, methods=["post"], url_path="opening-balance")
+    def opening_balance(self, request, pk=None):
+        """POST /api/accounting/bank-accounts/{id}/opening-balance/"""
+        bank_account = self.get_object()
+        serializer = OpeningBalanceInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            res = record_opening_balance(
+                bank_account_id=bank_account.id,
+                amount=data["amount"],
+                balance_date=data["date"],
+                user=request.user,
+                equity_account_id=data.get("equity_account"),
+                notes=data.get("notes", ""),
+            )
+            return Response({
+                "message": f"Opening balance of {data['amount']} posted successfully.",
+                "bank_account": BankAccountSerializer(res["bank_account"]).data,
+                "journal_entry_id": res["journal_entry"].id,
+                "journal_entry_number": res["journal_entry"].entry_number,
+                "transaction_id": res["transaction"].id,
+            }, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="import-statement")
+    def import_statement(self, request, pk=None):
+        """POST /api/accounting/bank-accounts/{id}/import-statement/"""
+        bank_account = self.get_object()
+        file_obj = request.FILES.get("file")
+        csv_data = request.data.get("csv_data")
+
+        if not file_obj and not csv_data:
+            return Response({"error": "A CSV file upload ('file') or 'csv_data' text is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = file_obj if file_obj else csv_data
+        try:
+            res = import_bank_statement_csv(
+                bank_account_id=bank_account.id,
+                csv_text_or_file=payload,
+                user=request.user,
+            )
+            return Response({
+                "message": f"Statement import completed. {res['imported_count']} rows imported, {res['skipped_count']} duplicate rows skipped.",
+                **res
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["get"], url_path="transactions")
+    def account_transactions(self, request, pk=None):
+        """GET /api/accounting/bank-accounts/{id}/transactions/"""
+        bank_account = self.get_object()
+        qs = BankTransaction.objects.filter(bank_account=bank_account)
+
+        status_filter = request.query_params.get("reconciliation_status")
+        if status_filter:
+            qs = qs.filter(reconciliation_status=status_filter)
+
+        txn_type = request.query_params.get("transaction_type")
+        if txn_type:
+            qs = qs.filter(transaction_type=txn_type)
+
+        direction = request.query_params.get("direction")
+        if direction:
+            qs = qs.filter(direction=direction)
+
+        start_date = request.query_params.get("start_date")
+        if start_date:
+            qs = qs.filter(transaction_date__gte=start_date)
+
+        end_date = request.query_params.get("end_date")
+        if end_date:
+            qs = qs.filter(transaction_date__lte=end_date)
+
+        search = request.query_params.get("search")
+        if search:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(description__icontains=search) |
+                Q(reference__icontains=search) |
+                Q(counterparty__icontains=search) |
+                Q(external_id__icontains=search)
+            )
+
+        serializer = BankTransactionSerializer(qs.order_by("-transaction_date", "-id"), many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="unreconciled-queue")
+    def unreconciled_queue(self, request, pk=None):
+        """GET /api/accounting/bank-accounts/{id}/unreconciled-queue/"""
+        bank_account = self.get_object()
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        search = request.query_params.get("search")
+
+        try:
+            queue_data = get_unreconciled_transactions_queue(
+                bank_account_id=bank_account.id,
+                start_date=start_date,
+                end_date=end_date,
+                search=search,
+            )
+            bt_serialized = BankTransactionSerializer(queue_data["bank_transactions"], many=True).data
+            jl_serialized = [
+                {
+                    "id": jl.id,
+                    "journal_entry_id": jl.journal_entry_id,
+                    "journal_entry_number": jl.journal_entry.entry_number,
+                    "transaction_date": jl.journal_entry.transaction_date.isoformat(),
+                    "debit": float(jl.debit),
+                    "credit": float(jl.credit),
+                    "amount": float(jl.debit if jl.debit > 0 else jl.credit),
+                    "direction": "inflow" if jl.debit > 0 else "outflow",
+                    "description": jl.description or jl.journal_entry.narration,
+                    "reference": jl.journal_entry.reference,
+                    "account_code": jl.account.code,
+                    "account_name": jl.account.name,
+                }
+                for jl in queue_data["journal_lines"]
+            ]
+            return Response({
+                "bank_account_id": bank_account.id,
+                "bank_account_name": bank_account.account_name,
+                "reconciled_balance": float(bank_account.reconciled_balance),
+                "current_gl_balance": float(bank_account.current_gl_balance),
+                "unreconciled_difference": float(bank_account.unreconciled_difference),
+                "bank_transactions": bt_serialized,
+                "journal_lines": jl_serialized,
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="toggle-active")
+    def toggle_active(self, request, pk=None):
+        """POST /api/accounting/bank-accounts/{id}/toggle-active/"""
+        bank_account = self.get_object()
+        bank_account.is_active = not bank_account.is_active
+        bank_account.save(update_fields=["is_active", "updated_at"])
+        action_name = "account_activated" if bank_account.is_active else "account_deactivated"
+        BankAuditLog.objects.create(
+            company=bank_account.company,
+            bank_account=bank_account,
+            action=action_name,
+            actor=request.user,
+            details={"is_active": bank_account.is_active},
+            notes=f"Bank account {'activated' if bank_account.is_active else 'deactivated'}",
+        )
+        return Response(BankAccountSerializer(bank_account).data, status=status.HTTP_200_OK)
+
+
+class BankTransactionViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    Blueprint Section #17 — Bank Transaction Subledger API.
+    Lists, filters, records deposits, withdrawals, and internal bank transfers.
+    """
+    company_field = "company"
+    queryset = BankTransaction.objects.select_related(
+        "bank_account",
+        "journal_entry",
+        "journal_entry_line",
+        "reconciliation",
+        "created_by"
+    ).all()
+    serializer_class = BankTransactionSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["bank_account", "direction", "transaction_type", "source", "matching_status", "reconciliation_status"]
+    search_fields = ["description", "reference", "counterparty", "external_id", "source_document_ref"]
+    ordering_fields = ["transaction_date", "created_at", "amount"]
+    ordering = ["-transaction_date", "-created_at"]
+
+    @action(detail=False, methods=["post"], url_path="deposit")
+    def deposit(self, request):
+        """POST /api/accounting/bank-transactions/deposit/"""
+        serializer = DepositInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        bank_account_id = request.data.get("bank_account")
+        if not bank_account_id:
+            return Response({"error": "bank_account is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            bt = record_deposit(
+                bank_account_id=bank_account_id,
+                amount=data["amount"],
+                txn_date=data["date"],
+                offset_account_id=data["offset_account"],
+                user=request.user,
+                description=data.get("description", ""),
+                reference=data.get("reference", ""),
+                counterparty=data.get("counterparty", ""),
+            )
+            return Response(BankTransactionSerializer(bt).data, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="withdrawal")
+    def withdrawal(self, request):
+        """POST /api/accounting/bank-transactions/withdrawal/"""
+        serializer = WithdrawalInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        bank_account_id = request.data.get("bank_account")
+        if not bank_account_id:
+            return Response({"error": "bank_account is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            bt = record_withdrawal(
+                bank_account_id=bank_account_id,
+                amount=data["amount"],
+                txn_date=data["date"],
+                offset_account_id=data["offset_account"],
+                user=request.user,
+                description=data.get("description", ""),
+                reference=data.get("reference", ""),
+                counterparty=data.get("counterparty", ""),
+                transaction_type=data.get("transaction_type", "withdrawal"),
+            )
+            return Response(BankTransactionSerializer(bt).data, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="transfer")
+    def transfer(self, request):
+        """POST /api/accounting/bank-transactions/transfer/"""
+        serializer = BankTransferInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            res = record_transfer(
+                from_account_id=data["from_account"],
+                to_account_id=data["to_account"],
+                amount=data["amount"],
+                txn_date=data["date"],
+                user=request.user,
+                description=data.get("description", ""),
+                reference=data.get("reference", ""),
+            )
+            return Response({
+                "message": "Internal bank transfer posted successfully.",
+                "journal_entry_id": res["journal_entry"].id,
+                "journal_entry_number": res["journal_entry"].entry_number,
+                "outflow_transaction": BankTransactionSerializer(res["outflow_transaction"]).data,
+                "inflow_transaction": BankTransactionSerializer(res["inflow_transaction"]).data,
+            }, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class BankReconciliationViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    Blueprint Section #17 — Bank Reconciliation API.
+    Performs matching, statement reconciliation confirmation, reopening, and audit trail retrieval.
+    """
+    company_field = "company"
+    queryset = BankReconciliation.objects.select_related("bank_account", "reconciled_by").prefetch_related("transactions").all()
+    serializer_class = BankReconciliationSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["bank_account", "status"]
+    search_fields = ["reconciliation_number", "notes", "bank_account__account_name"]
+    ordering_fields = ["statement_date", "created_at"]
+    ordering = ["-statement_date", "-created_at"]
+
+    @action(detail=False, methods=["post"], url_path="reconcile")
+    def reconcile(self, request):
+        """POST /api/accounting/bank-reconciliations/reconcile/"""
+        serializer = ReconciliationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        bank_account_id = request.data.get("bank_account")
+        if not bank_account_id:
+            return Response({"error": "bank_account is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            rec = reconcile_bank_account(
+                bank_account_id=bank_account_id,
+                statement_date=data["statement_date"],
+                statement_balance=data["statement_balance"],
+                transaction_ids=data.get("transaction_ids", []),
+                journal_line_ids=data.get("journal_line_ids", []),
+                user=request.user,
+                notes=data.get("notes", ""),
+            )
+            return Response({
+                "message": f"Reconciliation {rec.reconciliation_number} completed successfully.",
+                "reconciliation": BankReconciliationSerializer(rec).data,
+            }, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reopen")
+    def reopen(self, request, pk=None):
+        """POST /api/accounting/bank-reconciliations/{id}/reopen/"""
+        reason = request.data.get("reason", "")
+        try:
+            rec = reopen_reconciliation(
+                reconciliation_id=pk,
+                user=request.user,
+                reason=reason,
+            )
+            return Response({
+                "message": f"Reconciliation {rec.reconciliation_number} reopened successfully.",
+                "reconciliation": BankReconciliationSerializer(rec).data,
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["get"], url_path="cleared-items")
+    def cleared_items(self, request, pk=None):
+        """GET /api/accounting/bank-reconciliations/{id}/cleared-items/"""
+        rec = self.get_object()
+        txns = BankTransactionSerializer(rec.transactions.all(), many=True).data
+        lines = [
+            {
+                "id": jl.id,
+                "journal_entry_number": jl.journal_entry.entry_number,
+                "transaction_date": jl.journal_entry.transaction_date.isoformat(),
+                "debit": float(jl.debit),
+                "credit": float(jl.credit),
+                "amount": float(jl.debit if jl.debit > 0 else jl.credit),
+                "direction": "inflow" if jl.debit > 0 else "outflow",
+                "description": jl.description,
+            }
+            for jl in rec.reconciled_journal_lines.select_related("journal_entry").all()
+        ]
+        return Response({
+            "reconciliation_id": rec.id,
+            "reconciliation_number": rec.reconciliation_number,
+            "transactions": txns,
+            "journal_lines": lines,
+        }, status=status.HTTP_200_OK)
+
+
+class BankingSummaryViewSet(viewsets.ViewSet):
+    """
+    Cash & Bank Summary API (Blueprint Section No. 17).
+    Provides tenant-level high-level banking statistics and KPIs.
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/banking/summary/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            res = get_cash_bank_summary(company=company)
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
 
 
 

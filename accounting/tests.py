@@ -3776,6 +3776,675 @@ class ExpenseAccountingAPITests(APITestCase):
         self.assertIn("Successfully seeded", res.data["message"])
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #17 — CASH & BANK TESTS
+# ==============================================================================
+
+from accounting.models import BankAccount, BankReconciliation, BankTransaction, BankAuditLog
+from accounting.cash_bank import (
+    record_opening_balance,
+    record_deposit,
+    record_withdrawal,
+    record_transfer,
+    import_bank_statement_csv,
+    get_unreconciled_transactions_queue,
+    reconcile_bank_account,
+    reopen_reconciliation,
+    get_cash_bank_summary,
+)
+
+
+class CashAndBankTests(TestCase):
+    """
+    Blueprint Section #17 — Cash & Bank Unit & Domain Service Tests.
+    Tests Bank Account Master, Opening Balances, Deposits, Withdrawals,
+    Internal Transfers, Statement CSV Imports with idempotency,
+    Reconciliation Workflows, Reopening, and Audit Trails.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="ApexForge Bank Co", slug="apexforge-bank")
+        self.user = User.objects.create_user(
+            username="treasury_admin",
+            email="treasury@apexforge.com",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+        )
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+
+        self.operating_gl = Account.objects.get(company=self.company, code="1010")
+        self.payroll_gl = Account.objects.get(company=self.company, code="1020")
+        self.petty_cash_gl = Account.objects.get(company=self.company, code="1030")
+        self.sales_gl = Account.objects.get(company=self.company, code="4010")
+        self.equity_gl = Account.objects.get(company=self.company, code="3010")
+        self.bank_fee_gl = Account.objects.filter(company=self.company, account_type__category="expense").exclude(children__isnull=False).first()
+
+        self.bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Main Operating Account",
+            bank_name="JPMorgan Chase",
+            account_number="123456789012",
+            routing_number="021000021",
+            account_type="checking",
+            currency="USD",
+            gl_account=self.operating_gl,
+        )
+
+        self.payroll_bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Payroll Clearing",
+            bank_name="Wells Fargo",
+            account_number="987654321098",
+            routing_number="121000247",
+            account_type="checking",
+            currency="USD",
+            gl_account=self.payroll_gl,
+        )
+
+    def test_bank_account_creation_and_masking(self):
+        """Verifies account number masking and default balances."""
+        self.assertEqual(self.bank_account.masked_account_number, "****9012")
+        self.assertEqual(self.bank_account.opening_balance, Decimal("0.00"))
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("0.00"))
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("0.00"))
+        self.assertTrue(self.bank_account.is_active)
+
+    def test_bank_account_header_account_rejection(self):
+        """Bank Account cannot link to a parent header account."""
+        header_acc = Account.objects.get(company=self.company, code="1000")  # Current Assets header
+        with self.assertRaises(ValidationError):
+            BankAccount.objects.create(
+                company=self.company,
+                account_name="Invalid Header Bank",
+                bank_name="Test Bank",
+                account_number="111122223333",
+                gl_account=header_acc,
+            )
+
+    def test_bank_account_company_isolation(self):
+        """Bank Account cannot link to another company's GL account."""
+        comp_b = Company.objects.create(name="Other Co", slug="other-co")
+        seed_standard_chart_of_accounts(comp_b)
+        foreign_gl = Account.objects.get(company=comp_b, code="1010")
+
+        with self.assertRaises(ValidationError):
+            BankAccount.objects.create(
+                company=self.company,
+                account_name="Cross Company Bank",
+                bank_name="Test Bank",
+                account_number="555566667777",
+                gl_account=foreign_gl,
+            )
+
+    def test_opening_balance_positive_posting(self):
+        """
+        Positive opening balance:
+        DR 1010 Bank Asset = $25,000.00
+        CR 3010 Equity = $25,000.00
+        """
+        res = record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("25000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+            notes="Initial capital deposit",
+        )
+        je = res["journal_entry"]
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+        self.assertEqual(je.total_debit, Decimal("25000.00"))
+        self.assertEqual(je.total_credit, Decimal("25000.00"))
+
+        # BankAccount state
+        self.bank_account.refresh_from_db()
+        self.assertTrue(self.bank_account.opening_balance_posted)
+        self.assertEqual(self.bank_account.opening_balance, Decimal("25000.00"))
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("25000.00"))
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("25000.00"))
+        self.assertEqual(self.bank_account.unreconciled_difference, Decimal("0.00"))
+
+        # BankTransaction record created
+        bt = res["transaction"]
+        self.assertEqual(bt.direction, "inflow")
+        self.assertEqual(bt.transaction_type, "opening_balance")
+        self.assertEqual(bt.reconciliation_status, "reconciled")
+
+        # Audit trail
+        log = BankAuditLog.objects.filter(bank_account=self.bank_account, action="opening_balance_posted").first()
+        self.assertIsNotNone(log)
+
+    def test_opening_balance_overdraft_posting(self):
+        """
+        Overdraft/negative opening balance:
+        DR 3010 Equity = $1,500.00
+        CR 1010 Bank Asset = $1,500.00
+        """
+        res = record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("-1500.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+        je = res["journal_entry"]
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+        self.assertEqual(je.total_debit, Decimal("1500.00"))
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("-1500.00"))
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("-1500.00"))
+
+    def test_opening_balance_duplicate_prevention(self):
+        """Cannot post opening balance twice for the same account."""
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("10000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            record_opening_balance(
+                bank_account_id=self.bank_account.id,
+                amount=Decimal("5000.00"),
+                balance_date=date(2026, 1, 1),
+                user=self.user,
+            )
+        self.assertIn("already been posted", str(ctx.exception))
+
+    def test_opening_balance_lock_date_rejection(self):
+        """Cannot post opening balance on or before lock date."""
+        self.settings.lock_date = date(2026, 1, 15)
+        self.settings.save()
+
+        with self.assertRaises(ValidationError) as ctx:
+            record_opening_balance(
+                bank_account_id=self.bank_account.id,
+                amount=Decimal("5000.00"),
+                balance_date=date(2026, 1, 10),
+                user=self.user,
+            )
+        self.assertIn("lock date", str(ctx.exception))
+
+    def test_manual_deposit(self):
+        """
+        Money In:
+        DR 1010 Bank = $4,500.00
+        CR 4010 Revenue = $4,500.00
+        """
+        bt = record_deposit(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("4500.00"),
+            txn_date=date(2026, 2, 1),
+            offset_account_id=self.sales_gl.id,
+            user=self.user,
+            description="Client upfront payment",
+            reference="DEP-001",
+            counterparty="Acme Corp",
+        )
+        self.assertEqual(bt.direction, "inflow")
+        self.assertEqual(bt.transaction_type, "deposit")
+        self.assertEqual(bt.amount, Decimal("4500.00"))
+        self.assertEqual(bt.reconciliation_status, "unreconciled")
+        self.assertIsNotNone(bt.journal_entry)
+        self.assertEqual(bt.journal_entry.status, "posted")
+        self.assertTrue(bt.journal_entry.is_balanced)
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("4500.00"))
+
+    def test_manual_withdrawal(self):
+        """
+        Money Out:
+        DR 6050 Expense = $35.00
+        CR 1010 Bank = $35.00
+        """
+        bt = record_withdrawal(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("35.00"),
+            txn_date=date(2026, 2, 5),
+            offset_account_id=self.bank_fee_gl.id,
+            user=self.user,
+            description="Monthly wire maintenance fee",
+            reference="FEE-001",
+            counterparty="JPMorgan Chase",
+            transaction_type="fee",
+        )
+        self.assertEqual(bt.direction, "outflow")
+        self.assertEqual(bt.transaction_type, "fee")
+        self.assertEqual(bt.amount, Decimal("35.00"))
+        self.assertEqual(bt.reconciliation_status, "unreconciled")
+        self.assertEqual(bt.journal_entry.status, "posted")
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("-35.00"))
+
+    def test_internal_transfer_between_bank_accounts(self):
+        """
+        Internal Transfer:
+        DR 1020 Payroll Clearing = $12,000.00
+        CR 1010 Operating Checking = $12,000.00
+        """
+        # First fund operating account
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("50000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+
+        res = record_transfer(
+            from_account_id=self.bank_account.id,
+            to_account_id=self.payroll_bank_account.id,
+            amount=Decimal("12000.00"),
+            txn_date=date(2026, 2, 10),
+            user=self.user,
+            description="Fund bi-weekly payroll",
+            reference="TRF-PAYROLL-01",
+        )
+
+        je = res["journal_entry"]
+        self.assertEqual(je.status, "posted")
+        self.assertTrue(je.is_balanced)
+
+        out_txn = res["outflow_transaction"]
+        in_txn = res["inflow_transaction"]
+
+        self.assertEqual(out_txn.bank_account, self.bank_account)
+        self.assertEqual(out_txn.direction, "outflow")
+        self.assertEqual(out_txn.amount, Decimal("12000.00"))
+        self.assertEqual(out_txn.transfer_counterpart, in_txn)
+
+        self.assertEqual(in_txn.bank_account, self.payroll_bank_account)
+        self.assertEqual(in_txn.direction, "inflow")
+        self.assertEqual(in_txn.amount, Decimal("12000.00"))
+        self.assertEqual(in_txn.transfer_counterpart, out_txn)
+
+        self.bank_account.refresh_from_db()
+        self.payroll_bank_account.refresh_from_db()
+
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("38000.00"))
+        self.assertEqual(self.payroll_bank_account.current_gl_balance, Decimal("12000.00"))
+
+    def test_transfer_same_account_rejection(self):
+        """Cannot transfer from an account to itself."""
+        with self.assertRaises(ValidationError):
+            record_transfer(
+                from_account_id=self.bank_account.id,
+                to_account_id=self.bank_account.id,
+                amount=Decimal("100.00"),
+                txn_date=date(2026, 2, 1),
+                user=self.user,
+            )
+
+    def test_statement_csv_import_valid_and_idempotent(self):
+        """
+        Validates CSV statement import with positive/negative amounts,
+        deterministic external IDs, and duplicate idempotency skipping.
+        """
+        csv_data = """Date,Description,Amount,Reference,Transaction ID
+2026-02-01,Customer Wire ACME,5000.00,WIRE-1001,TXN-901
+2026-02-03,Office Supplies Amazon,-245.50,CARD-4421,TXN-902
+2026-02-05,Utility Electric,-150.00,ACH-5561,TXN-903
+"""
+        res1 = import_bank_statement_csv(
+            bank_account_id=self.bank_account.id,
+            csv_text_or_file=csv_data,
+            user=self.user,
+        )
+        self.assertEqual(res1["imported_count"], 3)
+        self.assertEqual(res1["skipped_count"], 0)
+        self.assertEqual(len(res1["errors"]), 0)
+
+        txns = list(BankTransaction.objects.filter(bank_account=self.bank_account, source="import"))
+        self.assertEqual(len(txns), 3)
+
+        txn_in = next(t for t in txns if t.external_id == "TXN-901")
+        self.assertEqual(txn_in.direction, "inflow")
+        self.assertEqual(txn_in.amount, Decimal("5000.00"))
+
+        txn_out = next(t for t in txns if t.external_id == "TXN-902")
+        self.assertEqual(txn_out.direction, "outflow")
+        self.assertEqual(txn_out.amount, Decimal("245.50"))
+
+        # Re-import identical statement: must skip duplicates safely (idempotency)
+        res2 = import_bank_statement_csv(
+            bank_account_id=self.bank_account.id,
+            csv_text_or_file=csv_data,
+            user=self.user,
+        )
+        self.assertEqual(res2["imported_count"], 0)
+        self.assertEqual(res2["skipped_count"], 3)
+        self.assertEqual(BankTransaction.objects.filter(bank_account=self.bank_account, source="import").count(), 3)
+
+    def test_statement_csv_import_debit_credit_columns(self):
+        """Tests statement with separate Debit and Credit columns."""
+        csv_data = """Date,Memo,Debit,Credit,Check
+2026-02-10,Vendor payment,1200.00,,CHK-101
+2026-02-12,Merchant batch deposit,,3500.00,BATCH-202
+"""
+        res = import_bank_statement_csv(
+            bank_account_id=self.bank_account.id,
+            csv_text_or_file=csv_data,
+            user=self.user,
+        )
+        self.assertEqual(res["imported_count"], 2)
+
+        dr_txn = BankTransaction.objects.get(bank_account=self.bank_account, reference="CHK-101")
+        self.assertEqual(dr_txn.direction, "outflow")
+        self.assertEqual(dr_txn.amount, Decimal("1200.00"))
+
+        cr_txn = BankTransaction.objects.get(bank_account=self.bank_account, reference="BATCH-202")
+        self.assertEqual(cr_txn.direction, "inflow")
+        self.assertEqual(cr_txn.amount, Decimal("3500.00"))
+
+    def test_bank_reconciliation_workflow_and_reopening(self):
+        """
+        Complete bank reconciliation lifecycle:
+        1. Setup Opening Balance ($10,000.00)
+        2. Deposit ($3,000.00) & Withdrawal ($1,000.00)
+        3. Check Unreconciled Queue
+        4. Reconcile matching transactions to Statement Ending Balance ($12,000.00)
+        5. Verify Reconciled Balance is updated
+        6. Reopen reconciliation and verify restoration of original balances.
+        """
+        # 1. Opening balance
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("10000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+
+        # 2. Deposit & Withdrawal
+        dep_txn = record_deposit(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("3000.00"),
+            txn_date=date(2026, 1, 15),
+            offset_account_id=self.sales_gl.id,
+            user=self.user,
+            description="January Sales",
+        )
+        wth_txn = record_withdrawal(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("1000.00"),
+            txn_date=date(2026, 1, 20),
+            offset_account_id=self.bank_fee_gl.id,
+            user=self.user,
+            description="Service Fee",
+        )
+
+        # 3. Unreconciled queue
+        queue = get_unreconciled_transactions_queue(self.bank_account.id)
+        self.assertEqual(queue["bank_transactions"].count(), 2)
+
+        # 4. Perform reconciliation
+        rec = reconcile_bank_account(
+            bank_account_id=self.bank_account.id,
+            statement_date=date(2026, 1, 31),
+            statement_balance=Decimal("12000.00"),
+            transaction_ids=[dep_txn.id, wth_txn.id],
+            journal_line_ids=[dep_txn.journal_entry_line.id, wth_txn.journal_entry_line.id],
+            user=self.user,
+            notes="January bank statement reconciliation completed",
+        )
+
+        self.assertEqual(rec.status, "completed")
+        self.assertEqual(rec.reconciled_balance, Decimal("12000.00"))
+        self.assertEqual(rec.starting_balance, Decimal("10000.00"))
+
+        dep_txn.refresh_from_db()
+        wth_txn.refresh_from_db()
+        self.assertEqual(dep_txn.reconciliation_status, "reconciled")
+        self.assertEqual(wth_txn.reconciliation_status, "reconciled")
+        self.assertEqual(dep_txn.reconciliation, rec)
+        self.assertTrue(dep_txn.journal_entry_line.is_reconciled)
+        self.assertTrue(wth_txn.journal_entry_line.is_reconciled)
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("12000.00"))
+        self.assertEqual(self.bank_account.current_gl_balance, Decimal("12000.00"))
+        self.assertEqual(self.bank_account.unreconciled_difference, Decimal("0.00"))
+
+        # Cannot reconcile already reconciled transaction
+        with self.assertRaises(ValidationError):
+            reconcile_bank_account(
+                bank_account_id=self.bank_account.id,
+                statement_date=date(2026, 1, 31),
+                statement_balance=Decimal("12000.00"),
+                transaction_ids=[dep_txn.id],
+                journal_line_ids=[],
+                user=self.user,
+            )
+
+        # 5. Reopen reconciliation
+        reopened = reopen_reconciliation(rec.id, user=self.user, reason="Need to re-match unrecorded check")
+        self.assertEqual(reopened.status, "reopened")
+
+        dep_txn.refresh_from_db()
+        wth_txn.refresh_from_db()
+        self.assertEqual(dep_txn.reconciliation_status, "unreconciled")
+        self.assertEqual(wth_txn.reconciliation_status, "unreconciled")
+        self.assertIsNone(dep_txn.reconciliation)
+
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.reconciled_balance, Decimal("10000.00"))
+
+    def test_cash_bank_summary(self):
+        """Tests tenant-level KPI summary aggregation."""
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("10000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+        record_deposit(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("2500.00"),
+            txn_date=date(2026, 1, 15),
+            offset_account_id=self.sales_gl.id,
+            user=self.user,
+        )
+
+        summary = get_cash_bank_summary(self.company)
+        self.assertEqual(summary["active_accounts_count"], 2)
+        self.assertEqual(summary["total_book_balance"], Decimal("12500.00"))
+        self.assertEqual(summary["total_reconciled_balance"], Decimal("10000.00"))
+        self.assertEqual(summary["total_unreconciled_difference"], Decimal("2500.00"))
+        self.assertEqual(summary["unreconciled_transactions_count"], 1)
+
+
+class CashAndBankAPITests(APITestCase):
+    """
+    Blueprint Section #17 — REST API Integration Tests.
+    Tests Bank Account endpoints, Opening Balance, Import, Transactions,
+    Reconciliations, and Summary endpoints.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="ApexForge API Co", slug="apexforge-api")
+        self.user = User.objects.create_user(
+            username="treasury_api_admin",
+            email="treasury_api@apexforge.com",
+            password="testpassword123",
+            company=self.company,
+            role="finance",
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+        )
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+
+        self.operating_gl = Account.objects.get(company=self.company, code="1010")
+        self.payroll_gl = Account.objects.get(company=self.company, code="1020")
+        self.sales_gl = Account.objects.get(company=self.company, code="4010")
+        self.fee_gl = Account.objects.filter(company=self.company, account_type__category="expense").exclude(children__isnull=False).first()
+
+        self.bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Primary Checking",
+            bank_name="Silicon Valley Bank",
+            account_number="987612345678",
+            account_type="checking",
+            gl_account=self.operating_gl,
+        )
+
+    def test_bank_account_crud_api(self):
+        """Tests bank account creation, list, retrieve, and masking via API."""
+        res = self.client.post("/api/accounting/bank-accounts/", {
+            "account_name": "Investment Savings",
+            "bank_name": "Goldman Sachs",
+            "account_number": "5555444433332222",
+            "routing_number": "021000089",
+            "account_type": "savings",
+            "currency": "USD",
+            "gl_account": self.payroll_gl.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        acc_id = res.data["id"]
+
+        # List
+        list_res = self.client.get("/api/accounting/bank-accounts/")
+        self.assertEqual(list_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(list_res.data), 2)
+
+        # Retrieve detail - verify raw account number is NOT exposed
+        det_res = self.client.get(f"/api/accounting/bank-accounts/{acc_id}/")
+        self.assertEqual(det_res.status_code, status.HTTP_200_OK)
+        self.assertNotIn("account_number", det_res.data)
+        self.assertEqual(det_res.data["masked_account_number"], "****2222")
+
+    def test_opening_balance_api(self):
+        """Tests opening balance posting endpoint."""
+        res = self.client.post(f"/api/accounting/bank-accounts/{self.bank_account.id}/opening-balance/", {
+            "amount": "15000.00",
+            "date": "2026-01-01",
+            "notes": "Starting balance 2026",
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.bank_account.refresh_from_db()
+        self.assertEqual(self.bank_account.opening_balance, Decimal("15000.00"))
+
+    def test_deposit_and_withdrawal_api(self):
+        """Tests deposit and withdrawal endpoints."""
+        # Deposit
+        dep_res = self.client.post("/api/accounting/bank-transactions/deposit/", {
+            "bank_account": self.bank_account.id,
+            "amount": "5000.00",
+            "date": "2026-02-01",
+            "offset_account": self.sales_gl.id,
+            "description": "Customer invoice payment deposit",
+            "reference": "DEP-API-01",
+        })
+        self.assertEqual(dep_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(dep_res.data["direction"], "inflow")
+
+        # Withdrawal
+        wth_res = self.client.post("/api/accounting/bank-transactions/withdrawal/", {
+            "bank_account": self.bank_account.id,
+            "amount": "250.00",
+            "date": "2026-02-05",
+            "offset_account": self.fee_gl.id,
+            "description": "Monthly Account Maintenance Fee",
+            "transaction_type": "fee",
+        })
+        self.assertEqual(wth_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(wth_res.data["direction"], "outflow")
+
+    def test_import_statement_api(self):
+        """Tests statement CSV upload via API."""
+        csv_file = SimpleUploadedFile(
+            "statement.csv",
+            b"Date,Amount,Description,Reference\n2026-02-01,1500.00,Deposit,REF1\n2026-02-02,-300.00,Payment,REF2\n",
+            content_type="text/csv"
+        )
+        res = self.client.post(
+            f"/api/accounting/bank-accounts/{self.bank_account.id}/import-statement/",
+            {"file": csv_file},
+            format="multipart"
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["imported_count"], 2)
+
+    def test_unreconciled_queue_and_reconciliation_api(self):
+        """Tests unreconciled queue and reconciliation execution via API."""
+        # Create deposit
+        self.client.post("/api/accounting/bank-transactions/deposit/", {
+            "bank_account": self.bank_account.id,
+            "amount": "2000.00",
+            "date": "2026-02-01",
+            "offset_account": self.sales_gl.id,
+            "description": "Sales deposit",
+        })
+
+        # Check queue
+        q_res = self.client.get(f"/api/accounting/bank-accounts/{self.bank_account.id}/unreconciled-queue/")
+        self.assertEqual(q_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(q_res.data["bank_transactions"]), 1)
+        txn_id = q_res.data["bank_transactions"][0]["id"]
+        jl_id = q_res.data["journal_lines"][0]["id"]
+
+        # Reconcile
+        rec_res = self.client.post("/api/accounting/bank-reconciliations/reconcile/", {
+            "bank_account": self.bank_account.id,
+            "statement_date": "2026-02-28",
+            "statement_balance": "2000.00",
+            "transaction_ids": [txn_id],
+            "journal_line_ids": [jl_id],
+            "notes": "Feb Reconciliation",
+        })
+        self.assertEqual(rec_res.status_code, status.HTTP_201_CREATED)
+        rec_id = rec_res.data["reconciliation"]["id"]
+
+        # Cleared items
+        det_res = self.client.get(f"/api/accounting/bank-reconciliations/{rec_id}/cleared-items/")
+        self.assertEqual(det_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(det_res.data["transactions"]), 1)
+
+        # Reopen
+        reopen_res = self.client.post(f"/api/accounting/bank-reconciliations/{rec_id}/reopen/", {
+            "reason": "Audit adjustment"
+        })
+        self.assertEqual(reopen_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(reopen_res.data["reconciliation"]["status"], "reopened")
+
+    def test_banking_summary_api(self):
+        """Tests summary KPI endpoint."""
+        res = self.client.get("/api/accounting/banking/summary/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("active_accounts_count", res.data)
+        self.assertIn("total_book_balance", res.data)
+        self.assertIn("total_reconciled_balance", res.data)
+
+    def test_toggle_active_api(self):
+        """Tests toggling account active/inactive status."""
+        res = self.client.post(f"/api/accounting/bank-accounts/{self.bank_account.id}/toggle-active/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data["is_active"])
+
+    def test_unauthorized_access(self):
+        """Non-finance/non-admin user is rejected with 403."""
+        unauth_user = User.objects.create_user(
+            username="shopfloor_worker",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.client.force_authenticate(user=unauth_user)
+        res = self.client.get("/api/accounting/bank-accounts/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+
 
 
 

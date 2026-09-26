@@ -18,6 +18,10 @@ from .views import (
     ManufacturingAccountingViewSet,
     ExpenseCategoryViewSet,
     ExpenseViewSet,
+    BankAccountViewSet,
+    BankTransactionViewSet,
+    BankReconciliationViewSet,
+    BankingSummaryViewSet,
 )
 
 router = DefaultRouter()
@@ -38,7 +42,12 @@ router.register(r'inventory', InventoryAccountingViewSet, basename='accounting-i
 router.register(r'manufacturing', ManufacturingAccountingViewSet, basename='accounting-manufacturing')
 router.register(r'expenses', ExpenseViewSet, basename='accounting-expenses')
 router.register(r'expense-categories', ExpenseCategoryViewSet, basename='accounting-expense-categories')
+router.register(r'bank-accounts', BankAccountViewSet, basename='accounting-bank-accounts')
+router.register(r'bank-transactions', BankTransactionViewSet, basename='accounting-bank-transactions')
+router.register(r'bank-reconciliations', BankReconciliationViewSet, basename='accounting-bank-reconciliations')
+router.register(r'banking', BankingSummaryViewSet, basename='accounting-banking')
 
 urlpatterns = [
     path('', include(router.urls)),
 ]
+

@@ -1,6 +1,10 @@
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .models import FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings
+from decimal import Decimal
+from .models import (
+    FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings,
+    BankAccount, BankReconciliation, BankTransaction, BankAuditLog
+)
 
 
 class FiscalYearSerializer(serializers.ModelSerializer):
@@ -743,6 +747,275 @@ class ExpenseCreateUpdateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"tax_amount": "Tax amount cannot be negative."})
 
         return attrs
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #17 — CASH & BANK SERIALIZERS
+# ==============================================================================
+
+class BankAccountSerializer(serializers.ModelSerializer):
+    gl_account_code = serializers.ReadOnlyField(source="gl_account.code")
+    gl_account_name = serializers.ReadOnlyField(source="gl_account.name")
+    masked_account_number = serializers.ReadOnlyField()
+    current_gl_balance = serializers.SerializerMethodField()
+    unreconciled_difference = serializers.SerializerMethodField()
+    opening_balance_journal_entry_number = serializers.ReadOnlyField(source="opening_balance_journal_entry.entry_number")
+
+    class Meta:
+        model = BankAccount
+        fields = [
+            "id",
+            "account_name",
+            "bank_name",
+            "masked_account_number",
+            "routing_number",
+            "swift_bic",
+            "account_type",
+            "currency",
+            "gl_account",
+            "gl_account_code",
+            "gl_account_name",
+            "opening_balance",
+            "opening_balance_date",
+            "opening_balance_posted",
+            "opening_balance_journal_entry",
+            "opening_balance_journal_entry_number",
+            "reconciled_balance",
+            "current_gl_balance",
+            "unreconciled_difference",
+            "last_reconciliation_date",
+            "is_active",
+            "description",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "masked_account_number",
+            "gl_account_code",
+            "gl_account_name",
+            "opening_balance_posted",
+            "opening_balance_journal_entry",
+            "opening_balance_journal_entry_number",
+            "reconciled_balance",
+            "current_gl_balance",
+            "unreconciled_difference",
+            "last_reconciliation_date",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_current_gl_balance(self, obj):
+        return float(obj.current_gl_balance)
+
+    def get_unreconciled_difference(self, obj):
+        return float(obj.unreconciled_difference)
+
+
+class BankAccountCreateUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BankAccount
+        fields = [
+            "id",
+            "account_name",
+            "bank_name",
+            "account_number",
+            "routing_number",
+            "swift_bic",
+            "account_type",
+            "currency",
+            "gl_account",
+            "is_active",
+            "description",
+        ]
+        read_only_fields = ["id"]
+        extra_kwargs = {
+            "account_number": {"write_only": True},
+        }
+
+    def validate_gl_account(self, value):
+        if value:
+            if value.is_header:
+                raise serializers.ValidationError("GL Account must be a leaf account, not a header.")
+            if not value.is_active:
+                raise serializers.ValidationError("GL Account must be active.")
+        return value
+
+
+class BankTransactionSerializer(serializers.ModelSerializer):
+    bank_account_name = serializers.ReadOnlyField(source="bank_account.account_name")
+    bank_name = serializers.ReadOnlyField(source="bank_account.bank_name")
+    journal_entry_number = serializers.ReadOnlyField(source="journal_entry.entry_number")
+    reconciliation_number = serializers.ReadOnlyField(source="reconciliation.reconciliation_number")
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BankTransaction
+        fields = [
+            "id",
+            "bank_account",
+            "bank_account_name",
+            "bank_name",
+            "transaction_date",
+            "value_date",
+            "amount",
+            "direction",
+            "transaction_type",
+            "source",
+            "description",
+            "reference",
+            "counterparty",
+            "external_id",
+            "matching_status",
+            "reconciliation_status",
+            "reconciliation",
+            "reconciliation_number",
+            "journal_entry",
+            "journal_entry_number",
+            "journal_entry_line",
+            "source_document_ref",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "bank_account_name",
+            "bank_name",
+            "journal_entry_number",
+            "reconciliation_number",
+            "created_by_name",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_created_by_name(self, obj):
+        return (obj.created_by.get_full_name() or obj.created_by.username) if obj.created_by else None
+
+
+class BankReconciliationSerializer(serializers.ModelSerializer):
+    bank_account_name = serializers.ReadOnlyField(source="bank_account.account_name")
+    bank_name = serializers.ReadOnlyField(source="bank_account.bank_name")
+    reconciled_by_name = serializers.SerializerMethodField()
+    transactions_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BankReconciliation
+        fields = [
+            "id",
+            "reconciliation_number",
+            "bank_account",
+            "bank_account_name",
+            "bank_name",
+            "statement_date",
+            "statement_balance",
+            "starting_balance",
+            "reconciled_balance",
+            "difference",
+            "status",
+            "notes",
+            "reconciled_by",
+            "reconciled_by_name",
+            "reconciled_at",
+            "transactions_count",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "reconciliation_number",
+            "bank_account_name",
+            "bank_name",
+            "reconciled_by_name",
+            "transactions_count",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_reconciled_by_name(self, obj):
+        return (obj.reconciled_by.get_full_name() or obj.reconciled_by.username) if obj.reconciled_by else None
+
+    def get_transactions_count(self, obj):
+        return obj.transactions.count()
+
+
+class BankAuditLogSerializer(serializers.ModelSerializer):
+    bank_account_name = serializers.ReadOnlyField(source="bank_account.account_name")
+    actor_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BankAuditLog
+        fields = [
+            "id",
+            "bank_account",
+            "bank_account_name",
+            "reconciliation",
+            "action",
+            "actor",
+            "actor_name",
+            "details",
+            "notes",
+            "created_at",
+        ]
+        read_only_fields = ["id", "bank_account_name", "actor_name", "created_at"]
+
+    def get_actor_name(self, obj):
+        return (obj.actor.get_full_name() or obj.actor.username) if obj.actor else None
+
+
+# Action Payload Input Serializers
+
+class OpeningBalanceInputSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2)
+    date = serializers.DateField()
+    equity_account = serializers.IntegerField(required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class DepositInputSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2, min_value=Decimal("0.01"))
+    date = serializers.DateField()
+    offset_account = serializers.IntegerField()
+    description = serializers.CharField(required=False, allow_blank=True, default="")
+    reference = serializers.CharField(required=False, allow_blank=True, default="")
+    counterparty = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class WithdrawalInputSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2, min_value=Decimal("0.01"))
+    date = serializers.DateField()
+    offset_account = serializers.IntegerField()
+    description = serializers.CharField(required=False, allow_blank=True, default="")
+    reference = serializers.CharField(required=False, allow_blank=True, default="")
+    counterparty = serializers.CharField(required=False, allow_blank=True, default="")
+    transaction_type = serializers.ChoiceField(
+        choices=["withdrawal", "fee", "other"],
+        default="withdrawal"
+    )
+
+
+class BankTransferInputSerializer(serializers.Serializer):
+    from_account = serializers.IntegerField()
+    to_account = serializers.IntegerField()
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2, min_value=Decimal("0.01"))
+    date = serializers.DateField()
+    description = serializers.CharField(required=False, allow_blank=True, default="")
+    reference = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        if attrs["from_account"] == attrs["to_account"]:
+            raise serializers.ValidationError("Source and destination accounts must be different.")
+        return attrs
+
+
+class ReconciliationInputSerializer(serializers.Serializer):
+    statement_date = serializers.DateField()
+    statement_balance = serializers.DecimalField(max_digits=18, decimal_places=2)
+    transaction_ids = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
+    journal_line_ids = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+
 
 
 
