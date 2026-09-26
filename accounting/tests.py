@@ -11,6 +11,7 @@ from .seeds import (
     seed_standard_chart_of_accounts,
     seed_standard_fiscal_year,
 )
+from .engine import post_journal_entry, reverse_journal_entry
 from production.models import Recipe, RecipeIngredient, ProductionOrder
 
 
@@ -6049,3 +6050,375 @@ class JournalEntryEnhancementsTestCase(APITestCase):
         post_res = self.client.post(f"/api/accounting/journal-entries/{entry_id}/post/")
         self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("accounting_period", str(post_res.data))
+
+
+class PeriodClosingTestCase(TestCase):
+    """
+    Blueprint #21: Period Closing Test Suite.
+    Verifies:
+    - Fiscal year and accounting period definition
+    - Open/locked/closed status tracking
+    - Unauthorized posting prevention into closed/locked periods
+    - Pre-closing verification checks (drafts, equilibrium, subledgers)
+    - Trial Balance generation and balance verification
+    - Closing adjustments tracking
+    - Controlled period reopening with authorized reasons
+    - Year-end closing with Retained Earnings entry generation
+    - Immutable period audit logging
+    - Multi-tenant company isolation & role-based permissions
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.company = Company.objects.create(name="BrewCo Period Closing Ltd")
+        self.other_company = Company.objects.create(name="Rival Brewing Ltd")
+
+        self.finance_user = User.objects.create_user(
+            username="period_manager",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.client.force_authenticate(user=self.finance_user)
+
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+
+        self.p1 = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+        self.p2 = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=2,
+            name="Feb 2026",
+            start_date=date(2026, 2, 1),
+            end_date=date(2026, 2, 28),
+            status="open",
+        )
+
+        ensure_account_types()
+        self.asset_type = AccountType.objects.get(name="Cash & Cash Equivalents")
+        self.equity_type = AccountType.objects.get(name="Retained Earnings")
+        self.rev_type = AccountType.objects.get(name="Operating Sales Revenue")
+        self.exp_type = AccountType.objects.get(name="Cost of Goods Sold (Raw Materials)")
+
+        self.bank_account = Account.objects.create(
+            company=self.company,
+            code="1010",
+            name="Operating Bank Account",
+            account_type=self.asset_type,
+            is_active=True,
+        )
+        self.revenue_account = Account.objects.create(
+            company=self.company,
+            code="4010",
+            name="Beer Sales Revenue",
+            account_type=self.rev_type,
+            is_active=True,
+        )
+        self.expense_account = Account.objects.create(
+            company=self.company,
+            code="5010",
+            name="Raw Materials Expense",
+            account_type=self.exp_type,
+            is_active=True,
+        )
+        self.retained_earnings = Account.objects.create(
+            company=self.company,
+            code="3200",
+            name="Retained Earnings",
+            account_type=self.equity_type,
+            is_active=True,
+        )
+
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+            current_fiscal_year=self.fy,
+            retained_earnings_account=self.retained_earnings,
+        )
+
+    def _create_and_post_entry(self, dt, dr_acc, cr_acc, amount, entry_type="manual", desc="Test Entry"):
+        entry = JournalEntry.objects.create(
+            company=self.company,
+            transaction_date=dt,
+            description=desc,
+            entry_type=entry_type,
+            status="draft",
+            created_by=self.finance_user,
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=dr_acc,
+            line_number=1,
+            debit=Decimal(amount),
+            credit=Decimal("0.00"),
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=cr_acc,
+            line_number=2,
+            debit=Decimal("0.00"),
+            credit=Decimal(amount),
+        )
+        return post_journal_entry(entry.id, self.finance_user, company=self.company)
+
+    def test_period_lock_and_unlock_lifecycle(self):
+        """Period can be locked and unlocked with status updates and audit logs."""
+        res = self.client.post(f"/api/accounting/periods/{self.p1.id}/lock/", {"reason": "End of month freeze"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.status, "locked")
+        self.assertIsNotNone(self.p1.locked_at)
+        self.assertEqual(self.p1.locked_by, self.finance_user)
+
+        # Unlock
+        res = self.client.post(f"/api/accounting/periods/{self.p1.id}/unlock/", format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.status, "open")
+
+    def test_locked_period_prevents_posting(self):
+        """Locked period prevents journal posting and submission."""
+        self.p1.lock_period(user=self.finance_user)
+
+        entry = JournalEntry.objects.create(
+            company=self.company,
+            transaction_date=date(2026, 1, 15),
+            status="draft",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=entry, account=self.expense_account, line_number=1, debit=Decimal("50.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=entry, account=self.bank_account, line_number=2, debit=Decimal("0.00"), credit=Decimal("50.00"))
+
+        # Submit should be rejected
+        sub_res = self.client.post(f"/api/accounting/journal-entries/{entry.id}/submit/")
+        self.assertEqual(sub_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("locked", str(sub_res.data))
+
+        # Direct post should also be rejected
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry.id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_period_closing_and_posting_rejection(self):
+        """Closing a period finalizes it and blocks all postings."""
+        close_res = self.client.post(f"/api/accounting/periods/{self.p1.id}/close/", format="json")
+        self.assertEqual(close_res.status_code, status.HTTP_200_OK)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.status, "closed")
+        self.assertIsNotNone(self.p1.closed_at)
+        self.assertEqual(self.p1.closed_by, self.finance_user)
+
+        # Attempt to post entry into closed period
+        entry = JournalEntry.objects.create(company=self.company, transaction_date=date(2026, 1, 20), status="draft")
+        JournalEntryLine.objects.create(company=self.company, journal_entry=entry, account=self.expense_account, line_number=1, debit=Decimal("100.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=entry, account=self.bank_account, line_number=2, debit=Decimal("0.00"), credit=Decimal("100.00"))
+
+        post_res = self.client.post(f"/api/accounting/journal-entries/{entry.id}/post/")
+        self.assertEqual(post_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("closed", str(post_res.data).lower())
+
+    def test_controlled_period_reopening_requires_reason(self):
+        """Reopening a closed period requires an authorized user and a non-empty reason."""
+        self.p1.close_period(user=self.finance_user)
+
+        # Attempt reopen without reason
+        res_no_reason = self.client.post(f"/api/accounting/periods/{self.p1.id}/reopen/", {"reason": ""}, format="json")
+        self.assertEqual(res_no_reason.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Attempt reopen with short reason
+        res_short = self.client.post(f"/api/accounting/periods/{self.p1.id}/reopen/", {"reason": "fix"}, format="json")
+        self.assertEqual(res_short.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Reopen with valid authorized reason
+        reopen_reason = "Auditor requested depreciation reclassification"
+        res_valid = self.client.post(f"/api/accounting/periods/{self.p1.id}/reopen/", {"reason": reopen_reason}, format="json")
+        self.assertEqual(res_valid.status_code, status.HTTP_200_OK)
+
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.status, "open")
+        self.assertEqual(self.p1.reopen_reason, reopen_reason)
+        self.assertIsNotNone(self.p1.reopened_at)
+        self.assertEqual(self.p1.reopened_by, self.finance_user)
+
+    def test_reopen_period_in_closed_fiscal_year_rejected(self):
+        """Cannot reopen an accounting period if the parent fiscal year is closed."""
+        self.p1.close_period(user=self.finance_user)
+        self.p2.close_period(user=self.finance_user)
+        self.fy.close_year(user=self.finance_user)
+
+        res = self.client.post(
+            f"/api/accounting/periods/{self.p1.id}/reopen/",
+            {"reason": "Attempting late post-closing audit entry"},
+            format="json"
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("fiscal year", str(res.data).lower())
+
+    def test_period_closing_checks_endpoint(self):
+        """Closing checks endpoint evaluates draft entries and trial balance."""
+        # Create unposted draft entry in period
+        JournalEntry.objects.create(
+            company=self.company,
+            transaction_date=date(2026, 1, 10),
+            status="draft",
+        )
+        res = self.client.get(f"/api/accounting/periods/{self.p1.id}/closing-checks/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+        self.assertTrue(data["has_warnings"])
+        draft_check = next(c for c in data["checks"] if c["id"] == "draft_journals")
+        self.assertEqual(draft_check["status"], "warning")
+        self.assertEqual(draft_check["count"], 1)
+
+    def test_period_trial_balance_equilibrium(self):
+        """Trial Balance endpoint accurately calculates debits, credits, and confirms equilibrium."""
+        # Post sales: Bank 1000 Dr, Revenue 1000 Cr
+        self._create_and_post_entry(date(2026, 1, 5), self.bank_account, self.revenue_account, "1000.00")
+        # Post expense: Expense 400 Dr, Bank 400 Cr
+        self._create_and_post_entry(date(2026, 1, 12), self.expense_account, self.bank_account, "400.00")
+
+        res = self.client.get(f"/api/accounting/periods/{self.p1.id}/trial-balance/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        tb = res.data
+        self.assertTrue(tb["totals"]["is_balanced"])
+        self.assertEqual(tb["totals"]["difference"], "0.00")
+        self.assertEqual(Decimal(tb["totals"]["total_period_debit"]), Decimal("1400.00"))
+        self.assertEqual(Decimal(tb["totals"]["total_period_credit"]), Decimal("1400.00"))
+
+    def test_period_adjustments_filtering(self):
+        """Adjustments endpoint returns only adjusting and closing entries for the period."""
+        # Create standard manual entry
+        self._create_and_post_entry(date(2026, 1, 10), self.bank_account, self.revenue_account, "200.00", entry_type="manual")
+        # Create adjusting entry
+        self._create_and_post_entry(date(2026, 1, 31), self.expense_account, self.bank_account, "50.00", entry_type="adjusting", desc="Accrued Utilities Adjustment")
+
+        res = self.client.get(f"/api/accounting/periods/{self.p1.id}/adjustments/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data), 1)
+        self.assertEqual(res.data[0]["entry_type"], "adjusting")
+
+    def test_period_audit_trail_recorded(self):
+        """All period lifecycle events (lock, unlock, close, reopen) are logged in the audit trail."""
+        self.client.post(f"/api/accounting/periods/{self.p1.id}/lock/", {"reason": "Monthly audit"}, format="json")
+        self.client.post(f"/api/accounting/periods/{self.p1.id}/unlock/", format="json")
+        self.client.post(f"/api/accounting/periods/{self.p1.id}/close/", format="json")
+        self.client.post(f"/api/accounting/periods/{self.p1.id}/reopen/", {"reason": "Quarterly reconciliations"}, format="json")
+
+        res = self.client.get(f"/api/accounting/periods/{self.p1.id}/audit-trail/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        actions = [log["action"] for log in res.data]
+        self.assertIn("LOCKED", actions)
+        self.assertIn("UNLOCKED", actions)
+        self.assertIn("CLOSED", actions)
+        self.assertIn("REOPENED", actions)
+
+    def test_fiscal_year_close_requires_all_periods_closed(self):
+        """Fiscal year cannot be closed while any of its periods remain open."""
+        # p1 is closed, p2 is open
+        self.p1.close_period(user=self.finance_user)
+
+        res = self.client.post(f"/api/accounting/fiscal-years/{self.fy.id}/close_year/", format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not closed", str(res.data).lower())
+
+    def test_fiscal_year_close_generates_retained_earnings_entry(self):
+        """Closing fiscal year generates closing entry zeroing out P&L accounts to Retained Earnings."""
+        # Post Net Profit of $1500: Revenue 2000 Cr, Expense 500 Dr
+        self._create_and_post_entry(date(2026, 1, 10), self.bank_account, self.revenue_account, "2000.00")
+        self._create_and_post_entry(date(2026, 2, 10), self.expense_account, self.bank_account, "500.00")
+
+        # Close all periods
+        self.p1.close_period(user=self.finance_user)
+        self.p2.close_period(user=self.finance_user)
+
+        res = self.client.post(
+            f"/api/accounting/fiscal-years/{self.fy.id}/close_year/",
+            {"generate_closing_entry": True},
+            format="json"
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.fy.refresh_from_db()
+        self.assertTrue(self.fy.is_closed)
+        self.assertIsNotNone(self.fy.closed_at)
+
+        # Check closing entry created
+        closing_entry = JournalEntry.objects.filter(
+            company=self.company,
+            entry_type="closing",
+            status="posted",
+        ).first()
+        self.assertIsNotNone(closing_entry)
+        self.assertEqual(closing_entry.reference, f"YE-CLOSE-{self.fy.name}")
+
+    def test_fiscal_year_reopen_with_reason(self):
+        """Fiscal year can be reopened with a valid reason."""
+        self.p1.close_period(user=self.finance_user)
+        self.p2.close_period(user=self.finance_user)
+        self.fy.close_year(user=self.finance_user)
+
+        # Reopen without reason -> fails
+        res_fail = self.client.post(f"/api/accounting/fiscal-years/{self.fy.id}/reopen_year/", {"reason": ""}, format="json")
+        self.assertEqual(res_fail.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Reopen with reason -> succeeds
+        res_ok = self.client.post(
+            f"/api/accounting/fiscal-years/{self.fy.id}/reopen_year/",
+            {"reason": "Board-approved restatement of fiscal year"},
+            format="json"
+        )
+        self.assertEqual(res_ok.status_code, status.HTTP_200_OK)
+        self.fy.refresh_from_db()
+        self.assertFalse(self.fy.is_closed)
+        self.assertIsNotNone(self.fy.reopened_at)
+
+    def test_company_isolation_on_periods(self):
+        """Users cannot access or modify periods belonging to another company."""
+        other_fy = FiscalYear.objects.create(
+            company=self.other_company,
+            name="Rival FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+        other_p = AccountingPeriod.objects.create(
+            company=self.other_company,
+            fiscal_year=other_fy,
+            period_number=1,
+            name="Rival Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+        )
+        res = self.client.post(f"/api/accounting/periods/{other_p.id}/lock/", format="json")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+        res_close = self.client.post(f"/api/accounting/periods/{other_p.id}/close/", format="json")
+        self.assertEqual(res_close.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unauthorized_user_period_operations_forbidden(self):
+        """Non-finance/admin users receive 403 Forbidden on period management actions."""
+        warehouse_user = User.objects.create_user(
+            username="forklift_joe",
+            password="password123",
+            company=self.company,
+            role="store",
+        )
+        self.client.force_authenticate(user=warehouse_user)
+
+        res = self.client.post(f"/api/accounting/periods/{self.p1.id}/lock/", format="json")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_close = self.client.post(f"/api/accounting/periods/{self.p1.id}/close/", format="json")
+        self.assertEqual(res_close.status_code, status.HTTP_403_FORBIDDEN)
+

@@ -2,6 +2,7 @@ from decimal import Decimal
 from django.db import models
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
+from django.utils import timezone
 
 
 class FiscalYear(models.Model):
@@ -19,6 +20,23 @@ class FiscalYear(models.Model):
         default=False,
         help_text="Indicates whether the fiscal year is closed for journal postings."
     )
+    closed_at = models.DateTimeField(null=True, blank=True)
+    closed_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="closed_fiscal_years"
+    )
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reopened_fiscal_years"
+    )
+    reopen_reason = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -46,6 +64,23 @@ class FiscalYear(models.Model):
     def save(self, *args, **kwargs):
         self.full_clean()
         super().save(*args, **kwargs)
+
+    def close_year(self, user=None):
+        """Finalizes and closes the fiscal year."""
+        self.is_closed = True
+        self.closed_at = timezone.now()
+        self.closed_by = user if (user and user.is_authenticated) else None
+        self.save(update_fields=["is_closed", "closed_at", "closed_by", "updated_at"])
+
+    def reopen_year(self, user=None, reason=""):
+        """Reopens a closed fiscal year with authorized reason."""
+        if not reason or len(reason.strip()) < 5:
+            raise ValidationError({"reopen_reason": _("A specific reason of at least 5 characters is required to reopen a closed fiscal year.")})
+        self.is_closed = False
+        self.reopened_at = timezone.now()
+        self.reopened_by = user if (user and user.is_authenticated) else None
+        self.reopen_reason = reason.strip()
+        self.save(update_fields=["is_closed", "reopened_at", "reopened_by", "reopen_reason", "updated_at"])
 
     def __str__(self):
         status = "Closed" if self.is_closed else "Open"
@@ -82,6 +117,31 @@ class AccountingPeriod(models.Model):
         default="open",
         help_text="Open = accepts postings, Locked = temporary freeze, Closed = finalized."
     )
+    closed_at = models.DateTimeField(null=True, blank=True)
+    closed_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="closed_periods"
+    )
+    locked_at = models.DateTimeField(null=True, blank=True)
+    locked_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="locked_periods"
+    )
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reopened_periods"
+    )
+    reopen_reason = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -112,8 +172,95 @@ class AccountingPeriod(models.Model):
         self.full_clean()
         super().save(*args, **kwargs)
 
+    def lock_period(self, user=None):
+        if self.status == "closed":
+            raise ValidationError(_("Cannot lock an already closed accounting period."))
+        self.status = "locked"
+        self.locked_at = timezone.now()
+        self.locked_by = user if (user and user.is_authenticated) else None
+        self.save(update_fields=["status", "locked_at", "locked_by", "updated_at"])
+
+    def unlock_period(self, user=None):
+        if self.status == "closed":
+            raise ValidationError(_("Cannot unlock a closed accounting period directly. Use reopen workflow."))
+        self.status = "open"
+        self.save(update_fields=["status", "updated_at"])
+
+    def close_period(self, user=None):
+        if self.status == "closed":
+            raise ValidationError(_("Period is already closed."))
+        self.status = "closed"
+        self.closed_at = timezone.now()
+        self.closed_by = user if (user and user.is_authenticated) else None
+        self.save(update_fields=["status", "closed_at", "closed_by", "updated_at"])
+
+    def reopen_period(self, user=None, reason=""):
+        if not reason or len(reason.strip()) < 5:
+            raise ValidationError({"reopen_reason": _("A specific reason of at least 5 characters is required to reopen a closed period.")})
+        if self.fiscal_year.is_closed:
+            raise ValidationError(_("Cannot reopen a period in a closed fiscal year. Reopen the fiscal year first."))
+        self.status = "open"
+        self.reopened_at = timezone.now()
+        self.reopened_by = user if (user and user.is_authenticated) else None
+        self.reopen_reason = reason.strip()
+        self.save(update_fields=["status", "reopened_at", "reopened_by", "reopen_reason", "updated_at"])
+
     def __str__(self):
         return f"{self.fiscal_year.name} - #{self.period_number} {self.name} ({self.status.upper()})"
+
+
+class PeriodAuditLog(models.Model):
+    """
+    Immutable audit history for AccountingPeriod lifecycle events
+    (LOCKED, UNLOCKED, CLOSED, REOPENED, CHECKS_RUN, YEAR_END_CLOSED).
+    """
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="period_audit_logs"
+    )
+    accounting_period = models.ForeignKey(
+        AccountingPeriod,
+        on_delete=models.CASCADE,
+        related_name="audit_logs"
+    )
+    action = models.CharField(
+        max_length=50,
+        help_text="LOCKED, UNLOCKED, CLOSED, REOPENED, CHECKS_RUN, ADJUSTMENT_POSTED"
+    )
+    performed_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    timestamp = models.DateTimeField(auto_now_add=True)
+    reason = models.TextField(blank=True, default="")
+    details = models.JSONField(default=dict, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-timestamp"]
+        indexes = [
+            models.Index(fields=["company", "accounting_period", "action"]),
+        ]
+
+    def __str__(self):
+        user_str = self.performed_by.email if self.performed_by else "System"
+        return f"[{self.timestamp:%Y-%m-%d %H:%M}] Period #{self.accounting_period.period_number} {self.action} by {user_str}"
+
+
+def record_period_audit_log(period, action, user=None, reason="", details=None, ip_address=None):
+    return PeriodAuditLog.objects.create(
+        company=period.company,
+        accounting_period=period,
+        action=action,
+        performed_by=user if (user and user.is_authenticated) else None,
+        reason=reason or "",
+        details=details or {},
+        ip_address=ip_address,
+    )
 
 
 class AccountType(models.Model):
@@ -737,16 +884,17 @@ class JournalEntry(models.Model):
                 raise ValidationError({"accounting_period": _("Accounting period belongs to a different company.")})
 
             if self.status == "posted":
-                if self.accounting_period.status != "open":
-                    raise ValidationError({
-                        "accounting_period": _(
-                            f"Cannot post to an accounting period with status '{self.accounting_period.status}'."
-                        )
-                    })
-                if self.accounting_period.fiscal_year.is_closed:
-                    raise ValidationError({
-                        "accounting_period": _("Cannot post to a closed fiscal year.")
-                    })
+                if self.entry_type != "closing":
+                    if self.accounting_period.status != "open":
+                        raise ValidationError({
+                            "accounting_period": _(
+                                f"Cannot post to an accounting period with status '{self.accounting_period.status}'."
+                            )
+                        })
+                    if self.accounting_period.fiscal_year.is_closed:
+                        raise ValidationError({
+                            "accounting_period": _("Cannot post to a closed fiscal year.")
+                        })
 
             # Check transaction date within period boundaries
             if self.transaction_date and (

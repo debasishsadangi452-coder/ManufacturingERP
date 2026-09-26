@@ -5,12 +5,15 @@ from .models import (
     FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings,
     BankAccount, BankReconciliation, BankTransaction, BankAuditLog,
     Payment, PaymentAllocation, PaymentAuditLog,
-    TaxCode, TaxTransactionLine, TaxAdjustment, TaxAuditLog
+    TaxCode, TaxTransactionLine, TaxAdjustment, TaxAuditLog,
+    PeriodAuditLog
 )
 
 
 class FiscalYearSerializer(serializers.ModelSerializer):
     periods_count = serializers.SerializerMethodField()
+    closed_by_email = serializers.ReadOnlyField(source="closed_by.email")
+    reopened_by_email = serializers.ReadOnlyField(source="reopened_by.email")
 
     class Meta:
         model = FiscalYear
@@ -20,11 +23,27 @@ class FiscalYearSerializer(serializers.ModelSerializer):
             "start_date",
             "end_date",
             "is_closed",
+            "closed_at",
+            "closed_by",
+            "closed_by_email",
+            "reopened_at",
+            "reopened_by",
+            "reopened_by_email",
+            "reopen_reason",
             "periods_count",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "periods_count", "created_at", "updated_at"]
+        read_only_fields = [
+            "id",
+            "periods_count",
+            "closed_at",
+            "closed_by_email",
+            "reopened_at",
+            "reopened_by_email",
+            "created_at",
+            "updated_at",
+        ]
 
     def get_periods_count(self, obj):
         return obj.periods.count()
@@ -39,6 +58,10 @@ class FiscalYearSerializer(serializers.ModelSerializer):
 
 class AccountingPeriodSerializer(serializers.ModelSerializer):
     fiscal_year_name = serializers.ReadOnlyField(source="fiscal_year.name")
+    fiscal_year_is_closed = serializers.ReadOnlyField(source="fiscal_year.is_closed")
+    closed_by_email = serializers.ReadOnlyField(source="closed_by.email")
+    locked_by_email = serializers.ReadOnlyField(source="locked_by.email")
+    reopened_by_email = serializers.ReadOnlyField(source="reopened_by.email")
 
     class Meta:
         model = AccountingPeriod
@@ -46,15 +69,38 @@ class AccountingPeriodSerializer(serializers.ModelSerializer):
             "id",
             "fiscal_year",
             "fiscal_year_name",
+            "fiscal_year_is_closed",
             "period_number",
             "name",
             "start_date",
             "end_date",
             "status",
+            "closed_at",
+            "closed_by",
+            "closed_by_email",
+            "locked_at",
+            "locked_by",
+            "locked_by_email",
+            "reopened_at",
+            "reopened_by",
+            "reopened_by_email",
+            "reopen_reason",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "fiscal_year_name", "created_at", "updated_at"]
+        read_only_fields = [
+            "id",
+            "fiscal_year_name",
+            "fiscal_year_is_closed",
+            "closed_at",
+            "closed_by_email",
+            "locked_at",
+            "locked_by_email",
+            "reopened_at",
+            "reopened_by_email",
+            "created_at",
+            "updated_at",
+        ]
 
     def validate(self, attrs):
         start_date = attrs.get("start_date") or getattr(self.instance, "start_date", None)
@@ -69,6 +115,29 @@ class AccountingPeriodSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("Period dates must be within fiscal year boundaries.")
 
         return attrs
+
+
+class PeriodAuditLogSerializer(serializers.ModelSerializer):
+    performed_by_email = serializers.ReadOnlyField(source="performed_by.email")
+    period_name = serializers.ReadOnlyField(source="accounting_period.name")
+    period_number = serializers.ReadOnlyField(source="accounting_period.period_number")
+
+    class Meta:
+        model = PeriodAuditLog
+        fields = [
+            "id",
+            "accounting_period",
+            "period_name",
+            "period_number",
+            "action",
+            "performed_by",
+            "performed_by_email",
+            "timestamp",
+            "reason",
+            "details",
+            "ip_address",
+        ]
+        read_only_fields = ["id", "timestamp"]
 
 
 class AccountTypeSerializer(serializers.ModelSerializer):

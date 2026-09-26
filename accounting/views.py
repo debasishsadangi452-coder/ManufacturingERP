@@ -9,7 +9,10 @@ import calendar
 
 from core.tenancy import CompanyScopedMixin
 from accounts.permission import IsFinanceOrAdmin
-from .models import FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings
+from .models import (
+    FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings,
+    PeriodAuditLog, record_period_audit_log
+)
 from .serializers import (
     FiscalYearSerializer,
     AccountingPeriodSerializer,
@@ -17,6 +20,13 @@ from .serializers import (
     AccountSerializer,
     AccountTreeSerializer,
     AccountingSettingsSerializer,
+    PeriodAuditLogSerializer,
+)
+from .period_closing import (
+    get_period_trial_balance,
+    run_period_closing_checks,
+    get_period_adjustments,
+    generate_year_end_closing_entry,
 )
 from .seeds import (
     ensure_account_types,
@@ -74,27 +84,79 @@ class FiscalYearViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def close_year(self, request, pk=None):
-        """Finalizes and closes the fiscal year."""
+        """Finalizes and closes the fiscal year with optional Year-End Closing Entry."""
         fy = self.get_object()
-        fy.is_closed = True
-        fy.save()
-        # Optionally close all periods
-        fy.periods.update(status="closed")
-        return Response({"status": "success", "message": f"Fiscal year {fy.name} is now closed."})
+        company = getattr(request.user, "company", None)
+        generate_closing = request.data.get("generate_closing_entry", True)
+
+        if fy.is_closed:
+            return Response({"error": f"Fiscal year {fy.name} is already closed."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check all periods in this FY are closed
+        open_periods = fy.periods.exclude(status="closed")
+        if open_periods.exists():
+            open_names = list(open_periods.values_list("name", flat=True)[:5])
+            return Response({
+                "error": f"Cannot close fiscal year. The following periods are not closed: {', '.join(open_names)}."
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        closing_entry = None
+        if generate_closing:
+            try:
+                closing_entry = generate_year_end_closing_entry(fy, user=request.user, company=company)
+            except DjangoValidationError as e:
+                msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+                return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        fy.close_year(user=request.user)
+
+        target_period = fy.periods.last() or fy.periods.first()
+        if target_period:
+            record_period_audit_log(
+                target_period,
+                action="YEAR_END_CLOSED",
+                user=request.user,
+                reason=f"Fiscal year {fy.name} closed.",
+                details={
+                    "fiscal_year_id": fy.id,
+                    "fiscal_year_name": fy.name,
+                    "closing_entry_id": closing_entry.id if closing_entry else None,
+                    "closing_entry_number": closing_entry.entry_number if closing_entry else None,
+                },
+                ip_address=request.META.get("REMOTE_ADDR"),
+            )
+
+        return Response({
+            "status": "success",
+            "message": f"Fiscal year {fy.name} is now closed.",
+            "closing_entry_number": closing_entry.entry_number if closing_entry else None,
+        })
 
     @action(detail=True, methods=["post"])
     def reopen_year(self, request, pk=None):
-        """Reopens a closed fiscal year."""
+        """Reopens a closed fiscal year with authorized reason."""
         fy = self.get_object()
-        fy.is_closed = False
-        fy.save()
-        return Response({"status": "success", "message": f"Fiscal year {fy.name} has been reopened."})
+        reason = request.data.get("reason", "")
+        if not reason or len(reason.strip()) < 5:
+            return Response(
+                {"error": "A specific reason (minimum 5 characters) is required to reopen a closed fiscal year."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            fy.reopen_year(user=request.user, reason=reason)
+            return Response({"status": "success", "message": f"Fiscal year {fy.name} has been reopened."})
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class AccountingPeriodViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
-    """CRUD and status lifecycle for Accounting Periods."""
+    """CRUD and status lifecycle for Accounting Periods with audit tracking and closing checks."""
     company_field = "company"
-    queryset = AccountingPeriod.objects.select_related("fiscal_year").all()
+    queryset = AccountingPeriod.objects.select_related("fiscal_year", "closed_by", "locked_by", "reopened_by").all()
     serializer_class = AccountingPeriodSerializer
     permission_classes = [IsFinanceOrAdmin]
     filter_backends = [DjangoFilterBackend, OrderingFilter]
@@ -104,24 +166,149 @@ class AccountingPeriodViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def lock(self, request, pk=None):
+        """Lock period to temporarily freeze postings."""
         period = self.get_object()
-        period.status = "locked"
-        period.save()
-        return Response({"status": "success", "message": f"Period {period.name} locked."})
+        try:
+            period.lock_period(user=request.user)
+            record_period_audit_log(
+                period,
+                action="LOCKED",
+                user=request.user,
+                reason=request.data.get("reason", ""),
+                ip_address=request.META.get("REMOTE_ADDR")
+            )
+            serializer = self.get_serializer(period)
+            return Response({"status": "success", "message": f"Period {period.name} locked.", "period": serializer.data})
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=["post"])
     def unlock(self, request, pk=None):
+        """Unlock a locked period."""
         period = self.get_object()
-        period.status = "open"
-        period.save()
-        return Response({"status": "success", "message": f"Period {period.name} unlocked."})
+        try:
+            period.unlock_period(user=request.user)
+            record_period_audit_log(
+                period,
+                action="UNLOCKED",
+                user=request.user,
+                reason=request.data.get("reason", ""),
+                ip_address=request.META.get("REMOTE_ADDR")
+            )
+            serializer = self.get_serializer(period)
+            return Response({"status": "success", "message": f"Period {period.name} unlocked.", "period": serializer.data})
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=["post"])
     def close(self, request, pk=None):
+        """Finalizes and closes the period after evaluating closing checks."""
         period = self.get_object()
-        period.status = "closed"
-        period.save()
-        return Response({"status": "success", "message": f"Period {period.name} closed."})
+        company = getattr(request.user, "company", None)
+        force = request.data.get("force", False)
+
+        # Run closing checks
+        checks_report = run_period_closing_checks(period, company=company)
+        if checks_report["has_blockers"] and not force:
+            return Response({
+                "error": "Cannot close period due to critical closing blockers.",
+                "closing_checks": checks_report,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            period.close_period(user=request.user)
+            record_period_audit_log(
+                period,
+                action="CLOSED",
+                user=request.user,
+                reason=request.data.get("reason", ""),
+                details={"closing_checks": checks_report},
+                ip_address=request.META.get("REMOTE_ADDR")
+            )
+            serializer = self.get_serializer(period)
+            return Response({
+                "status": "success",
+                "message": f"Period {period.name} closed successfully.",
+                "period": serializer.data,
+                "closing_checks": checks_report,
+            })
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"])
+    def reopen(self, request, pk=None):
+        """Reopens a closed period with authorized reason."""
+        period = self.get_object()
+        reason = request.data.get("reason", "")
+        if not reason or len(reason.strip()) < 5:
+            return Response({
+                "error": "A specific reason (minimum 5 characters) is required to reopen a closed period."
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            period.reopen_period(user=request.user, reason=reason)
+            record_period_audit_log(
+                period,
+                action="REOPENED",
+                user=request.user,
+                reason=reason,
+                ip_address=request.META.get("REMOTE_ADDR")
+            )
+            serializer = self.get_serializer(period)
+            return Response({
+                "status": "success",
+                "message": f"Period {period.name} has been reopened.",
+                "period": serializer.data,
+            })
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["get"], url_path="closing-checks")
+    def closing_checks(self, request, pk=None):
+        """Runs the 7 pre-closing verification checks."""
+        period = self.get_object()
+        company = getattr(request.user, "company", None)
+        report = run_period_closing_checks(period, company=company)
+        record_period_audit_log(
+            period,
+            action="CHECKS_RUN",
+            user=request.user,
+            details={"has_blockers": report["has_blockers"], "can_close": report["can_close"]},
+            ip_address=request.META.get("REMOTE_ADDR")
+        )
+        return Response(report, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="trial-balance")
+    def trial_balance(self, request, pk=None):
+        """Generates trial balance for this specific period."""
+        period = self.get_object()
+        company = getattr(request.user, "company", None)
+        search = request.query_params.get("search")
+        category = request.query_params.get("category")
+        tb = get_period_trial_balance(company, period=period, search=search, category=category)
+        return Response(tb, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="adjustments")
+    def adjustments(self, request, pk=None):
+        """Returns all adjusting and closing journal entries for this period."""
+        period = self.get_object()
+        company = getattr(request.user, "company", None)
+        from .serializers import JournalEntrySerializer
+        adjustments_qs = get_period_adjustments(period, company=company)
+        serializer = JournalEntrySerializer(adjustments_qs, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="audit-trail")
+    def audit_trail(self, request, pk=None):
+        """Returns immutable audit trail history for this period."""
+        period = self.get_object()
+        logs = period.audit_logs.select_related("performed_by").all()
+        serializer = PeriodAuditLogSerializer(logs, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 class AccountTypeViewSet(viewsets.ReadOnlyModelViewSet):
@@ -368,6 +555,11 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     def submit_entry(self, request, pk=None):
         """Submit a draft journal entry for approval."""
         entry = self.get_object()
+        if entry.accounting_period and entry.accounting_period.status != "open":
+            return Response(
+                {"error": f"Cannot submit journal entry into an accounting period with status '{entry.accounting_period.status}'."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         try:
             entry.submit_for_approval(user=request.user)
             serializer = self.get_serializer(entry)
@@ -382,6 +574,11 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     def approve_entry(self, request, pk=None):
         """Approve a submitted journal entry."""
         entry = self.get_object()
+        if entry.accounting_period and entry.accounting_period.status != "open":
+            return Response(
+                {"error": f"Cannot approve journal entry in an accounting period with status '{entry.accounting_period.status}'."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         try:
             entry.approve_entry(user=request.user)
             serializer = self.get_serializer(entry)
@@ -626,6 +823,43 @@ class GeneralLedgerViewSet(viewsets.ViewSet):
                 search=search,
             )
             return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="trial-balance")
+    def trial_balance(self, request):
+        """
+        GET /api/accounting/general-ledger/trial-balance/
+        Generates full trial balance with debit/credit equilibrium check.
+        """
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        accounting_period_id = request.query_params.get("accounting_period")
+        fiscal_year_id = request.query_params.get("fiscal_year")
+        as_of_date = request.query_params.get("as_of_date")
+        search = request.query_params.get("search")
+        category = request.query_params.get("category")
+
+        period = None
+        if accounting_period_id:
+            period = AccountingPeriod.objects.filter(pk=accounting_period_id, company=company).first()
+
+        fy = None
+        if fiscal_year_id:
+            fy = FiscalYear.objects.filter(pk=fiscal_year_id, company=company).first()
+
+        try:
+            tb = get_period_trial_balance(
+                company=company,
+                period=period,
+                fiscal_year=fy,
+                as_of_date=as_of_date,
+                search=search,
+                category=category,
+            )
+            return Response(tb, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
