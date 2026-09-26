@@ -6422,3 +6422,329 @@ class PeriodClosingTestCase(TestCase):
         res_close = self.client.post(f"/api/accounting/periods/{self.p1.id}/close/", format="json")
         self.assertEqual(res_close.status_code, status.HTTP_403_FORBIDDEN)
 
+
+class FinancialReportsTestCase(APITestCase):
+    """
+    Blueprint Section #22 — Financial Reports Comprehensive Test Suite.
+    Validates P&L, Balance Sheet, Cash Flow, Trial Balance, Inventory Valuation,
+    Manufacturing Cost, Account Reconciliations, Drill-Down, and Exports.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Report Brewery Corp")
+        self.other_company = Company.objects.create(name="Rival Drinks Inc")
+
+        self.finance_user = User.objects.create_user(
+            username="cfo_clara",
+            password="password123",
+            company=self.company,
+            role="admin",
+        )
+        self.regular_user = User.objects.create_user(
+            username="operator_bob",
+            password="password123",
+            company=self.company,
+            role="store",
+        )
+        self.other_user = User.objects.create_user(
+            username="rival_cfo",
+            password="password123",
+            company=self.other_company,
+            role="admin",
+        )
+
+        ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_chart_of_accounts(self.other_company)
+
+        # Fiscal Year & Periods for Report Brewery Corp
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+        self.p1 = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="January 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+        self.p2 = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=2,
+            name="February 2026",
+            start_date=date(2026, 2, 1),
+            end_date=date(2026, 2, 28),
+            status="open",
+        )
+
+        # Fetch accounts
+        self.acc_cash = Account.objects.get(company=self.company, code="1010")
+        self.acc_ar = Account.objects.get(company=self.company, code="1100")
+        self.acc_raw = Account.objects.get(company=self.company, code="1210")
+        self.acc_ap = Account.objects.get(company=self.company, code="2010")
+        self.acc_equity = Account.objects.get(company=self.company, code="3010")
+        self.acc_sales = Account.objects.get(company=self.company, code="4010")
+        self.acc_mat_cogs = Account.objects.get(company=self.company, code="5010")
+        self.acc_labor_cogs = Account.objects.get(company=self.company, code="5100")
+        self.acc_overhead_cogs = Account.objects.get(company=self.company, code="5200")
+        self.acc_salaries_opex = Account.objects.get(company=self.company, code="6010")
+        self.acc_rent_opex = Account.objects.get(company=self.company, code="6050")
+
+        # Initial capital entry: Dr Cash 50,000, Cr Owner Capital 50,000
+        je_cap = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-CAP-01",
+            transaction_date=date(2026, 1, 2),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Initial Owner Capital Contribution",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_cap, line_number=1, account=self.acc_cash, debit=Decimal("50000.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_cap, line_number=2, account=self.acc_equity, debit=Decimal("0.00"), credit=Decimal("50000.00"))
+        post_journal_entry(je_cap.id, user=self.finance_user)
+
+        # Sales entry: Dr Cash 10,000, Cr Sales 10,000
+        je_sale = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-SALE-01",
+            transaction_date=date(2026, 1, 15),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Finished Goods Wholesale Sale",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_sale, line_number=1, account=self.acc_cash, debit=Decimal("10000.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_sale, line_number=2, account=self.acc_sales, debit=Decimal("0.00"), credit=Decimal("10000.00"))
+        post_journal_entry(je_sale.id, user=self.finance_user)
+
+        # Materials Purchase entry: Dr Raw Materials 4,000, Cr Cash 4,000
+        je_pur = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-PUR-01",
+            transaction_date=date(2026, 1, 16),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Raw Material Ingredients Purchase",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_pur, line_number=1, account=self.acc_raw, debit=Decimal("4000.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_pur, line_number=2, account=self.acc_cash, debit=Decimal("0.00"), credit=Decimal("4000.00"))
+        post_journal_entry(je_pur.id, user=self.finance_user)
+
+        # Materials Consumption (COGS): Dr Mat COGS 2,500, Cr Raw Materials 2,500
+        je_cons = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-CONS-01",
+            transaction_date=date(2026, 1, 20),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Batch Production Material Consumption",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_cons, line_number=1, account=self.acc_mat_cogs, debit=Decimal("2500.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_cons, line_number=2, account=self.acc_raw, debit=Decimal("0.00"), credit=Decimal("2500.00"))
+        post_journal_entry(je_cons.id, user=self.finance_user)
+
+        # Direct Labor (COGS): Dr Direct Labor 1,500, Cr Cash 1,500
+        je_lab = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-LAB-01",
+            transaction_date=date(2026, 1, 25),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Direct Production Wages",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_lab, line_number=1, account=self.acc_labor_cogs, debit=Decimal("1500.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_lab, line_number=2, account=self.acc_cash, debit=Decimal("0.00"), credit=Decimal("1500.00"))
+        post_journal_entry(je_lab.id, user=self.finance_user)
+
+        # Factory Overhead (COGS): Dr Overhead 800, Cr Cash 800
+        je_ovh = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-OVH-01",
+            transaction_date=date(2026, 1, 26),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Factory Utilities Applied",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_ovh, line_number=1, account=self.acc_overhead_cogs, debit=Decimal("800.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_ovh, line_number=2, account=self.acc_cash, debit=Decimal("0.00"), credit=Decimal("800.00"))
+        post_journal_entry(je_ovh.id, user=self.finance_user)
+
+        # Operating Expenses: Dr Admin Salaries 1,200, Dr Rent 600, Cr Cash 1,800
+        je_opex = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-OPEX-01",
+            transaction_date=date(2026, 1, 28),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Office Salaries and Facility Rent",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_opex, line_number=1, account=self.acc_salaries_opex, debit=Decimal("1200.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_opex, line_number=2, account=self.acc_rent_opex, debit=Decimal("600.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_opex, line_number=3, account=self.acc_cash, debit=Decimal("0.00"), credit=Decimal("1800.00"))
+        post_journal_entry(je_opex.id, user=self.finance_user)
+
+        self.client.force_authenticate(user=self.finance_user)
+
+    def test_profit_and_loss_report(self):
+        """Profit & Loss calculates accurate Revenue, COGS, OpEx, and Net Profit."""
+        res = self.client.get(f"/api/accounting/reports/profit-and-loss/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        summary = data["summary"]
+        self.assertEqual(Decimal(str(summary["total_revenue"])), Decimal("10000.00"))
+        # COGS = 2,500 (mat) + 1,500 (labor) + 800 (overhead) = 4,800.00
+        self.assertEqual(Decimal(str(summary["total_cogs"])), Decimal("4800.00"))
+        # Gross profit = 10,000 - 4,800 = 5,200.00
+        self.assertEqual(Decimal(str(summary["gross_profit"])), Decimal("5200.00"))
+        # OpEx = 1,200 + 600 = 1,800.00
+        self.assertEqual(Decimal(str(summary["total_opex"])), Decimal("1800.00"))
+        # Net profit = 5,200 - 1,800 = 3,400.00
+        self.assertEqual(Decimal(str(summary["net_profit"])), Decimal("3400.00"))
+        self.assertEqual(Decimal(str(summary["net_margin_pct"])), Decimal("34.00"))
+
+    def test_profit_and_loss_comparative(self):
+        """P&L comparative period returns variance amounts and percentages."""
+        res = self.client.get(f"/api/accounting/reports/profit-and-loss/?period_id={self.p1.id}&compare_to=previous_period")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("comparative_start_date", res.data)
+        rev_section = res.data["sections"]["revenue"]
+        self.assertIn("variance_amount", rev_section)
+        self.assertIn("variance_pct", rev_section)
+
+    def test_balance_sheet_equilibrium(self):
+        """Balance sheet respects Assets = Liabilities + Equity with unclosed net income included."""
+        res = self.client.get(f"/api/accounting/reports/balance-sheet/?as_of_date=2026-01-31")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertTrue(data["is_balanced"])
+        self.assertEqual(Decimal(str(data["discrepancy"])), Decimal("0.00"))
+
+        tot_assets = Decimal(str(data["summary"]["total_assets"]))
+        tot_liab_eq = Decimal(str(data["summary"]["total_liabilities_and_equity"]))
+        self.assertEqual(tot_assets, tot_liab_eq)
+
+        # Initial cash: 50,000 + 10,000 (sale) - 4,000 (purch) - 1,500 (labor) - 800 (ovh) - 1,800 (opex) = 51,900.00
+        # Raw materials: 4,000 - 2,500 = 1,500.00
+        # Total Assets = 51,900 + 1,500 = 53,400.00
+        # Equity: Contributed 50,000 + Net Income 3,400 = 53,400.00
+        self.assertEqual(tot_assets, Decimal("53400.00"))
+
+    def test_cash_flow_statement_reconciliation(self):
+        """Cash flow indirect method reconciles operating, investing, and financing flows to cash accounts."""
+        res = self.client.get(f"/api/accounting/reports/cash-flow/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        summary = data["summary"]
+        self.assertTrue(summary["cash_reconciled"])
+        self.assertEqual(Decimal(str(summary["ending_cash_calculated"])), Decimal(str(summary["ending_cash_actual"])))
+        self.assertEqual(Decimal(str(summary["ending_cash_actual"])), Decimal("51900.00"))
+
+    def test_trial_balance_report(self):
+        """Trial balance returns total closing debits equal to total closing credits."""
+        res = self.client.get(f"/api/accounting/reports/trial-balance/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertTrue(data["is_balanced"])
+        self.assertEqual(Decimal(str(data["totals"]["total_closing_debit"])), Decimal(str(data["totals"]["total_closing_credit"])))
+
+    def test_general_ledger_report(self):
+        """General ledger summary and account statement endpoints return ledger entries."""
+        res_summary = self.client.get(f"/api/accounting/reports/general-ledger/?period_id={self.p1.id}")
+        self.assertEqual(res_summary.status_code, status.HTTP_200_OK)
+        self.assertIn("accounts", res_summary.data)
+
+        res_acc = self.client.get(f"/api/accounting/reports/general-ledger/?account_id={self.acc_cash.id}&period_id={self.p1.id}")
+        self.assertEqual(res_acc.status_code, status.HTTP_200_OK)
+        self.assertIn("transactions", res_acc.data)
+
+    def test_inventory_valuation_report(self):
+        """Inventory valuation report shows opening, receipts, issues, and closing balances."""
+        res = self.client.get(f"/api/accounting/reports/inventory-valuation/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertIn("items", data)
+        raw_item = next((i for i in data["items"] if i["code"] == "1210"), None)
+        self.assertIsNotNone(raw_item)
+        self.assertEqual(Decimal(str(raw_item["receipts_additions"])), Decimal("4000.00"))
+        self.assertEqual(Decimal(str(raw_item["issues_consumption"])), Decimal("2500.00"))
+        self.assertEqual(Decimal(str(raw_item["closing_valuation"])), Decimal("1500.00"))
+
+    def test_manufacturing_cost_report(self):
+        """Manufacturing cost statement computes prime cost, conversion cost, and COGM."""
+        res = self.client.get(f"/api/accounting/reports/manufacturing-cost/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        kpis = data["kpis"]
+        # Direct materials 2500, Direct labor 1500 -> Prime cost = 4000
+        self.assertEqual(Decimal(str(kpis["prime_cost"])), Decimal("4000.00"))
+        # Direct labor 1500, Overhead 800 -> Conversion cost = 2300
+        self.assertEqual(Decimal(str(kpis["conversion_cost"])), Decimal("2300.00"))
+        # Total manufacturing costs = 4800.00
+        self.assertEqual(Decimal(str(kpis["total_manufacturing_costs"])), Decimal("4800.00"))
+
+    def test_account_reconciliation_report(self):
+        """Account reconciliation audits AR, AP, Bank, Tax, and Inventory control accounts."""
+        res = self.client.get("/api/accounting/reports/reconciliations/?as_of_date=2026-01-31")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+        self.assertIn("reconciliations", data)
+        self.assertTrue(len(data["reconciliations"]) >= 4)
+
+    def test_report_drill_down(self):
+        """Drill-down API returns individual line items for an account."""
+        res = self.client.get(f"/api/accounting/reports/drill-down/?account_id={self.acc_cash.id}&period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("transactions", res.data)
+        self.assertTrue(len(res.data["transactions"]) > 0)
+
+    def test_export_endpoints(self):
+        """Export endpoints generate CSV and JSON reports."""
+        res_csv = self.client.get(f"/api/accounting/reports/export/?report_type=profit_and_loss&export_format=csv&period_id={self.p1.id}")
+        self.assertEqual(res_csv.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_csv["Content-Type"], "text/csv")
+        self.assertIn("PROFIT AND LOSS", res_csv.content.decode())
+
+        res_json = self.client.get(f"/api/accounting/reports/export/?report_type=balance_sheet&export_format=json&as_of_date=2026-01-31")
+        self.assertEqual(res_json.status_code, status.HTTP_200_OK)
+        self.assertIn("summary", res_json.data)
+
+    def test_company_isolation(self):
+        """Company B cannot see Company A's financial reports."""
+        self.client.force_authenticate(user=self.other_user)
+
+        res = self.client.get(f"/api/accounting/reports/profit-and-loss/?start_date=2026-01-01&end_date=2026-01-31")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        summary = res.data["summary"]
+        # Rival company has zero transactions
+        self.assertEqual(Decimal(str(summary["total_revenue"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(summary["net_profit"])), Decimal("0.00"))
+
+    def test_permissions(self):
+        """Non-finance user gets 403 Forbidden on reports."""
+        self.client.force_authenticate(user=self.regular_user)
+        res = self.client.get(f"/api/accounting/reports/profit-and-loss/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_anon = self.client.get(f"/api/accounting/reports/profit-and-loss/?period_id={self.p1.id}")
+        self.assertEqual(res_anon.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
