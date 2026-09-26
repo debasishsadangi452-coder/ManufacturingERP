@@ -361,6 +361,25 @@ class AccountViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             "total_accounts": Account.objects.filter(company=company).count()
         })
 
+    @action(detail=True, methods=["post"], url_path="activate")
+    def activate(self, request, pk=None):
+        """Blueprint #25: Activate an inactive account."""
+        account = self.get_object()
+        account.is_active = True
+        account.save(update_fields=["is_active"])
+        serializer = self.get_serializer(account)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="deactivate")
+    def deactivate(self, request, pk=None):
+        """Blueprint #25: Deactivate an active account."""
+        account = self.get_object()
+        account.is_active = False
+        account.save(update_fields=["is_active"])
+        serializer = self.get_serializer(account)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
 
 class AccountingSettingsViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     """Company Accounting Settings."""
@@ -551,7 +570,56 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             )
         return super().destroy(request, *args, **kwargs)
 
+    @action(detail=True, methods=["get", "post"], url_path="validate")
+    def validate_entry(self, request, pk=None):
+        """
+        Blueprint #25: Validate a journal entry against double-entry balance,
+        accounting periods, lock dates, and account posting rules without posting.
+        """
+        entry = self.get_object()
+        errors = []
+        warnings = []
+
+        lines = entry.lines.all()
+        if not lines.exists():
+            errors.append("Journal entry has no lines.")
+        total_debit = sum(l.debit for l in lines)
+        total_credit = sum(l.credit for l in lines)
+        if total_debit != total_credit:
+            errors.append(f"Journal entry is out of balance. Total Debits: {total_debit}, Total Credits: {total_credit}.")
+
+        if not entry.accounting_period:
+            warnings.append("No accounting period explicitly assigned (will be auto-assigned on save).")
+        elif entry.accounting_period.status != "open":
+            errors.append(f"Accounting period '{entry.accounting_period.name}' has status '{entry.accounting_period.status}'.")
+
+        settings = getattr(entry.company, "accounting_settings", None)
+        if settings and settings.lock_date and entry.transaction_date:
+            if entry.transaction_date <= settings.lock_date:
+                errors.append(f"Transaction date is on or prior to global lock date ({settings.lock_date}).")
+
+        for l in lines:
+            if not l.account.is_active:
+                errors.append(f"Line {l.line_number}: Account '{l.account.code}' is inactive.")
+            if l.debit > 0 and l.credit > 0:
+                errors.append(f"Line {l.line_number}: Line contains both debit and credit.")
+            if l.debit == 0 and l.credit == 0:
+                errors.append(f"Line {l.line_number}: Line has zero debit and credit.")
+
+        is_valid = len(errors) == 0
+        return Response({
+            "entry_number": entry.entry_number,
+            "status": entry.status,
+            "is_valid": is_valid,
+            "total_debit": str(total_debit),
+            "total_credit": str(total_credit),
+            "difference": str(abs(total_debit - total_credit)),
+            "errors": errors,
+            "warnings": warnings,
+        }, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["post"], url_path="submit")
+
     def submit_entry(self, request, pk=None):
         """Submit a draft journal entry for approval."""
         entry = self.get_object()
@@ -3646,4 +3714,59 @@ class DatabaseArchitectureViewSet(viewsets.ViewSet):
             return Response(data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #25 — API ARCHITECTURE VIEWS
+# ==============================================================================
+
+from .api_architecture import (
+    get_api_architecture_metadata,
+    verify_api_architecture_health,
+)
+
+
+class APIArchitectureViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #25 — API Architecture API.
+    Provides complete endpoint registry across 11 core categories,
+    layered architecture specs, architectural concern enforcements, and live health diagnostics.
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        """GET /api/accounting/api-architecture/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_api_architecture_metadata(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="health")
+    def health(self, request):
+        """GET /api/accounting/api-architecture/health/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_api_architecture_health(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="verify")
+    def verify(self, request):
+        """POST /api/accounting/api-architecture/verify/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_api_architecture_health(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 

@@ -7431,3 +7431,244 @@ class DatabaseArchitectureTestCase(APITestCase):
         self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #25 — API ARCHITECTURE TESTS
+# ==============================================================================
+
+from accounting.api_architecture import (
+    get_api_architecture_metadata,
+    verify_api_architecture_health,
+    API_CATEGORIES_SPEC,
+    ARCHITECTURAL_CONCERNS_SPEC,
+)
+
+
+class APIArchitectureTestCase(APITestCase):
+    """
+    Automated verification suite for Blueprint Section #25 (API Architecture).
+    Validates:
+    1. Complete endpoint mapping across all 11 core categories from Blueprint Page 30.
+    2. Enforcement of the 8 architectural concerns from Page 37 (JWT, RBAC, Two-tier validation, Atomicity, etc.).
+    3. Layered architecture specification (View -> Serializer -> Service -> Model -> DB).
+    4. Dedicated endpoints for Account activate / deactivate.
+    5. Dedicated endpoint for Journal Entry pre-flight validation.
+    6. Multi-tenant company isolation and permission restrictions (401/403).
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="API Arch Alpha Corp")
+        self.user = User.objects.create_user(
+            username="api_arch_admin",
+            password="password123",
+            company=self.company,
+            role="admin",
+        )
+        self.regular_user = User.objects.create_user(
+            username="api_arch_regular",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+
+        # Company B for cross-tenant isolation tests
+        self.company_b = Company.objects.create(name="API Arch Beta Corp")
+        self.user_b = User.objects.create_user(
+            username="api_arch_user_b",
+            password="password123",
+            company=self.company_b,
+            role="finance",
+        )
+
+        # Basic setup
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            is_closed=False,
+        )
+        self.period = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+
+        self.asset_type = AccountType.objects.filter(category="ASSET").first()
+        if not self.asset_type:
+            self.asset_type = AccountType.objects.create(
+                name="Current Asset", category="ASSET", normal_balance="DEBIT", code_prefix="1"
+            )
+
+        self.test_account = Account.objects.create(
+            company=self.company,
+            account_type=self.asset_type,
+            code="1080",
+            name="API Test Cash Account",
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.user)
+
+    def test_api_architecture_metadata_endpoint(self):
+        """Test GET /api/accounting/api-architecture/ returns catalog across all 11 Blueprint categories."""
+        res = self.client.get("/api/accounting/api-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        # 1. Tenant info
+        self.assertEqual(data["tenant"]["company_id"], self.company.id)
+        self.assertEqual(data["tenant"]["company_name"], "API Arch Alpha Corp")
+
+        # 2. Summary
+        self.assertEqual(data["summary"]["total_categories"], 11)
+        self.assertTrue(data["summary"]["total_documented_endpoints"] >= 35)
+        self.assertEqual(data["summary"]["authentication_mode"], "JWT Bearer Token")
+        self.assertEqual(data["summary"]["authorization_mode"], "Role-Based Access Control (IsFinanceOrAdmin)")
+
+        # 3. All 11 categories present from Blueprint Section #25 Page 30
+        category_ids = [c["category_id"] for c in data["categories"]]
+        required_categories = [
+            "authentication",
+            "accounts",
+            "journals",
+            "ledger",
+            "receivables",
+            "payables",
+            "cash_bank",
+            "expenses_taxes",
+            "reports_dashboard",
+            "periods_years",
+            "audit_logs",
+        ]
+        for req_cat in required_categories:
+            self.assertIn(req_cat, category_ids, f"Category {req_cat} must be documented")
+
+        # 4. All 8 architectural concerns present from Research Page 37
+        concern_ids = [c["concern_id"] for c in data["concerns"]]
+        required_concerns = [
+            "authentication",
+            "authorization",
+            "two_tier_validation",
+            "transaction_atomicity",
+            "error_handling",
+            "pagination",
+            "filtering_tenant_scoping",
+            "audit_logging",
+        ]
+        for req_con in required_concerns:
+            self.assertIn(req_con, concern_ids, f"Architectural concern {req_con} must be documented")
+
+        # 5. Layered architecture specification
+        layers = data["layered_architecture"]["layers"]
+        self.assertEqual(len(layers), 4)
+
+    def test_api_architecture_health_endpoint(self):
+        """Test GET /api/accounting/api-architecture/health/ passes all 8 architectural checks."""
+        res = self.client.get("/api/accounting/api-architecture/health/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["status"], "HEALTHY")
+        self.assertEqual(data["overall_errors"], 0)
+        self.assertEqual(data["total_checks"], 8)
+        self.assertEqual(data["passing_checks"], 8)
+
+    def test_api_architecture_verify_post_action(self):
+        """Test POST /api/accounting/api-architecture/verify/ executes diagnostic check."""
+        res = self.client.post("/api/accounting/api-architecture/verify/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "HEALTHY")
+
+    def test_account_activate_and_deactivate_endpoints(self):
+        """Test Blueprint #25 requirement: activate and deactivate account endpoints."""
+        acc_id = self.test_account.id
+
+        # Deactivate
+        res_deact = self.client.post(f"/api/accounting/accounts/{acc_id}/deactivate/")
+        self.assertEqual(res_deact.status_code, status.HTTP_200_OK)
+        self.assertFalse(res_deact.data["is_active"])
+        self.test_account.refresh_from_db()
+        self.assertFalse(self.test_account.is_active)
+
+        # Activate
+        res_act = self.client.post(f"/api/accounting/accounts/{acc_id}/activate/")
+        self.assertEqual(res_act.status_code, status.HTTP_200_OK)
+        self.assertTrue(res_act.data["is_active"])
+        self.test_account.refresh_from_db()
+        self.assertTrue(self.test_account.is_active)
+
+    def test_journal_entry_validate_endpoint(self):
+        """Test Blueprint #25 requirement: journals validate endpoint without posting."""
+        # 1. Create a balanced draft journal entry
+        entry = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-VAL-001",
+            entry_type="manual",
+            transaction_date=date(2026, 1, 15),
+            accounting_period=self.period,
+            status="draft",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=self.test_account,
+            line_number=1,
+            debit=Decimal("250.00"),
+            credit=Decimal("0.00"),
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=self.test_account,
+            line_number=2,
+            debit=Decimal("0.00"),
+            credit=Decimal("250.00"),
+        )
+
+        res_val = self.client.post(f"/api/accounting/journal-entries/{entry.id}/validate/")
+        self.assertEqual(res_val.status_code, status.HTTP_200_OK)
+        self.assertTrue(res_val.data["is_valid"])
+        self.assertEqual(len(res_val.data["errors"]), 0)
+        self.assertEqual(res_val.data["total_debit"], "250.00")
+        self.assertEqual(res_val.data["total_credit"], "250.00")
+
+        # 2. Corrupt line to be unbalanced and re-validate
+        l2 = entry.lines.filter(line_number=2).first()
+        JournalEntryLine.objects.filter(id=l2.id).update(credit=Decimal("200.00"))
+
+        res_unbal = self.client.get(f"/api/accounting/journal-entries/{entry.id}/validate/")
+        self.assertEqual(res_unbal.status_code, status.HTTP_200_OK)
+        self.assertFalse(res_unbal.data["is_valid"])
+        self.assertTrue(len(res_unbal.data["errors"]) >= 1)
+        self.assertIn("out of balance", res_unbal.data["errors"][0])
+
+    def test_company_isolation(self):
+        """Company B only views its own tenant API context and cannot access Company A objects."""
+        self.client.force_authenticate(user=self.user_b)
+        res = self.client.get("/api/accounting/api-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["tenant"]["company_id"], self.company_b.id)
+
+        # Company B cannot deactivate Company A's account
+        res_cross = self.client.post(f"/api/accounting/accounts/{self.test_account.id}/deactivate/")
+        self.assertEqual(res_cross.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_permissions(self):
+        """Non-finance user receives 403 Forbidden; anonymous user receives 401 Unauthorized."""
+        self.client.force_authenticate(user=self.regular_user)
+        res_forbidden = self.client.get("/api/accounting/api-architecture/")
+        self.assertEqual(res_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_health_forbidden = self.client.get("/api/accounting/api-architecture/health/")
+        self.assertEqual(res_health_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_unauth = self.client.get("/api/accounting/api-architecture/")
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+
