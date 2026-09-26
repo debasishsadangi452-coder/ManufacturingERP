@@ -4,7 +4,8 @@ from decimal import Decimal
 from .models import (
     FiscalYear, AccountingPeriod, AccountType, Account, AccountingSettings,
     BankAccount, BankReconciliation, BankTransaction, BankAuditLog,
-    Payment, PaymentAllocation, PaymentAuditLog
+    Payment, PaymentAllocation, PaymentAuditLog,
+    TaxCode, TaxTransactionLine, TaxAdjustment, TaxAuditLog
 )
 
 
@@ -1211,6 +1212,211 @@ class AllocatePaymentInputSerializer(serializers.Serializer):
 
 
 class ReversePaymentInputSerializer(serializers.Serializer):
+    reason = serializers.CharField(min_length=3, max_length=255)
+
+
+# =============================================================================
+# BLUEPRINT SECTION #19 — TAX LAYER SERIALIZERS
+# =============================================================================
+
+class TaxCodeSerializer(serializers.ModelSerializer):
+    tax_account_code = serializers.ReadOnlyField(source="tax_account.code")
+    tax_account_name = serializers.ReadOnlyField(source="tax_account.name")
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TaxCode
+        fields = [
+            "id",
+            "code",
+            "name",
+            "description",
+            "rate",
+            "tax_type",
+            "calculation_mode",
+            "tax_account",
+            "tax_account_code",
+            "tax_account_name",
+            "is_recoverable",
+            "is_active",
+            "effective_from",
+            "effective_to",
+            "metadata",
+            "created_by",
+            "created_by_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "tax_account_code", "tax_account_name", "created_by_name", "created_at", "updated_at"]
+
+    def get_created_by_name(self, obj):
+        return (obj.created_by.get_full_name() or obj.created_by.username) if obj.created_by else None
+
+    def validate_rate(self, value):
+        if value < Decimal("0.0000"):
+            raise serializers.ValidationError("Tax rate cannot be negative.")
+        return value
+
+
+class TaxTransactionLineSerializer(serializers.ModelSerializer):
+    tax_code_str = serializers.ReadOnlyField(source="tax_code.code")
+    tax_code_name = serializers.ReadOnlyField(source="tax_code.name")
+    tax_account_code = serializers.ReadOnlyField(source="tax_account.code")
+    tax_account_name = serializers.ReadOnlyField(source="tax_account.name")
+    journal_entry_number = serializers.ReadOnlyField(source="journal_entry.entry_number")
+    reversal_journal_entry_number = serializers.ReadOnlyField(source="reversal_journal_entry.entry_number")
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TaxTransactionLine
+        fields = [
+            "id",
+            "tax_code",
+            "tax_code_str",
+            "tax_code_name",
+            "tax_account",
+            "tax_account_code",
+            "tax_account_name",
+            "source_module",
+            "source_id",
+            "source_reference",
+            "source_line_id",
+            "taxable_amount",
+            "tax_rate",
+            "tax_amount",
+            "total_amount",
+            "calculation_mode",
+            "transaction_date",
+            "journal_entry",
+            "journal_entry_number",
+            "is_posted",
+            "is_reversed",
+            "reversed_at",
+            "reversal_reference",
+            "reversal_journal_entry",
+            "reversal_journal_entry_number",
+            "created_by_name",
+            "metadata",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [f for f in fields]
+
+    def get_created_by_name(self, obj):
+        return (obj.created_by.get_full_name() or obj.created_by.username) if obj.created_by else None
+
+
+class TaxAdjustmentSerializer(serializers.ModelSerializer):
+    tax_code_str = serializers.ReadOnlyField(source="tax_code.code")
+    tax_account_code = serializers.ReadOnlyField(source="tax_account.code")
+    tax_account_name = serializers.ReadOnlyField(source="tax_account.name")
+    offset_account_code = serializers.ReadOnlyField(source="offset_account.code")
+    offset_account_name = serializers.ReadOnlyField(source="offset_account.name")
+    journal_entry_number = serializers.ReadOnlyField(source="journal_entry.entry_number")
+    reversal_journal_entry_number = serializers.ReadOnlyField(source="reversal_journal_entry.entry_number")
+    created_by_name = serializers.SerializerMethodField()
+    posted_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TaxAdjustment
+        fields = [
+            "id",
+            "adjustment_number",
+            "tax_code",
+            "tax_code_str",
+            "original_tax_line",
+            "tax_account",
+            "tax_account_code",
+            "tax_account_name",
+            "offset_account",
+            "offset_account_code",
+            "offset_account_name",
+            "adjustment_direction",
+            "taxable_amount",
+            "tax_amount",
+            "adjustment_date",
+            "reason",
+            "status",
+            "journal_entry",
+            "journal_entry_number",
+            "reversal_journal_entry",
+            "reversal_journal_entry_number",
+            "created_by",
+            "created_by_name",
+            "posted_by",
+            "posted_by_name",
+            "posted_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id", "adjustment_number", "tax_code_str", "tax_account_code", "tax_account_name",
+            "offset_account_code", "offset_account_name", "journal_entry_number",
+            "reversal_journal_entry_number", "created_by_name", "posted_by_name",
+            "posted_at", "created_at", "updated_at"
+        ]
+
+    def get_created_by_name(self, obj):
+        return (obj.created_by.get_full_name() or obj.created_by.username) if obj.created_by else None
+
+    def get_posted_by_name(self, obj):
+        return (obj.posted_by.get_full_name() or obj.posted_by.username) if obj.posted_by else None
+
+
+class TaxAuditLogSerializer(serializers.ModelSerializer):
+    actor_name = serializers.SerializerMethodField()
+    tax_code_str = serializers.ReadOnlyField(source="tax_code.code")
+
+    class Meta:
+        model = TaxAuditLog
+        fields = [
+            "id",
+            "action",
+            "tax_code",
+            "tax_code_str",
+            "tax_line",
+            "tax_adjustment",
+            "actor",
+            "actor_name",
+            "details",
+            "notes",
+            "created_at",
+        ]
+
+    def get_actor_name(self, obj):
+        return (obj.actor.get_full_name() or obj.actor.username) if obj.actor else None
+
+
+class CalculateTaxInputSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2, min_value=Decimal("0.00"))
+    tax_code_id = serializers.IntegerField(required=False, allow_null=True)
+    tax_rate = serializers.DecimalField(max_digits=7, decimal_places=4, required=False, allow_null=True)
+    calculation_mode = serializers.ChoiceField(choices=["exclusive", "inclusive"], required=False, default="exclusive")
+    precision = serializers.IntegerField(required=False, default=2, min_value=0, max_value=6)
+
+
+class CreateTaxAdjustmentInputSerializer(serializers.Serializer):
+    tax_code_id = serializers.IntegerField(required=False, allow_null=True)
+    original_tax_line_id = serializers.IntegerField(required=False, allow_null=True)
+    tax_account_id = serializers.IntegerField(required=False, allow_null=True)
+    offset_account_id = serializers.IntegerField(required=True)
+    adjustment_direction = serializers.ChoiceField(
+        choices=[
+            "increase_liability",
+            "decrease_liability",
+            "increase_credit",
+            "decrease_credit",
+        ],
+        default="increase_liability"
+    )
+    taxable_amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
+    tax_amount = serializers.DecimalField(max_digits=18, decimal_places=2, min_value=Decimal("0.01"))
+    adjustment_date = serializers.DateField(required=False)
+    reason = serializers.CharField(min_length=3)
+    auto_post = serializers.BooleanField(required=False, default=False)
+
+
+class ReverseTaxLineInputSerializer(serializers.Serializer):
     reason = serializers.CharField(min_length=3, max_length=255)
 
 

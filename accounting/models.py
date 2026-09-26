@@ -451,6 +451,31 @@ class AccountingSettings(models.Model):
         related_name="+",
         help_text="Leaf equity account for opening balance offset (e.g. 3010 Common Stock / Owner Capital)"
     )
+    # Section #19 — Tax Layer Defaults
+    default_sales_tax_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf sales tax payable account (e.g. 2200 Sales Tax Payable)"
+    )
+    default_purchase_tax_account = models.ForeignKey(
+        Account,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default leaf input tax recoverable account (e.g. 1310 Input Tax Recoverable)"
+    )
+    default_tax_code = models.ForeignKey(
+        "accounting.TaxCode",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Default active tax code for sales and purchase transactions"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -484,10 +509,14 @@ class AccountingSettings(models.Model):
             ("expenses_default_employee_payable_account", self.expenses_default_employee_payable_account),
             ("expenses_default_tax_account", self.expenses_default_tax_account),
             ("opening_balance_equity_account", self.opening_balance_equity_account),
+            ("default_sales_tax_account", self.default_sales_tax_account),
+            ("default_purchase_tax_account", self.default_purchase_tax_account),
         ]
         for field_name, acc in inv_account_fields:
             if acc and self.company_id and acc.company_id != self.company_id:
                 raise ValidationError({field_name: _(f"{field_name} must belong to this company.")})
+        if self.default_tax_code and self.company_id and self.default_tax_code.company_id != self.company_id:
+            raise ValidationError({"default_tax_code": _("Default tax code must belong to this company.")})
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -1911,6 +1940,368 @@ class PaymentAuditLog(models.Model):
 
     def __str__(self):
         return f"PaymentAudit: {self.payment.payment_number} - {self.action} at {self.created_at}"
+
+
+# =============================================================================
+# BLUEPRINT SECTION #19 — TAX LAYER
+# =============================================================================
+
+class TaxCode(models.Model):
+    """
+    Blueprint Section #19 — Configurable Tax Master Data.
+    Defines tax codes, rates, calculation modes (inclusive vs. exclusive), and posting tax account mapping.
+    """
+    CALCULATION_MODE_CHOICES = [
+        ("exclusive", "Tax Exclusive"),
+        ("inclusive", "Tax Inclusive"),
+    ]
+    TAX_TYPE_CHOICES = [
+        ("sales", "Output Tax (Sales)"),
+        ("purchase", "Input Tax (Purchase)"),
+        ("both", "Both (Sales & Purchase)"),
+        ("other", "Other / Special Tax"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="tax_codes",
+        help_text="Tenant company that owns this tax code."
+    )
+    code = models.CharField(max_length=30, help_text="Unique tax code, e.g. STD-18, ZERO, EXEMPT, VAT-20")
+    name = models.CharField(max_length=120, help_text="Human-readable description, e.g. Standard Sales Tax 18%")
+    description = models.TextField(blank=True, default="")
+    rate = models.DecimalField(
+        max_digits=7,
+        decimal_places=4,
+        default=Decimal("0.0000"),
+        help_text="Tax rate percentage (e.g. 18.0000 for 18%)"
+    )
+    tax_type = models.CharField(max_length=20, choices=TAX_TYPE_CHOICES, default="both")
+    calculation_mode = models.CharField(max_length=20, choices=CALCULATION_MODE_CHOICES, default="exclusive")
+    tax_account = models.ForeignKey(
+        Account,
+        on_delete=models.PROTECT,
+        related_name="tax_codes",
+        help_text="Active leaf account mapped for posting this tax (e.g. 2200 Sales Tax Payable or 1310 Input Tax Recoverable)"
+    )
+    is_recoverable = models.BooleanField(
+        default=True,
+        help_text="Whether input tax under this code can be claimed/recovered as an asset tax credit"
+    )
+    is_active = models.BooleanField(default=True)
+    effective_from = models.DateField(null=True, blank=True)
+    effective_to = models.DateField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    updated_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["code"]
+        unique_together = [("company", "code")]
+
+    def clean(self):
+        super().clean()
+        if self.rate is not None and self.rate < Decimal("0.0000"):
+            raise ValidationError({"rate": _("Tax rate cannot be negative.")})
+        if self.tax_account_id:
+            if self.company_id and self.tax_account.company_id != self.company_id:
+                raise ValidationError({"tax_account": _("Tax account must belong to the same company.")})
+            if self.tax_account.is_header:
+                raise ValidationError({"tax_account": _("Tax account must be an active leaf posting account, not a header.")})
+            if not self.tax_account.is_active:
+                raise ValidationError({"tax_account": _("Tax account must be active.")})
+        if self.effective_from and self.effective_to and self.effective_from > self.effective_to:
+            raise ValidationError({"effective_to": _("Effective-to date cannot be earlier than effective-from date.")})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.code} - {self.name} ({self.rate}% {self.get_calculation_mode_display()})"
+
+
+class TaxTransactionLine(models.Model):
+    """
+    Blueprint Section #19 — Transaction-level tax breakdown.
+    Records the granular tax calculation for sales invoices, purchase bills, expenses, and adjustments.
+    """
+    SOURCE_MODULE_CHOICES = [
+        ("sales", "Sales Invoice"),
+        ("purchases", "Purchase Bill"),
+        ("expenses", "Expense"),
+        ("tax_adjustment", "Tax Adjustment"),
+        ("manual", "Manual Journal / Direct"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="tax_transaction_lines"
+    )
+    tax_code = models.ForeignKey(
+        TaxCode,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="transaction_lines"
+    )
+    tax_account = models.ForeignKey(
+        Account,
+        on_delete=models.PROTECT,
+        related_name="tax_transaction_lines"
+    )
+    source_module = models.CharField(max_length=30, choices=SOURCE_MODULE_CHOICES)
+    source_id = models.CharField(max_length=100, blank=True, default="", help_text="Primary key of source record")
+    source_reference = models.CharField(max_length=100, blank=True, default="", help_text="Human identifier e.g. INV-2026-0001")
+    source_line_id = models.CharField(max_length=100, blank=True, default="")
+    taxable_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    tax_rate = models.DecimalField(max_digits=7, decimal_places=4, default=Decimal("0.0000"))
+    tax_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    total_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    calculation_mode = models.CharField(max_length=20, default="exclusive")
+    transaction_date = models.DateField()
+    journal_entry = models.ForeignKey(
+        "accounting.JournalEntry",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="tax_lines"
+    )
+    is_posted = models.BooleanField(default=True)
+    is_reversed = models.BooleanField(default=False)
+    reversed_at = models.DateTimeField(null=True, blank=True)
+    reversal_reference = models.CharField(max_length=100, blank=True, default="")
+    reversal_journal_entry = models.ForeignKey(
+        "accounting.JournalEntry",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    created_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-transaction_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "source_module", "source_id"]),
+            models.Index(fields=["company", "transaction_date"]),
+            models.Index(fields=["company", "is_reversed"]),
+        ]
+
+    def __str__(self):
+        code_str = self.tax_code.code if self.tax_code else "CUSTOM"
+        return f"{self.source_reference} [{self.source_module}] - {code_str} ${self.tax_amount:.2f} ({self.transaction_date})"
+
+
+class TaxAdjustment(models.Model):
+    """
+    Blueprint Section #19 — Controlled Tax Adjustment.
+    Allows adjustment of tax liability or input tax credits through a balanced double-entry journal,
+    without silently mutating posted historical records.
+    """
+    DIRECTION_CHOICES = [
+        ("increase_liability", "Increase Tax Liability (Output Tax)"),
+        ("decrease_liability", "Decrease Tax Liability (Output Tax)"),
+        ("increase_credit", "Increase Input Tax Credit"),
+        ("decrease_credit", "Decrease Input Tax Credit"),
+    ]
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("posted", "Posted"),
+        ("cancelled", "Cancelled"),
+        ("reversed", "Reversed"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="tax_adjustments"
+    )
+    adjustment_number = models.CharField(max_length=60, unique=True)
+    tax_code = models.ForeignKey(
+        TaxCode,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="adjustments"
+    )
+    original_tax_line = models.ForeignKey(
+        TaxTransactionLine,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="adjustments"
+    )
+    tax_account = models.ForeignKey(
+        Account,
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text="The tax liability or asset account being adjusted"
+    )
+    offset_account = models.ForeignKey(
+        Account,
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text="Balancing offset account (e.g. Tax Expense, General Expense, Revenue, or Retained Earnings)"
+    )
+    adjustment_direction = models.CharField(max_length=30, choices=DIRECTION_CHOICES, default="increase_liability")
+    taxable_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    tax_amount = models.DecimalField(max_digits=18, decimal_places=2, help_text="Adjustment amount (positive)")
+    adjustment_date = models.DateField()
+    reason = models.TextField(help_text="Mandatory business reason / justification")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
+    journal_entry = models.ForeignKey(
+        "accounting.JournalEntry",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="tax_adjustment_entries"
+    )
+    reversal_journal_entry = models.ForeignKey(
+        "accounting.JournalEntry",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    created_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    posted_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    posted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-adjustment_date", "-created_at"]
+
+    def clean(self):
+        super().clean()
+        if self.tax_amount is not None and self.tax_amount <= Decimal("0.00"):
+            raise ValidationError({"tax_amount": _("Adjustment tax amount must be greater than zero.")})
+        if self.tax_account_id and self.company_id and self.tax_account.company_id != self.company_id:
+            raise ValidationError({"tax_account": _("Tax account must belong to the company.")})
+        if self.offset_account_id and self.company_id and self.offset_account.company_id != self.company_id:
+            raise ValidationError({"offset_account": _("Offset account must belong to the company.")})
+        if self.tax_account_id and self.tax_account.is_header:
+            raise ValidationError({"tax_account": _("Tax account must be a leaf account.")})
+        if self.offset_account_id and self.offset_account.is_header:
+            raise ValidationError({"offset_account": _("Offset account must be a leaf account.")})
+        if self.tax_account_id and not self.tax_account.is_active:
+            raise ValidationError({"tax_account": _("Tax account must be active.")})
+        if self.offset_account_id and not self.offset_account.is_active:
+            raise ValidationError({"offset_account": _("Offset account must be active.")})
+
+    def save(self, *args, **kwargs):
+        if not self.adjustment_number and self.company_id:
+            year = self.adjustment_date.year if self.adjustment_date else timezone.now().year
+            prefix = f"TAX-ADJ-{year}-"
+            last_record = TaxAdjustment.objects.filter(
+                company_id=self.company_id,
+                adjustment_number__startswith=prefix
+            ).order_by("-adjustment_number").first()
+            if last_record and last_record.adjustment_number:
+                try:
+                    last_seq = int(last_record.adjustment_number.split("-")[-1])
+                    seq = last_seq + 1
+                except (ValueError, IndexError):
+                    seq = 1
+            else:
+                seq = 1
+            self.adjustment_number = f"{prefix}{seq:05d}"
+
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.adjustment_number}: {self.get_adjustment_direction_display()} ${self.tax_amount:.2f} ({self.status})"
+
+
+class TaxAuditLog(models.Model):
+    """
+    Blueprint Section #19 — Immutable Audit Trail for Tax Configuration & Adjustments.
+    """
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="tax_audit_logs"
+    )
+    tax_code = models.ForeignKey(
+        TaxCode,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    tax_line = models.ForeignKey(
+        TaxTransactionLine,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    tax_adjustment = models.ForeignKey(
+        TaxAdjustment,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    action = models.CharField(
+        max_length=60,
+        help_text="e.g. tax_code_created, tax_code_updated, tax_code_deactivated, tax_adjustment_posted, tax_reversed"
+    )
+    actor = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+"
+    )
+    details = models.JSONField(default=dict, blank=True)
+    notes = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"TaxAudit: {self.action} by {self.actor} at {self.created_at}"
 
 
 

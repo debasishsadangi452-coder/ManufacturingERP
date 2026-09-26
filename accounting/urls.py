@@ -24,6 +24,10 @@ from .views import (
     BankingSummaryViewSet,
     PaymentViewSet,
     PaymentAllocationViewSet,
+    TaxCodeViewSet,
+    TaxTransactionLineViewSet,
+    TaxAdjustmentViewSet,
+    TaxManagementViewSet,
 )
 
 router = DefaultRouter()
@@ -50,8 +54,13 @@ router.register(r'bank-reconciliations', BankReconciliationViewSet, basename='ac
 router.register(r'banking', BankingSummaryViewSet, basename='accounting-banking')
 router.register(r'payments', PaymentViewSet, basename='accounting-payments')
 router.register(r'payment-allocations', PaymentAllocationViewSet, basename='accounting-payment-allocations')
+router.register(r'tax-codes', TaxCodeViewSet, basename='accounting-tax-codes')
+router.register(r'tax-lines', TaxTransactionLineViewSet, basename='accounting-tax-lines')
+router.register(r'tax-adjustments', TaxAdjustmentViewSet, basename='accounting-tax-adjustments')
+router.register(r'taxes', TaxManagementViewSet, basename='accounting-taxes')
 
 urlpatterns = [
     path('', include(router.urls)),
 ]
+
 

@@ -5216,6 +5216,480 @@ class PaymentsAllocationsTestCase(TestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
+# =============================================================================
+# BLUEPRINT SECTION #19 — TAX LAYER TESTS
+# =============================================================================
+
+from decimal import Decimal
+from accounting.models import (
+    TaxCode,
+    TaxTransactionLine,
+    TaxAdjustment,
+    TaxAuditLog,
+)
+from accounting.tax import (
+    calculate_tax,
+    calculate_lines_tax,
+    record_tax_line,
+    create_tax_adjustment,
+    post_tax_adjustment,
+    reverse_tax_adjustment,
+    reverse_tax_transaction_line,
+    get_tax_summary,
+    get_tax_report,
+    seed_default_tax_codes,
+)
+from sales.models import Customer, Invoice
+from procurement.models import Vendor, Bill
+from accounting.sales_accounting import post_sales_invoice_to_accounting, reverse_sales_invoice_accounting
+from accounting.purchase_accounting import post_purchase_to_accounting, reverse_purchase_accounting
+
+
+class TaxLayerTestCase(APITestCase):
+    """
+    Blueprint Section #19 — Comprehensive Tests for Tax Layer.
+    Tests tax calculations (inclusive/exclusive), master data, account mappings,
+    transaction lines, adjustments, reversals, period controls, GL reconciliation,
+    and company isolation.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Apex Brewing Corp", slug="apex-brew")
+        self.other_company = Company.objects.create(name="Rival Beverages", slug="rival-bev")
+
+        self.types = ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_chart_of_accounts(self.other_company)
+
+        self.fy = seed_standard_fiscal_year(self.company, year=2026)
+        self.other_fy = seed_standard_fiscal_year(self.other_company, year=2026)
+
+        self.finance_user = User.objects.create_user(
+            username="tax_officer",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.finance_user)
+
+        self.sales_tax_acc = Account.objects.filter(company=self.company, code="2200").first()
+        if not self.sales_tax_acc:
+            from accounting.sales_accounting import get_tax_payable_account
+            self.sales_tax_acc = get_tax_payable_account(self.company)
+
+        self.input_tax_acc = Account.objects.filter(company=self.company, code="1310").first()
+        if not self.input_tax_acc:
+            from accounting.purchase_accounting import get_input_tax_account
+            self.input_tax_acc = get_input_tax_account(self.company)
+
+        self.expense_offset_acc = Account.objects.filter(company=self.company, code="2110").first()
+        if not self.expense_offset_acc:
+            self.expense_offset_acc = Account.objects.filter(company=self.company, children__isnull=True).exclude(id=self.sales_tax_acc.id).first()
+
+        # Seed standard default codes
+        seed_default_tax_codes(self.company, user=self.finance_user)
+        self.std_code = TaxCode.objects.filter(company=self.company, code="STD-10").first()
+
+    def test_tax_calculation_exclusive(self):
+        """Standard tax exclusive: amount=100, rate=18% -> base=100, tax=18, gross=118."""
+        res = calculate_tax(
+            amount=Decimal("100.00"),
+            tax_rate=Decimal("18.0000"),
+            calculation_mode="exclusive"
+        )
+        self.assertEqual(res["taxable_amount"], Decimal("100.00"))
+        self.assertEqual(res["tax_amount"], Decimal("18.00"))
+        self.assertEqual(res["total_amount"], Decimal("118.00"))
+        self.assertEqual(res["calculation_mode"], "exclusive")
+
+    def test_tax_calculation_inclusive(self):
+        """Tax inclusive: gross=118, rate=18% -> base=100, tax=18, gross=118."""
+        res = calculate_tax(
+            amount=Decimal("118.00"),
+            tax_rate=Decimal("18.0000"),
+            calculation_mode="inclusive"
+        )
+        self.assertEqual(res["taxable_amount"], Decimal("100.00"))
+        self.assertEqual(res["tax_amount"], Decimal("18.00"))
+        self.assertEqual(res["total_amount"], Decimal("118.00"))
+        self.assertEqual(res["calculation_mode"], "inclusive")
+
+    def test_tax_calculation_zero_rate(self):
+        """Zero rated or exempt calculation: rate=0% -> tax=0, total=amount."""
+        res = calculate_tax(
+            amount=Decimal("250.50"),
+            tax_rate=Decimal("0.0000"),
+            calculation_mode="exclusive"
+        )
+        self.assertEqual(res["taxable_amount"], Decimal("250.50"))
+        self.assertEqual(res["tax_amount"], Decimal("0.00"))
+        self.assertEqual(res["total_amount"], Decimal("250.50"))
+
+    def test_tax_calculation_decimal_rate_and_rounding(self):
+        """Fractional rate (7.25%) with deterministic ROUND_HALF_UP rounding."""
+        res = calculate_tax(
+            amount=Decimal("99.99"),
+            tax_rate=Decimal("7.2500"),
+            calculation_mode="exclusive"
+        )
+        # 99.99 * 0.0725 = 7.249275 -> 7.25
+        self.assertEqual(res["taxable_amount"], Decimal("99.99"))
+        self.assertEqual(res["tax_amount"], Decimal("7.25"))
+        self.assertEqual(res["total_amount"], Decimal("107.24"))
+
+    def test_calculate_lines_tax_multi(self):
+        """Aggregates multiple line calculations into document totals."""
+        lines = [
+            {"amount": Decimal("100.00"), "tax_rate": Decimal("10.0000"), "calculation_mode": "exclusive"},
+            {"amount": Decimal("200.00"), "tax_rate": Decimal("5.0000"), "calculation_mode": "exclusive"},
+            {"amount": Decimal("50.00"), "tax_rate": Decimal("0.0000"), "calculation_mode": "exclusive"},
+        ]
+        res = calculate_lines_tax(lines)
+        self.assertEqual(res["total_taxable_amount"], Decimal("350.00"))
+        # 10.00 + 10.00 + 0 = 20.00
+        self.assertEqual(res["total_tax_amount"], Decimal("20.00"))
+        self.assertEqual(res["grand_total"], Decimal("370.00"))
+        self.assertEqual(len(res["lines"]), 3)
+
+    def test_tax_code_validations(self):
+        """TaxCode clean() rejects negative rate, header account, and wrong company."""
+        # Negative rate
+        with self.assertRaises(ValidationError):
+            TaxCode.objects.create(
+                company=self.company,
+                code="BAD-NEG",
+                name="Negative Rate",
+                rate=Decimal("-5.0000"),
+                tax_account=self.sales_tax_acc,
+            )
+
+        # Header account
+        header_acc = Account.objects.filter(company=self.company, children__isnull=False).first()
+        if header_acc:
+            with self.assertRaises(ValidationError):
+                TaxCode.objects.create(
+                    company=self.company,
+                    code="BAD-HDR",
+                    name="Header Account",
+                    rate=Decimal("10.0000"),
+                    tax_account=header_acc,
+                )
+
+        # Other company account
+        other_acc = Account.objects.filter(company=self.other_company, children__isnull=True).first()
+        with self.assertRaises(ValidationError):
+            TaxCode.objects.create(
+                company=self.company,
+                code="BAD-COMP",
+                name="Wrong Company",
+                rate=Decimal("10.0000"),
+                tax_account=other_acc,
+            )
+
+    def test_tax_code_api_crud_and_toggle(self):
+        """CRUD operations and active toggle via REST API."""
+        # Create
+        create_payload = {
+            "code": "VAT-20",
+            "name": "Standard Value Added Tax 20%",
+            "rate": "20.0000",
+            "tax_type": "sales",
+            "calculation_mode": "exclusive",
+            "tax_account": self.sales_tax_acc.id,
+            "is_recoverable": True,
+        }
+        res = self.client.post("/api/accounting/tax-codes/", create_payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        tax_id = res.data["id"]
+
+        # Retrieve
+        get_res = self.client.get(f"/api/accounting/tax-codes/{tax_id}/")
+        self.assertEqual(get_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(get_res.data["code"], "VAT-20")
+
+        # Update
+        patch_res = self.client.patch(f"/api/accounting/tax-codes/{tax_id}/", {"name": "Updated VAT 20%"}, format="json")
+        self.assertEqual(patch_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(patch_res.data["name"], "Updated VAT 20%")
+
+        # Toggle Active
+        toggle_res = self.client.post(f"/api/accounting/tax-codes/{tax_id}/toggle-active/")
+        self.assertEqual(toggle_res.status_code, status.HTTP_200_OK)
+        self.assertFalse(toggle_res.data["is_active"])
+
+    def test_calculate_tax_api_endpoint(self):
+        """POST /api/accounting/taxes/calculate/ returns authoritative values."""
+        payload = {
+            "amount": "500.00",
+            "tax_rate": "12.5000",
+            "calculation_mode": "exclusive",
+        }
+        res = self.client.post("/api/accounting/taxes/calculate/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["taxable_amount"], 500.0)
+        self.assertEqual(res.data["tax_amount"], 62.5)
+        self.assertEqual(res.data["total_amount"], 562.5)
+
+    def test_record_tax_line_and_audit(self):
+        """Records granular tax transaction line and immutable audit log."""
+        line = record_tax_line(
+            company=self.company,
+            source_module="sales",
+            source_id="101",
+            source_reference="INV-TEST-001",
+            taxable_amount=Decimal("1000.00"),
+            tax_rate=Decimal("10.0000"),
+            tax_amount=Decimal("100.00"),
+            transaction_date=date(2026, 3, 15),
+            tax_code=self.std_code,
+            tax_account=self.sales_tax_acc,
+            actor=self.finance_user,
+        )
+        self.assertEqual(line.source_reference, "INV-TEST-001")
+        self.assertEqual(line.tax_amount, Decimal("100.00"))
+        self.assertEqual(line.total_amount, Decimal("1100.00"))
+
+        audit_exists = TaxAuditLog.objects.filter(company=self.company, tax_line=line).exists()
+        self.assertTrue(audit_exists)
+
+    def test_sales_invoice_tax_integration(self):
+        """Sales invoice posting registers a TaxTransactionLine and reconciles with journal."""
+        customer = Customer.objects.create(company=self.company, name="Galaxy Mart")
+        inv = Invoice.objects.create(
+            company=self.company,
+            customer=customer,
+            invoice_date=date(2026, 4, 10),
+            due_date=date(2026, 5, 10),
+            status="draft",
+            total_amount=Decimal("1100.00"),
+        )
+
+        je = post_sales_invoice_to_accounting(
+            invoice_id=inv.id,
+            user=self.finance_user,
+            company=self.company,
+            tax_amount=Decimal("100.00"),
+            tax_account_id=self.sales_tax_acc.id,
+        )
+        self.assertEqual(je.status, "posted")
+
+        # Verify TaxTransactionLine was created
+        tax_line = TaxTransactionLine.objects.filter(
+            company=self.company,
+            source_module="sales",
+            source_id=str(inv.id),
+        ).first()
+        self.assertIsNotNone(tax_line)
+        self.assertEqual(tax_line.tax_amount, Decimal("100.00"))
+        self.assertEqual(tax_line.taxable_amount, Decimal("1000.00"))
+        self.assertFalse(tax_line.is_reversed)
+
+        # Reverse invoice and verify tax line is reversed
+        reverse_sales_invoice_accounting(
+            invoice_id=inv.id,
+            user=self.finance_user,
+            company=self.company,
+            reason="Customer cancelled",
+        )
+        tax_line.refresh_from_db()
+        self.assertTrue(tax_line.is_reversed)
+
+    def test_purchase_bill_tax_integration(self):
+        """Purchase bill posting registers a TaxTransactionLine and reconciles with journal."""
+        vendor = Vendor.objects.create(company=self.company, name="Hops & Malt Co")
+        bill = Bill.objects.create(
+            company=self.company,
+            vendor=vendor,
+            bill_number="BILL-HOP-001",
+            bill_date=date(2026, 4, 12),
+            due_date=date(2026, 5, 12),
+            status="draft",
+            total_amount=Decimal("550.00"),
+        )
+
+        je = post_purchase_to_accounting(
+            bill_id=bill.id,
+            user=self.finance_user,
+            company=self.company,
+            tax_amount=Decimal("50.00"),
+            tax_account_id=self.input_tax_acc.id,
+        )
+        self.assertEqual(je.status, "posted")
+
+        tax_line = TaxTransactionLine.objects.filter(
+            company=self.company,
+            source_module="purchases",
+            source_id=str(bill.id),
+        ).first()
+        self.assertIsNotNone(tax_line)
+        self.assertEqual(tax_line.tax_amount, Decimal("50.00"))
+        self.assertFalse(tax_line.is_reversed)
+
+        # Reverse bill and verify tax line is reversed
+        reverse_purchase_accounting(
+            bill_id=bill.id,
+            user=self.finance_user,
+            company=self.company,
+            reason="Damaged goods returned",
+        )
+        tax_line.refresh_from_db()
+        self.assertTrue(tax_line.is_reversed)
+
+    def test_tax_adjustment_lifecycle_and_reversal(self):
+        """Tax adjustment: create draft -> post to journal -> reverse via #8 engine."""
+        data = {
+            "tax_code_id": self.std_code.id,
+            "tax_account_id": self.sales_tax_acc.id,
+            "offset_account_id": self.expense_offset_acc.id,
+            "adjustment_direction": "increase_liability",
+            "taxable_amount": Decimal("1000.00"),
+            "tax_amount": Decimal("100.00"),
+            "adjustment_date": date(2026, 3, 20),
+            "reason": "Quarterly audit assessment adjustment",
+        }
+        adj = create_tax_adjustment(company=self.company, user=self.finance_user, data=data)
+        self.assertEqual(adj.status, "draft")
+        self.assertTrue(adj.adjustment_number.startswith("TAX-ADJ-2026-"))
+
+        # Post adjustment
+        posted_adj = post_tax_adjustment(adj.id, user=self.finance_user, company=self.company)
+        self.assertEqual(posted_adj.status, "posted")
+        self.assertIsNotNone(posted_adj.journal_entry)
+        self.assertEqual(posted_adj.journal_entry.status, "posted")
+
+        # Verify tax line created
+        adj_line = TaxTransactionLine.objects.filter(
+            company=self.company,
+            source_module="tax_adjustment",
+            source_id=str(adj.id),
+        ).first()
+        self.assertIsNotNone(adj_line)
+        self.assertEqual(adj_line.tax_amount, Decimal("100.00"))
+
+        # Reverse adjustment
+        rev_adj = reverse_tax_adjustment(
+            adjustment_id=adj.id,
+            reason="Incorrect audit calculation",
+            user=self.finance_user,
+            company=self.company,
+        )
+        self.assertEqual(rev_adj.status, "reversed")
+        self.assertIsNotNone(rev_adj.reversal_journal_entry)
+
+        adj_line.refresh_from_db()
+        self.assertTrue(adj_line.is_reversed)
+
+        # Duplicate reversal raises error
+        with self.assertRaises(ValidationError):
+            reverse_tax_adjustment(
+                adjustment_id=adj.id,
+                reason="Duplicate reversal attempt",
+                user=self.finance_user,
+                company=self.company,
+            )
+
+    def test_tax_adjustment_closed_period_rejected(self):
+        """Adjustment posting is rejected if period is closed."""
+        period = AccountingPeriod.objects.filter(
+            fiscal_year__company=self.company,
+            start_date__lte=date(2026, 1, 15),
+            end_date__gte=date(2026, 1, 15),
+        ).first()
+        self.assertIsNotNone(period)
+        period.status = "closed"
+        period.save()
+
+        data = {
+            "tax_account_id": self.sales_tax_acc.id,
+            "offset_account_id": self.expense_offset_acc.id,
+            "adjustment_direction": "decrease_liability",
+            "tax_amount": Decimal("50.00"),
+            "adjustment_date": date(2026, 1, 15),
+            "reason": "Closed period test",
+        }
+        adj = create_tax_adjustment(company=self.company, user=self.finance_user, data=data)
+
+        with self.assertRaises(ValidationError):
+            post_tax_adjustment(adj.id, user=self.finance_user, company=self.company)
+
+    def test_tax_line_reversal_api(self):
+        """POST /api/accounting/tax-lines/{id}/reverse/ reverses transaction tax line."""
+        line = record_tax_line(
+            company=self.company,
+            source_module="manual",
+            source_id="888",
+            source_reference="MAN-TAX-01",
+            taxable_amount=Decimal("500.00"),
+            tax_rate=Decimal("10.0000"),
+            tax_amount=Decimal("50.00"),
+            transaction_date=date(2026, 3, 10),
+            tax_account=self.sales_tax_acc,
+            actor=self.finance_user,
+        )
+        res = self.client.post(f"/api/accounting/tax-lines/{line.id}/reverse/", {"reason": "Manual error corrected"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data["is_reversed"])
+
+    def test_tax_summary_and_report_endpoints(self):
+        """GET /api/accounting/taxes/summary/ and report/ return valid aggregates."""
+        record_tax_line(
+            company=self.company,
+            source_module="sales",
+            source_id="1",
+            source_reference="INV-SUM-1",
+            taxable_amount=Decimal("1000.00"),
+            tax_rate=Decimal("10.0000"),
+            tax_amount=Decimal("100.00"),
+            transaction_date=date(2026, 3, 5),
+            tax_code=self.std_code,
+            tax_account=self.sales_tax_acc,
+            actor=self.finance_user,
+        )
+
+        sum_res = self.client.get("/api/accounting/taxes/summary/")
+        self.assertEqual(sum_res.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(sum_res.data["total_taxable_amount"], 1000.0)
+        self.assertGreaterEqual(sum_res.data["total_tax_amount"], 100.0)
+
+        rep_res = self.client.get("/api/accounting/taxes/report/")
+        self.assertEqual(rep_res.status_code, status.HTTP_200_OK)
+        self.assertIn("records", rep_res.data)
+        self.assertIn("account_reconciliations", rep_res.data)
+
+    def test_tax_audit_trail_endpoint(self):
+        """GET /api/accounting/taxes/audit-trail/ returns immutable audit entries."""
+        res = self.client.get("/api/accounting/taxes/audit-trail/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(res.data, list)
+
+    def test_company_isolation(self):
+        """Company A cannot view or manipulate Company B's tax records."""
+        other_code = TaxCode.objects.create(
+            company=self.other_company,
+            code="RIVAL-15",
+            name="Rival 15%",
+            rate=Decimal("15.0000"),
+            tax_account=Account.objects.filter(company=self.other_company, children__isnull=True).first(),
+        )
+
+        res = self.client.get(f"/api/accounting/tax-codes/{other_code.id}/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unauthorized_user_forbidden(self):
+        """Non-finance users are rejected with 403 Forbidden."""
+        worker = User.objects.create_user(
+            username="brewer_sam",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.client.force_authenticate(user=worker)
+        res = self.client.get("/api/accounting/tax-codes/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+
 
 
 

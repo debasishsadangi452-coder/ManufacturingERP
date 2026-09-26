@@ -787,6 +787,29 @@ def post_expense_accounting(
             notes=f"Posted to General Ledger via JE #{posted_je.entry_number}",
         )
 
+        # Blueprint #19 Tax Layer Integration
+        if tax_amount > Decimal("0.00") and tax_acc:
+            try:
+                from .tax import record_tax_line
+                tax_rate_val = Decimal("0.0000")
+                if amount_before_tax > Decimal("0.00"):
+                    tax_rate_val = (tax_amount / amount_before_tax * Decimal("100.0000")).quantize(Decimal("0.0001"))
+                record_tax_line(
+                    company=company,
+                    source_module="expenses",
+                    source_id=str(expense.id),
+                    source_reference=expense.expense_number,
+                    taxable_amount=amount_before_tax,
+                    tax_rate=tax_rate_val,
+                    tax_amount=tax_amount,
+                    transaction_date=txn_date,
+                    tax_account=tax_acc,
+                    journal_entry=posted_je,
+                    actor=user,
+                )
+            except Exception:
+                pass
+
         return posted_je
 
 
@@ -842,6 +865,23 @@ def reverse_expense_accounting(expense, user=None, reason="", reversal_date=None
             },
             notes=reason or f"Reversed via JE #{reversal_je.entry_number}",
         )
+
+        # Blueprint #19 Tax Layer Integration: mark tax lines as reversed
+        try:
+            from .models import TaxTransactionLine
+            TaxTransactionLine.objects.filter(
+                company=company,
+                source_module="expenses",
+                source_id=str(expense.id),
+                is_reversed=False,
+            ).update(
+                is_reversed=True,
+                reversed_at=timezone.now(),
+                reversal_reference="Reversed via expense reversal",
+                reversal_journal_entry=reversal_je,
+            )
+        except Exception:
+            pass
 
         return reversal_je
 

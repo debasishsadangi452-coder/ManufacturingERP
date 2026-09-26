@@ -2589,6 +2589,313 @@ class PaymentAllocationViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# =============================================================================
+# BLUEPRINT SECTION #19 — TAX LAYER VIEWSETS
+# =============================================================================
+
+from .models import (
+    TaxCode,
+    TaxTransactionLine,
+    TaxAdjustment,
+    TaxAuditLog,
+)
+from .serializers import (
+    TaxCodeSerializer,
+    TaxTransactionLineSerializer,
+    TaxAdjustmentSerializer,
+    TaxAuditLogSerializer,
+    CalculateTaxInputSerializer,
+    CreateTaxAdjustmentInputSerializer,
+    ReverseTaxLineInputSerializer,
+)
+from .tax import (
+    calculate_tax,
+    calculate_lines_tax,
+    record_tax_line,
+    create_tax_adjustment,
+    post_tax_adjustment,
+    reverse_tax_adjustment,
+    reverse_tax_transaction_line,
+    get_tax_summary,
+    get_tax_report,
+    seed_default_tax_codes,
+)
+
+
+class TaxCodeViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    Blueprint Section #19 — Tax Codes & Rates Master Data API.
+    Provides CRUD, activation/deactivation, and standard default seeding.
+    """
+    company_field = "company"
+    queryset = TaxCode.objects.select_related("tax_account", "created_by").all()
+    serializer_class = TaxCodeSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["tax_type", "calculation_mode", "is_active", "is_recoverable"]
+    search_fields = ["code", "name", "description"]
+    ordering_fields = ["code", "rate", "created_at"]
+    ordering = ["code"]
+
+    def perform_create(self, serializer):
+        company = getattr(self.request.user, "company", None)
+        serializer.save(company=company, created_by=self.request.user)
+        TaxAuditLog.objects.create(
+            company=company,
+            tax_code=serializer.instance,
+            action="tax_code_created",
+            actor=self.request.user,
+            details={"code": serializer.instance.code, "rate": float(serializer.instance.rate)}
+        )
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+        TaxAuditLog.objects.create(
+            company=serializer.instance.company,
+            tax_code=serializer.instance,
+            action="tax_code_updated",
+            actor=self.request.user,
+            details={"code": serializer.instance.code, "rate": float(serializer.instance.rate)}
+        )
+
+    @action(detail=True, methods=["post"], url_path="toggle-active")
+    def toggle_active(self, request, pk=None):
+        """POST /api/accounting/tax-codes/{id}/toggle-active/"""
+        tax_code = self.get_object()
+        tax_code.is_active = not tax_code.is_active
+        tax_code.updated_by = request.user
+        tax_code.save(update_fields=["is_active", "updated_by", "updated_at"])
+
+        TaxAuditLog.objects.create(
+            company=tax_code.company,
+            tax_code=tax_code,
+            action="tax_code_activated" if tax_code.is_active else "tax_code_deactivated",
+            actor=request.user,
+            details={"code": tax_code.code, "is_active": tax_code.is_active}
+        )
+
+        return Response(TaxCodeSerializer(tax_code).data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="seed-defaults")
+    def seed_defaults(self, request):
+        """POST /api/accounting/tax-codes/seed-defaults/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "No company associated with user"}, status=status.HTTP_400_BAD_REQUEST)
+
+        created_cnt = seed_default_tax_codes(company, user=request.user)
+        return Response({
+            "status": "success",
+            "message": f"Successfully initialized {created_cnt} standard tax code(s).",
+            "total_codes": TaxCode.objects.filter(company=company).count()
+        }, status=status.HTTP_200_OK)
+
+
+class TaxTransactionLineViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    Blueprint Section #19 — Transaction-Level Tax Breakdown API.
+    Read-only view of granular tax lines with controlled reversal capability.
+    """
+    company_field = "company"
+    queryset = TaxTransactionLine.objects.select_related(
+        "tax_code", "tax_account", "journal_entry", "reversal_journal_entry", "created_by"
+    ).all()
+    serializer_class = TaxTransactionLineSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["source_module", "is_posted", "is_reversed", "tax_code", "tax_account"]
+    search_fields = ["source_reference", "source_id", "reversal_reference"]
+    ordering = ["-transaction_date", "-created_at"]
+
+    @action(detail=True, methods=["post"], url_path="reverse")
+    def reverse_line(self, request, pk=None):
+        """POST /api/accounting/tax-lines/{id}/reverse/"""
+        line = self.get_object()
+        company = getattr(request.user, "company", None)
+        serializer = ReverseTaxLineInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            rev_line = reverse_tax_transaction_line(
+                tax_line_id=line.id,
+                reason=serializer.validated_data["reason"],
+                user=request.user,
+                company=company,
+            )
+            return Response(TaxTransactionLineSerializer(rev_line).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class TaxAdjustmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    Blueprint Section #19 — Controlled Tax Adjustment API.
+    Creates and posts double-entry adjustments for tax liabilities or input credits.
+    """
+    company_field = "company"
+    queryset = TaxAdjustment.objects.select_related(
+        "tax_code", "tax_account", "offset_account", "journal_entry", "reversal_journal_entry"
+    ).all()
+    serializer_class = TaxAdjustmentSerializer
+    permission_classes = [IsFinanceOrAdmin]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ["status", "adjustment_direction", "tax_code"]
+    search_fields = ["adjustment_number", "reason"]
+    ordering = ["-adjustment_date", "-created_at"]
+
+    def create(self, request, *args, **kwargs):
+        company = getattr(request.user, "company", None)
+        serializer = CreateTaxAdjustmentInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            adj = create_tax_adjustment(
+                company=company,
+                user=request.user,
+                data=serializer.validated_data,
+            )
+            return Response(TaxAdjustmentSerializer(adj).data, status=status.HTTP_201_CREATED)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="post")
+    def post_action(self, request, pk=None):
+        """POST /api/accounting/tax-adjustments/{id}/post/"""
+        adj = self.get_object()
+        company = getattr(request.user, "company", None)
+
+        try:
+            posted_adj = post_tax_adjustment(
+                adjustment_id=adj.id,
+                user=request.user,
+                company=company,
+            )
+            return Response(TaxAdjustmentSerializer(posted_adj).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=["post"], url_path="reverse")
+    def reverse_action(self, request, pk=None):
+        """POST /api/accounting/tax-adjustments/{id}/reverse/"""
+        adj = self.get_object()
+        company = getattr(request.user, "company", None)
+        serializer = ReverseTaxLineInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            rev_adj = reverse_tax_adjustment(
+                adjustment_id=adj.id,
+                reason=serializer.validated_data["reason"],
+                user=request.user,
+                company=company,
+            )
+            return Response(TaxAdjustmentSerializer(rev_adj).data, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class TaxManagementViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #19 — Central Tax Operations, Calculation, Summary & Reporting API.
+    Mounted at /api/accounting/taxes/
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    @action(detail=False, methods=["post"], url_path="calculate")
+    def calculate(self, request):
+        """POST /api/accounting/taxes/calculate/"""
+        serializer = CalculateTaxInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            res = calculate_tax(
+                amount=serializer.validated_data["amount"],
+                tax_code=serializer.validated_data.get("tax_code_id"),
+                tax_rate=serializer.validated_data.get("tax_rate"),
+                calculation_mode=serializer.validated_data.get("calculation_mode"),
+                precision=serializer.validated_data.get("precision", 2),
+            )
+            return Response({
+                "taxable_amount": float(res["taxable_amount"]),
+                "tax_rate": float(res["tax_rate"]),
+                "tax_amount": float(res["tax_amount"]),
+                "total_amount": float(res["total_amount"]),
+                "calculation_mode": res["calculation_mode"],
+                "tax_code_id": res["tax_code_id"],
+                "tax_code": res["tax_code"],
+            }, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else getattr(e, "messages", str(e))
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/taxes/summary/"""
+        company = getattr(request.user, "company", None)
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        tax_code_id = request.query_params.get("tax_code_id")
+        account_id = request.query_params.get("account_id")
+
+        try:
+            res = get_tax_summary(
+                company=company,
+                start_date=start_date,
+                end_date=end_date,
+                tax_code_id=tax_code_id,
+                account_id=account_id,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="report")
+    def report(self, request):
+        """GET /api/accounting/taxes/report/"""
+        company = getattr(request.user, "company", None)
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+        tax_code_id = request.query_params.get("tax_code_id")
+        account_id = request.query_params.get("account_id")
+        source_module = request.query_params.get("source_module")
+
+        try:
+            res = get_tax_report(
+                company=company,
+                start_date=start_date,
+                end_date=end_date,
+                tax_code_id=tax_code_id,
+                account_id=account_id,
+                source_module=source_module,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="audit-trail")
+    def audit_trail(self, request):
+        """GET /api/accounting/taxes/audit-trail/"""
+        company = getattr(request.user, "company", None)
+        logs = TaxAuditLog.objects.filter(company=company).select_related(
+            "actor", "tax_code", "tax_adjustment"
+        ).order_by("-created_at")[:100]
+        return Response(TaxAuditLogSerializer(logs, many=True).data, status=status.HTTP_200_OK)
+
+
 
 
 
