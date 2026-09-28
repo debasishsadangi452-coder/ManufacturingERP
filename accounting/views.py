@@ -374,6 +374,25 @@ class AccountViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             "total_accounts": Account.objects.filter(company=company).count()
         })
 
+    @action(detail=True, methods=["post"], url_path="activate")
+    def activate(self, request, pk=None):
+        """Blueprint #25: Activate an inactive account."""
+        account = self.get_object()
+        account.is_active = True
+        account.save(update_fields=["is_active"])
+        serializer = self.get_serializer(account)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="deactivate")
+    def deactivate(self, request, pk=None):
+        """Blueprint #25: Deactivate an active account."""
+        account = self.get_object()
+        account.is_active = False
+        account.save(update_fields=["is_active"])
+        serializer = self.get_serializer(account)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
 
 class AccountingSettingsViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     """Company Accounting Settings."""
@@ -564,7 +583,56 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             )
         return super().destroy(request, *args, **kwargs)
 
+    @action(detail=True, methods=["get", "post"], url_path="validate")
+    def validate_entry(self, request, pk=None):
+        """
+        Blueprint #25: Validate a journal entry against double-entry balance,
+        accounting periods, lock dates, and account posting rules without posting.
+        """
+        entry = self.get_object()
+        errors = []
+        warnings = []
+
+        lines = entry.lines.all()
+        if not lines.exists():
+            errors.append("Journal entry has no lines.")
+        total_debit = sum(l.debit for l in lines)
+        total_credit = sum(l.credit for l in lines)
+        if total_debit != total_credit:
+            errors.append(f"Journal entry is out of balance. Total Debits: {total_debit}, Total Credits: {total_credit}.")
+
+        if not entry.accounting_period:
+            warnings.append("No accounting period explicitly assigned (will be auto-assigned on save).")
+        elif entry.accounting_period.status != "open":
+            errors.append(f"Accounting period '{entry.accounting_period.name}' has status '{entry.accounting_period.status}'.")
+
+        settings = getattr(entry.company, "accounting_settings", None)
+        if settings and settings.lock_date and entry.transaction_date:
+            if entry.transaction_date <= settings.lock_date:
+                errors.append(f"Transaction date is on or prior to global lock date ({settings.lock_date}).")
+
+        for l in lines:
+            if not l.account.is_active:
+                errors.append(f"Line {l.line_number}: Account '{l.account.code}' is inactive.")
+            if l.debit > 0 and l.credit > 0:
+                errors.append(f"Line {l.line_number}: Line contains both debit and credit.")
+            if l.debit == 0 and l.credit == 0:
+                errors.append(f"Line {l.line_number}: Line has zero debit and credit.")
+
+        is_valid = len(errors) == 0
+        return Response({
+            "entry_number": entry.entry_number,
+            "status": entry.status,
+            "is_valid": is_valid,
+            "total_debit": str(total_debit),
+            "total_credit": str(total_credit),
+            "difference": str(abs(total_debit - total_credit)),
+            "errors": errors,
+            "warnings": warnings,
+        }, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["post"], url_path="submit")
+
     def submit_entry(self, request, pk=None):
         """Submit a draft journal entry for approval."""
         entry = self.get_object()
@@ -3280,14 +3348,439 @@ class TaxManagementViewSet(viewsets.ViewSet):
         return Response(TaxAuditLogSerializer(logs, many=True).data, status=status.HTTP_200_OK)
 
 
+from .reports import (
+    get_profit_and_loss_report,
+    get_balance_sheet_report,
+    get_cash_flow_statement_report,
+    get_trial_balance_report,
+    get_inventory_valuation_report,
+    get_manufacturing_cost_report,
+    get_account_reconciliation_report,
+    get_report_drill_down,
+    export_financial_report,
+)
 
 
+class FinancialReportsViewSet(CompanyScopedMixin, viewsets.ViewSet):
+    """
+    Blueprint Section #22 — Financial Reports API Suite.
+    
+    Provides real-time financial reporting derived strictly from double-entry posted journals:
+    - /profit-and-loss/
+    - /balance-sheet/
+    - /cash-flow/
+    - /trial-balance/
+    - /general-ledger/
+    - /ar-aging/
+    - /ap-aging/
+    - /tax-summary/
+    - /inventory-valuation/
+    - /manufacturing-cost/
+    - /reconciliations/
+    - /drill-down/
+    - /export/
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    @action(detail=False, methods=["get"], url_path="profit-and-loss")
+    def profit_and_loss(self, request):
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_profit_and_loss_report(
+                company=company,
+                start_date=request.query_params.get("start_date"),
+                end_date=request.query_params.get("end_date"),
+                period_id=request.query_params.get("period_id"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                compare_to=request.query_params.get("compare_to"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="balance-sheet")
+    def balance_sheet(self, request):
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_balance_sheet_report(
+                company=company,
+                as_of_date=request.query_params.get("as_of_date"),
+                period_id=request.query_params.get("period_id"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                compare_to=request.query_params.get("compare_to"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="cash-flow")
+    def cash_flow(self, request):
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_cash_flow_statement_report(
+                company=company,
+                start_date=request.query_params.get("start_date"),
+                end_date=request.query_params.get("end_date"),
+                period_id=request.query_params.get("period_id"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="trial-balance")
+    def trial_balance(self, request):
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_trial_balance_report(
+                company=company,
+                period_id=request.query_params.get("period_id"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                as_of_date=request.query_params.get("as_of_date"),
+                start_date=request.query_params.get("start_date"),
+                end_date=request.query_params.get("end_date"),
+                search=request.query_params.get("search"),
+                category=request.query_params.get("category"),
+                compare_to=request.query_params.get("compare_to"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="general-ledger")
+    def general_ledger(self, request):
+        company = getattr(request.user, "company", None)
+        account_id = request.query_params.get("account_id")
+        try:
+            if account_id:
+                res = get_account_ledger(
+                    company=company,
+                    account_id=account_id,
+                    start_date=request.query_params.get("start_date"),
+                    end_date=request.query_params.get("end_date"),
+                    fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                    accounting_period_id=request.query_params.get("period_id"),
+                    search=request.query_params.get("search"),
+                )
+            else:
+                res = get_general_ledger_summary(
+                    company=company,
+                    start_date=request.query_params.get("start_date"),
+                    end_date=request.query_params.get("end_date"),
+                    fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                    accounting_period_id=request.query_params.get("period_id"),
+                    search=request.query_params.get("search"),
+                )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="ar-aging")
+    def ar_aging(self, request):
+        company = getattr(request.user, "company", None)
+        as_of_date = request.query_params.get("as_of_date")
+        try:
+            res = get_ar_aging_report(company=company, as_of_date=as_of_date)
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="ap-aging")
+    def ap_aging(self, request):
+        company = getattr(request.user, "company", None)
+        as_of_date = request.query_params.get("as_of_date")
+        try:
+            res = get_ap_aging_report(company=company, as_of_date=as_of_date)
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="tax-summary")
+    def tax_summary(self, request):
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_tax_report(
+                company=company,
+                start_date=request.query_params.get("start_date"),
+                end_date=request.query_params.get("end_date"),
+                tax_code_id=request.query_params.get("tax_code_id"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="inventory-valuation")
+    def inventory_valuation(self, request):
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_inventory_valuation_report(
+                company=company,
+                as_of_date=request.query_params.get("as_of_date"),
+                period_id=request.query_params.get("period_id"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="manufacturing-cost")
+    def manufacturing_cost(self, request):
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_manufacturing_cost_report(
+                company=company,
+                start_date=request.query_params.get("start_date"),
+                end_date=request.query_params.get("end_date"),
+                period_id=request.query_params.get("period_id"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="reconciliations")
+    def reconciliations(self, request):
+        company = getattr(request.user, "company", None)
+        try:
+            res = get_account_reconciliation_report(
+                company=company,
+                as_of_date=request.query_params.get("as_of_date"),
+                period_id=request.query_params.get("period_id"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="drill-down")
+    def drill_down(self, request):
+        company = getattr(request.user, "company", None)
+        account_id = request.query_params.get("account_id")
+        if not account_id:
+            return Response({"error": "account_id parameter is required for drill-down."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            res = get_report_drill_down(
+                company=company,
+                account_id=account_id,
+                start_date=request.query_params.get("start_date"),
+                end_date=request.query_params.get("end_date"),
+                period_id=request.query_params.get("period_id"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        from django.http import HttpResponse
+        company = getattr(request.user, "company", None)
+        report_type = request.query_params.get("report_type", "profit_and_loss")
+        export_fmt = request.query_params.get("export_format") or request.query_params.get("format", "csv")
+        try:
+            if report_type == "profit_and_loss":
+                data = get_profit_and_loss_report(
+                    company=company,
+                    start_date=request.query_params.get("start_date"),
+                    end_date=request.query_params.get("end_date"),
+                    period_id=request.query_params.get("period_id"),
+                    fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                )
+            elif report_type == "balance_sheet":
+                data = get_balance_sheet_report(
+                    company=company,
+                    as_of_date=request.query_params.get("as_of_date"),
+                    period_id=request.query_params.get("period_id"),
+                    fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                )
+            elif report_type == "cash_flow":
+                data = get_cash_flow_statement_report(
+                    company=company,
+                    start_date=request.query_params.get("start_date"),
+                    end_date=request.query_params.get("end_date"),
+                    period_id=request.query_params.get("period_id"),
+                    fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                )
+            elif report_type == "trial_balance":
+                data = get_trial_balance_report(
+                    company=company,
+                    period_id=request.query_params.get("period_id"),
+                    fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                    as_of_date=request.query_params.get("as_of_date"),
+                )
+            elif report_type == "inventory_valuation":
+                data = get_inventory_valuation_report(
+                    company=company,
+                    as_of_date=request.query_params.get("as_of_date"),
+                    period_id=request.query_params.get("period_id"),
+                )
+            elif report_type == "manufacturing_cost":
+                data = get_manufacturing_cost_report(
+                    company=company,
+                    start_date=request.query_params.get("start_date"),
+                    end_date=request.query_params.get("end_date"),
+                    period_id=request.query_params.get("period_id"),
+                )
+            elif report_type == "reconciliations":
+                data = get_account_reconciliation_report(
+                    company=company,
+                    as_of_date=request.query_params.get("as_of_date"),
+                    period_id=request.query_params.get("period_id"),
+                )
+            else:
+                return Response({"error": f"Unsupported report_type '{report_type}' for export."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if export_fmt == "json":
+                return Response(data, status=status.HTTP_200_OK)
+
+            csv_content = export_financial_report(data, export_format="csv")
+            response = HttpResponse(csv_content, content_type="text/csv")
+            response["Content-Disposition"] = f'attachment; filename="{report_type}_{date.today().isoformat()}.csv"'
+            return response
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #23 — ACCOUNTING DASHBOARD VIEWS
+# ==============================================================================
+
+from .dashboard import get_accounting_dashboard_data
 
 
+class AccountingDashboardViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #23 — Accounting Dashboard API.
+    Provides authoritative executive KPIs, profitability metrics, aging summaries,
+    liquidity, inventory, production costs, and recent accounting transactions.
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        """GET /api/accounting/dashboard/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_accounting_dashboard_data(
+                company=company,
+                date_filter=request.query_params.get("date_filter", "this_month"),
+                start_date=request.query_params.get("start_date"),
+                end_date=request.query_params.get("end_date"),
+                fiscal_year_id=request.query_params.get("fiscal_year_id"),
+                period_id=request.query_params.get("period_id"),
+            )
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #24 — DATABASE ARCHITECTURE VIEWS
+# ==============================================================================
+
+from .database_architecture import (
+    get_database_architecture_metadata,
+    verify_database_integrity,
+)
+
+
+class DatabaseArchitectureViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #24 — Database Architecture API.
+    Provides schema registry for the 18 core accounting entities, ERD flows,
+    cross-domain relationships, data design constraints, and live integrity diagnostics.
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        """GET /api/accounting/database-architecture/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_database_architecture_metadata(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="integrity")
+    def integrity(self, request):
+        """GET /api/accounting/database-architecture/integrity/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_database_integrity(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="verify")
+    def verify(self, request):
+        """POST /api/accounting/database-architecture/verify/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_database_integrity(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #25 — API ARCHITECTURE VIEWS
+# ==============================================================================
+
+from .api_architecture import (
+    get_api_architecture_metadata,
+    verify_api_architecture_health,
+)
+
+
+class APIArchitectureViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #25 — API Architecture API.
+    Provides complete endpoint registry across 11 core categories,
+    layered architecture specs, architectural concern enforcements, and live health diagnostics.
+    """
+    permission_classes = [IsFinanceOrAdmin]
+
+    def list(self, request):
+        """GET /api/accounting/api-architecture/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = get_api_architecture_metadata(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="health")
+    def health(self, request):
+        """GET /api/accounting/api-architecture/health/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_api_architecture_health(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="verify")
+    def verify(self, request):
+        """POST /api/accounting/api-architecture/verify/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            data = verify_api_architecture_health(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 

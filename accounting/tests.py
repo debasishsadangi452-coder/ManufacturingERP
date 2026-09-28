@@ -6422,3 +6422,1253 @@ class PeriodClosingTestCase(TestCase):
         res_close = self.client.post(f"/api/accounting/periods/{self.p1.id}/close/", format="json")
         self.assertEqual(res_close.status_code, status.HTTP_403_FORBIDDEN)
 
+
+class FinancialReportsTestCase(APITestCase):
+    """
+    Blueprint Section #22 — Financial Reports Comprehensive Test Suite.
+    Validates P&L, Balance Sheet, Cash Flow, Trial Balance, Inventory Valuation,
+    Manufacturing Cost, Account Reconciliations, Drill-Down, and Exports.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Report Brewery Corp")
+        self.other_company = Company.objects.create(name="Rival Drinks Inc")
+
+        self.finance_user = User.objects.create_user(
+            username="cfo_clara",
+            password="password123",
+            company=self.company,
+            role="admin",
+        )
+        self.regular_user = User.objects.create_user(
+            username="operator_bob",
+            password="password123",
+            company=self.company,
+            role="store",
+        )
+        self.other_user = User.objects.create_user(
+            username="rival_cfo",
+            password="password123",
+            company=self.other_company,
+            role="admin",
+        )
+
+        ensure_account_types()
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_chart_of_accounts(self.other_company)
+
+        # Fiscal Year & Periods for Report Brewery Corp
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+        self.p1 = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="January 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+        self.p2 = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=2,
+            name="February 2026",
+            start_date=date(2026, 2, 1),
+            end_date=date(2026, 2, 28),
+            status="open",
+        )
+
+        # Fetch accounts
+        self.acc_cash = Account.objects.get(company=self.company, code="1010")
+        self.acc_ar = Account.objects.get(company=self.company, code="1100")
+        self.acc_raw = Account.objects.get(company=self.company, code="1210")
+        self.acc_ap = Account.objects.get(company=self.company, code="2010")
+        self.acc_equity = Account.objects.get(company=self.company, code="3010")
+        self.acc_sales = Account.objects.get(company=self.company, code="4010")
+        self.acc_mat_cogs = Account.objects.get(company=self.company, code="5010")
+        self.acc_labor_cogs = Account.objects.get(company=self.company, code="5100")
+        self.acc_overhead_cogs = Account.objects.get(company=self.company, code="5200")
+        self.acc_salaries_opex = Account.objects.get(company=self.company, code="6010")
+        self.acc_rent_opex = Account.objects.get(company=self.company, code="6050")
+
+        # Initial capital entry: Dr Cash 50,000, Cr Owner Capital 50,000
+        je_cap = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-CAP-01",
+            transaction_date=date(2026, 1, 2),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Initial Owner Capital Contribution",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_cap, line_number=1, account=self.acc_cash, debit=Decimal("50000.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_cap, line_number=2, account=self.acc_equity, debit=Decimal("0.00"), credit=Decimal("50000.00"))
+        post_journal_entry(je_cap.id, user=self.finance_user)
+
+        # Sales entry: Dr Cash 10,000, Cr Sales 10,000
+        je_sale = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-SALE-01",
+            transaction_date=date(2026, 1, 15),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Finished Goods Wholesale Sale",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_sale, line_number=1, account=self.acc_cash, debit=Decimal("10000.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_sale, line_number=2, account=self.acc_sales, debit=Decimal("0.00"), credit=Decimal("10000.00"))
+        post_journal_entry(je_sale.id, user=self.finance_user)
+
+        # Materials Purchase entry: Dr Raw Materials 4,000, Cr Cash 4,000
+        je_pur = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-PUR-01",
+            transaction_date=date(2026, 1, 16),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Raw Material Ingredients Purchase",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_pur, line_number=1, account=self.acc_raw, debit=Decimal("4000.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_pur, line_number=2, account=self.acc_cash, debit=Decimal("0.00"), credit=Decimal("4000.00"))
+        post_journal_entry(je_pur.id, user=self.finance_user)
+
+        # Materials Consumption (COGS): Dr Mat COGS 2,500, Cr Raw Materials 2,500
+        je_cons = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-CONS-01",
+            transaction_date=date(2026, 1, 20),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Batch Production Material Consumption",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_cons, line_number=1, account=self.acc_mat_cogs, debit=Decimal("2500.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_cons, line_number=2, account=self.acc_raw, debit=Decimal("0.00"), credit=Decimal("2500.00"))
+        post_journal_entry(je_cons.id, user=self.finance_user)
+
+        # Direct Labor (COGS): Dr Direct Labor 1,500, Cr Cash 1,500
+        je_lab = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-LAB-01",
+            transaction_date=date(2026, 1, 25),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Direct Production Wages",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_lab, line_number=1, account=self.acc_labor_cogs, debit=Decimal("1500.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_lab, line_number=2, account=self.acc_cash, debit=Decimal("0.00"), credit=Decimal("1500.00"))
+        post_journal_entry(je_lab.id, user=self.finance_user)
+
+        # Factory Overhead (COGS): Dr Overhead 800, Cr Cash 800
+        je_ovh = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-OVH-01",
+            transaction_date=date(2026, 1, 26),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Factory Utilities Applied",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_ovh, line_number=1, account=self.acc_overhead_cogs, debit=Decimal("800.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_ovh, line_number=2, account=self.acc_cash, debit=Decimal("0.00"), credit=Decimal("800.00"))
+        post_journal_entry(je_ovh.id, user=self.finance_user)
+
+        # Operating Expenses: Dr Admin Salaries 1,200, Dr Rent 600, Cr Cash 1,800
+        je_opex = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-OPEX-01",
+            transaction_date=date(2026, 1, 28),
+            entry_type="manual",
+            status="draft",
+            accounting_period=self.p1,
+            description="Office Salaries and Facility Rent",
+        )
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_opex, line_number=1, account=self.acc_salaries_opex, debit=Decimal("1200.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_opex, line_number=2, account=self.acc_rent_opex, debit=Decimal("600.00"), credit=Decimal("0.00"))
+        JournalEntryLine.objects.create(company=self.company, journal_entry=je_opex, line_number=3, account=self.acc_cash, debit=Decimal("0.00"), credit=Decimal("1800.00"))
+        post_journal_entry(je_opex.id, user=self.finance_user)
+
+        self.client.force_authenticate(user=self.finance_user)
+
+    def test_profit_and_loss_report(self):
+        """Profit & Loss calculates accurate Revenue, COGS, OpEx, and Net Profit."""
+        res = self.client.get(f"/api/accounting/reports/profit-and-loss/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        summary = data["summary"]
+        self.assertEqual(Decimal(str(summary["total_revenue"])), Decimal("10000.00"))
+        # COGS = 2,500 (mat) + 1,500 (labor) + 800 (overhead) = 4,800.00
+        self.assertEqual(Decimal(str(summary["total_cogs"])), Decimal("4800.00"))
+        # Gross profit = 10,000 - 4,800 = 5,200.00
+        self.assertEqual(Decimal(str(summary["gross_profit"])), Decimal("5200.00"))
+        # OpEx = 1,200 + 600 = 1,800.00
+        self.assertEqual(Decimal(str(summary["total_opex"])), Decimal("1800.00"))
+        # Net profit = 5,200 - 1,800 = 3,400.00
+        self.assertEqual(Decimal(str(summary["net_profit"])), Decimal("3400.00"))
+        self.assertEqual(Decimal(str(summary["net_margin_pct"])), Decimal("34.00"))
+
+    def test_profit_and_loss_comparative(self):
+        """P&L comparative period returns variance amounts and percentages."""
+        res = self.client.get(f"/api/accounting/reports/profit-and-loss/?period_id={self.p1.id}&compare_to=previous_period")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("comparative_start_date", res.data)
+        rev_section = res.data["sections"]["revenue"]
+        self.assertIn("variance_amount", rev_section)
+        self.assertIn("variance_pct", rev_section)
+
+    def test_balance_sheet_equilibrium(self):
+        """Balance sheet respects Assets = Liabilities + Equity with unclosed net income included."""
+        res = self.client.get(f"/api/accounting/reports/balance-sheet/?as_of_date=2026-01-31")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertTrue(data["is_balanced"])
+        self.assertEqual(Decimal(str(data["discrepancy"])), Decimal("0.00"))
+
+        tot_assets = Decimal(str(data["summary"]["total_assets"]))
+        tot_liab_eq = Decimal(str(data["summary"]["total_liabilities_and_equity"]))
+        self.assertEqual(tot_assets, tot_liab_eq)
+
+        # Initial cash: 50,000 + 10,000 (sale) - 4,000 (purch) - 1,500 (labor) - 800 (ovh) - 1,800 (opex) = 51,900.00
+        # Raw materials: 4,000 - 2,500 = 1,500.00
+        # Total Assets = 51,900 + 1,500 = 53,400.00
+        # Equity: Contributed 50,000 + Net Income 3,400 = 53,400.00
+        self.assertEqual(tot_assets, Decimal("53400.00"))
+
+    def test_cash_flow_statement_reconciliation(self):
+        """Cash flow indirect method reconciles operating, investing, and financing flows to cash accounts."""
+        res = self.client.get(f"/api/accounting/reports/cash-flow/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        summary = data["summary"]
+        self.assertTrue(summary["cash_reconciled"])
+        self.assertEqual(Decimal(str(summary["ending_cash_calculated"])), Decimal(str(summary["ending_cash_actual"])))
+        self.assertEqual(Decimal(str(summary["ending_cash_actual"])), Decimal("51900.00"))
+
+    def test_trial_balance_report(self):
+        """Trial balance returns total closing debits equal to total closing credits."""
+        res = self.client.get(f"/api/accounting/reports/trial-balance/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertTrue(data["is_balanced"])
+        self.assertEqual(Decimal(str(data["totals"]["total_closing_debit"])), Decimal(str(data["totals"]["total_closing_credit"])))
+
+    def test_general_ledger_report(self):
+        """General ledger summary and account statement endpoints return ledger entries."""
+        res_summary = self.client.get(f"/api/accounting/reports/general-ledger/?period_id={self.p1.id}")
+        self.assertEqual(res_summary.status_code, status.HTTP_200_OK)
+        self.assertIn("accounts", res_summary.data)
+
+        res_acc = self.client.get(f"/api/accounting/reports/general-ledger/?account_id={self.acc_cash.id}&period_id={self.p1.id}")
+        self.assertEqual(res_acc.status_code, status.HTTP_200_OK)
+        self.assertIn("transactions", res_acc.data)
+
+    def test_inventory_valuation_report(self):
+        """Inventory valuation report shows opening, receipts, issues, and closing balances."""
+        res = self.client.get(f"/api/accounting/reports/inventory-valuation/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertIn("items", data)
+        raw_item = next((i for i in data["items"] if i["code"] == "1210"), None)
+        self.assertIsNotNone(raw_item)
+        self.assertEqual(Decimal(str(raw_item["receipts_additions"])), Decimal("4000.00"))
+        self.assertEqual(Decimal(str(raw_item["issues_consumption"])), Decimal("2500.00"))
+        self.assertEqual(Decimal(str(raw_item["closing_valuation"])), Decimal("1500.00"))
+
+    def test_manufacturing_cost_report(self):
+        """Manufacturing cost statement computes prime cost, conversion cost, and COGM."""
+        res = self.client.get(f"/api/accounting/reports/manufacturing-cost/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        kpis = data["kpis"]
+        # Direct materials 2500, Direct labor 1500 -> Prime cost = 4000
+        self.assertEqual(Decimal(str(kpis["prime_cost"])), Decimal("4000.00"))
+        # Direct labor 1500, Overhead 800 -> Conversion cost = 2300
+        self.assertEqual(Decimal(str(kpis["conversion_cost"])), Decimal("2300.00"))
+        # Total manufacturing costs = 4800.00
+        self.assertEqual(Decimal(str(kpis["total_manufacturing_costs"])), Decimal("4800.00"))
+
+    def test_account_reconciliation_report(self):
+        """Account reconciliation audits AR, AP, Bank, Tax, and Inventory control accounts."""
+        res = self.client.get("/api/accounting/reports/reconciliations/?as_of_date=2026-01-31")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+        self.assertIn("reconciliations", data)
+        self.assertTrue(len(data["reconciliations"]) >= 4)
+
+    def test_report_drill_down(self):
+        """Drill-down API returns individual line items for an account."""
+        res = self.client.get(f"/api/accounting/reports/drill-down/?account_id={self.acc_cash.id}&period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("transactions", res.data)
+        self.assertTrue(len(res.data["transactions"]) > 0)
+
+    def test_export_endpoints(self):
+        """Export endpoints generate CSV and JSON reports."""
+        res_csv = self.client.get(f"/api/accounting/reports/export/?report_type=profit_and_loss&export_format=csv&period_id={self.p1.id}")
+        self.assertEqual(res_csv.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_csv["Content-Type"], "text/csv")
+        self.assertIn("PROFIT AND LOSS", res_csv.content.decode())
+
+        res_json = self.client.get(f"/api/accounting/reports/export/?report_type=balance_sheet&export_format=json&as_of_date=2026-01-31")
+        self.assertEqual(res_json.status_code, status.HTTP_200_OK)
+        self.assertIn("summary", res_json.data)
+
+    def test_company_isolation(self):
+        """Company B cannot see Company A's financial reports."""
+        self.client.force_authenticate(user=self.other_user)
+
+        res = self.client.get(f"/api/accounting/reports/profit-and-loss/?start_date=2026-01-01&end_date=2026-01-31")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        summary = res.data["summary"]
+        # Rival company has zero transactions
+        self.assertEqual(Decimal(str(summary["total_revenue"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(summary["net_profit"])), Decimal("0.00"))
+
+    def test_permissions(self):
+        """Non-finance user gets 403 Forbidden on reports."""
+        self.client.force_authenticate(user=self.regular_user)
+        res = self.client.get(f"/api/accounting/reports/profit-and-loss/?period_id={self.p1.id}")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_anon = self.client.get(f"/api/accounting/reports/profit-and-loss/?period_id={self.p1.id}")
+        self.assertEqual(res_anon.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #23 — ACCOUNTING DASHBOARD TEST SUITE
+# ==============================================================================
+
+class AccountingDashboardTestCase(APITestCase):
+    """
+    Blueprint Section #23 comprehensive test suite:
+      - Master executive dashboard aggregation
+      - Cash and bank balance summary
+      - Receivables due / overdue & aging
+      - Payables due / overdue & aging
+      - Gross margin and profitability metrics
+      - 6-month historical revenue & expense trends
+      - Inventory balance breakdown (Raw materials, WIP, Finished goods)
+      - Production cost indicators (DM, DL, MOH, Prime, Conversion, COGM)
+      - Unreconciled bank transactions count & amount
+      - Pending journal approvals and draft counts
+      - Period closing status and closing readiness
+      - Recent transactions activity feed
+      - Date filter presets (today, this_week, this_month, this_quarter, this_year, custom)
+      - Multi-tenant company isolation
+      - Permission and authentication enforcement
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Dashboard Alpha Corp", slug="dashboard-alpha")
+        self.user = User.objects.create_user(
+            username="dash_finance",
+            email="dash@alpha.com",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.regular_user = User.objects.create_user(
+            username="dash_worker",
+            email="worker@alpha.com",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+        self.other_company = Company.objects.create(name="Dashboard Beta Corp", slug="dashboard-beta")
+        self.other_user = User.objects.create_user(
+            username="other_dash_user",
+            email="other@beta.com",
+            password="password123",
+            company=self.other_company,
+            role="finance",
+        )
+
+        self.settings = AccountingSettings.objects.create(
+            company=self.company,
+            default_currency="USD",
+        )
+        AccountingSettings.objects.create(
+            company=self.other_company,
+            default_currency="USD",
+        )
+
+        seed_standard_chart_of_accounts(self.company)
+        seed_standard_fiscal_year(self.company, year=2026)
+        seed_standard_chart_of_accounts(self.other_company)
+        seed_standard_fiscal_year(self.other_company, year=2026)
+
+        # Reference accounts
+        self.acc_cash = Account.objects.get(company=self.company, code="1010")
+        self.acc_bank = Account.objects.get(company=self.company, code="1020")
+        self.acc_ar = Account.objects.get(company=self.company, code="1100")
+        self.acc_inv_rm = Account.objects.get(company=self.company, code="1210")
+        self.acc_inv_wip = Account.objects.get(company=self.company, code="1220")
+        self.acc_inv_fg = Account.objects.get(company=self.company, code="1230")
+        self.acc_ap = Account.objects.get(company=self.company, code="2010")
+        self.acc_tax = Account.objects.get(company=self.company, code="2100")
+        self.acc_equity = Account.objects.get(company=self.company, code="3010")
+        self.acc_revenue = Account.objects.get(company=self.company, code="4010")
+        self.acc_cogs = Account.objects.get(company=self.company, code="5010")
+        self.acc_overhead = Account.objects.get(company=self.company, code="5210")
+        self.acc_rent = Account.objects.get(company=self.company, code="6020")
+
+        # Bank Account
+        self.bank_account = BankAccount.objects.create(
+            company=self.company,
+            account_name="Main Operating Account",
+            bank_name="Citibank",
+            account_number="987654321012",
+            account_type="checking",
+            currency="USD",
+            gl_account=self.acc_bank,
+        )
+        record_opening_balance(
+            bank_account_id=self.bank_account.id,
+            amount=Decimal("50000.00"),
+            balance_date=date(2026, 1, 1),
+            user=self.user,
+        )
+
+        # Customer & Vendor
+        self.customer = Customer.objects.create(company=self.company, name="Global Breweries Inc")
+        self.vendor = Vendor.objects.create(company=self.company, name="Hops Harvest Co")
+
+        # 1. Sales Invoice: $10,000 + $1,800 Tax
+        from sales.models import Invoice as SalesInv
+        self.sales_inv = SalesInv.objects.create(
+            company=self.company,
+            customer=self.customer,
+            invoice_date=date(2026, 1, 15),
+            due_date=date(2026, 2, 15),
+            total_amount=Decimal("11800.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        from .sales_accounting import post_sales_invoice_to_accounting
+        post_sales_invoice_to_accounting(
+            self.sales_inv.id,
+            user=self.user,
+            company=self.company,
+            revenue_account_id=self.acc_revenue.id,
+            tax_account_id=self.acc_tax.id,
+            tax_amount=Decimal("1800.00"),
+        )
+
+        # 2. Supplier Bill: $20,000 for Raw Material Inventory
+        from procurement.models import Bill as SuppBill
+        self.supp_bill = SuppBill.objects.create(
+            company=self.company,
+            vendor=self.vendor,
+            bill_number="BILL-DASH-01",
+            bill_date=date(2026, 1, 20),
+            due_date=date(2026, 2, 20),
+            total_amount=Decimal("20000.00"),
+            amount_paid=Decimal("0.00"),
+            status="open",
+        )
+        from .purchase_accounting import post_purchase_to_accounting
+        post_purchase_to_accounting(
+            self.supp_bill.id,
+            user=self.user,
+            company=self.company,
+            expense_account_id=self.acc_inv_rm.id,
+        )
+
+        # 3. COGS entry: Dr COGS 6,000, Cr Inventory RM 6,000
+        p1 = AccountingPeriod.objects.filter(company=self.company, period_number=1).first()
+        cogs_je = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="system",
+            source_module="sales",
+            source_id=101,
+            transaction_date=date(2026, 1, 16),
+            accounting_period=p1,
+            reference="DEL-DASH-01",
+            description="COGS for sales delivery",
+            status="draft",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=cogs_je,
+            account=self.acc_cogs,
+            debit=Decimal("6000.00"),
+            credit=Decimal("0.00"),
+            description="COGS delivery recognition",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=cogs_je,
+            account=self.acc_inv_rm,
+            debit=Decimal("0.00"),
+            credit=Decimal("6000.00"),
+            description="Stock relief for delivery",
+        )
+        post_journal_entry(cogs_je.id, user=self.user)
+
+        # 4. Production cost entries: Dr WIP 3000 / Cr RM 3000
+        prod_je = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="system",
+            source_module="manufacturing",
+            source_id=202,
+            transaction_date=date(2026, 1, 18),
+            accounting_period=p1,
+            reference="PR-DASH-01",
+            description="Issue RM to production WIP",
+            status="draft",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=prod_je,
+            account=self.acc_inv_wip,
+            debit=Decimal("3000.00"),
+            credit=Decimal("0.00"),
+            description="WIP direct materials",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=prod_je,
+            account=self.acc_inv_rm,
+            debit=Decimal("0.00"),
+            credit=Decimal("3000.00"),
+            description="RM stock consumption",
+        )
+        post_journal_entry(prod_je.id, user=self.user)
+
+        # 5. Pending approvals & drafts
+        self.draft_je = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="manual",
+            transaction_date=date(2026, 1, 25),
+            accounting_period=p1,
+            reference="MAN-DRAFT-01",
+            description="Pending draft journal",
+            status="draft",
+        )
+        self.submitted_je = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="manual",
+            transaction_date=date(2026, 1, 26),
+            accounting_period=p1,
+            reference="MAN-SUBMIT-01",
+            description="Pending approval journal",
+            status="submitted",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.submitted_je,
+            account=self.acc_rent,
+            debit=Decimal("500.00"),
+            credit=Decimal("0.00"),
+            description="Rent adjustment",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.submitted_je,
+            account=self.acc_cash,
+            debit=Decimal("0.00"),
+            credit=Decimal("500.00"),
+            description="Rent cash outflow",
+        )
+
+        # 6. Unreconciled bank item
+        BankTransaction.objects.create(
+            company=self.company,
+            bank_account=self.bank_account,
+            transaction_date=date(2026, 1, 28),
+            amount=Decimal("1250.00"),
+            direction="inflow",
+            reconciliation_status="unreconciled",
+            description="Unreconciled merchant settlement",
+        )
+
+        self.client.force_authenticate(user=self.user)
+
+    def test_dashboard_full_aggregation_and_sections(self):
+        """Validates all 10 Blueprint #23 dashboard sections and KPIs."""
+        res = self.client.get("/api/accounting/dashboard/?date_filter=custom&start_date=2026-01-01&end_date=2026-01-31")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        # 0. Metadata
+        self.assertEqual(data["company_name"], "Dashboard Alpha Corp")
+        self.assertEqual(data["currency"], "USD")
+        self.assertEqual(data["date_filter"], "custom")
+        self.assertEqual(data["start_date"], "2026-01-01")
+        self.assertEqual(data["end_date"], "2026-01-31")
+
+        # 1. Cash and bank summary
+        cash_bank = data["cash_bank"]
+        self.assertEqual(Decimal(str(cash_bank["total_cash_and_bank"])), Decimal("50000.00"))
+        self.assertEqual(cash_bank["accounts_count"], 1)
+        self.assertEqual(cash_bank["accounts"][0]["bank_name"], "Citibank")
+        self.assertEqual(cash_bank["accounts"][0]["account_number_masked"], "****1012")
+
+        # 2. Receivables due / overdue & aging
+        ar = data["receivables"]
+        self.assertEqual(Decimal(str(ar["total_receivables"])), Decimal("11800.00"))
+        self.assertEqual(Decimal(str(ar["current_due"])), Decimal("11800.00"))
+        self.assertEqual(Decimal(str(ar["overdue_receivables"])), Decimal("0.00"))
+        self.assertTrue(len(ar["aging_brackets"]) >= 5)
+        self.assertTrue(len(ar["top_debtors"]) >= 1)
+        self.assertEqual(ar["top_debtors"][0]["customer_name"], "Global Breweries Inc")
+
+        # 3. Payables due / overdue & aging
+        ap = data["payables"]
+        self.assertEqual(Decimal(str(ap["total_payables"])), Decimal("20000.00"))
+        self.assertEqual(Decimal(str(ap["current_due"])), Decimal("20000.00"))
+        self.assertEqual(Decimal(str(ap["overdue_payables"])), Decimal("0.00"))
+        self.assertTrue(len(ap["aging_brackets"]) >= 5)
+        self.assertTrue(len(ap["top_creditors"]) >= 1)
+        self.assertEqual(ap["top_creditors"][0]["vendor_name"], "Hops Harvest Co")
+
+        # 4. Gross margin and profitability
+        profit = data["profitability"]
+        self.assertEqual(Decimal(str(profit["total_revenue"])), Decimal("10000.00"))
+        self.assertEqual(Decimal(str(profit["total_cogs"])), Decimal("6000.00"))
+        self.assertEqual(Decimal(str(profit["gross_profit"])), Decimal("4000.00"))
+        self.assertEqual(Decimal(str(profit["gross_margin_pct"])), Decimal("40.00"))
+        self.assertEqual(Decimal(str(profit["net_profit"])), Decimal("4000.00"))
+
+        # 5. Revenue & expense trends
+        trends = data["revenue_expense_trends"]
+        self.assertEqual(len(trends), 6)
+        jan_trend = next((t for t in trends if t["year"] == 2026 and t["month_num"] == 1), None)
+        if jan_trend:
+            self.assertEqual(Decimal(str(jan_trend["revenue"])), Decimal("10000.00"))
+            self.assertEqual(Decimal(str(jan_trend["cogs"])), Decimal("6000.00"))
+
+        # 6. Inventory value breakdown
+        inv = data["inventory"]
+        self.assertEqual(Decimal(str(inv["raw_materials_value"])), Decimal("11000.00"))
+        self.assertEqual(Decimal(str(inv["work_in_progress_value"])), Decimal("3000.00"))
+        self.assertEqual(Decimal(str(inv["finished_goods_value"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(inv["total_inventory_value"])), Decimal("14000.00"))
+        self.assertEqual(len(inv["breakdown"]), 3)
+
+        # 7. Production cost indicators
+        prod = data["production_cost"]
+        self.assertIn("prime_cost", prod)
+        self.assertIn("conversion_cost", prod)
+        self.assertIn("cost_of_goods_manufactured", prod)
+
+        # 8. Unreconciled bank items
+        unrec = data["unreconciled_bank"]
+        self.assertEqual(unrec["unreconciled_count"], 1)
+        self.assertEqual(Decimal(str(unrec["unreconciled_amount"])), Decimal("1250.00"))
+
+        # 9. Pending approvals
+        approvals = data["pending_approvals"]
+        self.assertEqual(approvals["pending_journals_count"], 1)
+        self.assertEqual(Decimal(str(approvals["pending_journals_amount"])), Decimal("500.00"))
+        self.assertEqual(approvals["draft_journals_count"], 1)
+
+        # 10. Period closing status
+        closing = data["period_closing"]
+        self.assertIsNotNone(closing["fiscal_year"])
+        self.assertEqual(closing["fiscal_year"]["name"], "FY 2026")
+        self.assertTrue(closing["open_periods_count"] > 0)
+        self.assertIn("is_ready_to_close", closing)
+
+        # 11. Recent transactions
+        recent = data["recent_transactions"]
+        self.assertTrue(len(recent) >= 4)
+        first_txn = recent[0]
+        self.assertIn("entry_number", first_txn)
+        self.assertIn("transaction_date", first_txn)
+        self.assertIn("amount", first_txn)
+
+    def test_date_filter_options(self):
+        """Tests preset date filter options: today, this_week, this_month, this_quarter, this_year."""
+        for filter_name in ["today", "this_week", "this_month", "this_quarter", "this_year"]:
+            res = self.client.get(f"/api/accounting/dashboard/?date_filter={filter_name}")
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.assertEqual(res.data["date_filter"], filter_name)
+            self.assertIsNotNone(res.data["start_date"])
+            self.assertIsNotNone(res.data["end_date"])
+
+    def test_company_isolation(self):
+        """Company B receives clean isolated metrics without seeing Company A's data."""
+        self.client.force_authenticate(user=self.other_user)
+        res = self.client.get("/api/accounting/dashboard/?date_filter=this_month")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["company_name"], "Dashboard Beta Corp")
+        self.assertEqual(Decimal(str(data["cash_bank"]["total_cash_and_bank"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(data["receivables"]["total_receivables"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(data["payables"]["total_payables"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(data["profitability"]["total_revenue"])), Decimal("0.00"))
+        self.assertEqual(Decimal(str(data["inventory"]["total_inventory_value"])), Decimal("0.00"))
+        self.assertEqual(data["pending_approvals"]["pending_journals_count"], 0)
+        self.assertEqual(len(data["recent_transactions"]), 0)
+
+    def test_permissions(self):
+        """Unauthorized access controls: 403 for non-finance, 401 for anonymous."""
+        self.client.force_authenticate(user=self.regular_user)
+        res = self.client.get("/api/accounting/dashboard/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_anon = self.client.get("/api/accounting/dashboard/")
+        self.assertEqual(res_anon.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #24 — DATABASE ARCHITECTURE TESTS
+# ==============================================================================
+
+from django.utils import timezone
+from accounting.database_architecture import (
+    get_database_architecture_metadata,
+    verify_database_integrity,
+    LOGICAL_ENTITIES_SPEC,
+)
+
+
+
+class DatabaseArchitectureTestCase(APITestCase):
+    """
+    Automated verification suite for Blueprint Section #24 (Database Architecture).
+    Validates:
+    1. Schema alignment for all 18 core logical entities and their relationships.
+    2. ERD flows (General Ledger, AR Subledger, AP Subledger).
+    3. Cross-domain relationships (Invoices, Bills, Payments, Allocations, Source tracking).
+    4. Data design rules & integrity constraints (Decimals, Tenant Scoping, Debit XOR Credit).
+    5. Database integrity diagnostics engine (Balance, orphans, constraints, cross-tenant isolation).
+    6. Multi-tenant company isolation and strict permission controls.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="DB Arch Alpha Corp")
+        self.user = User.objects.create_user(
+            username="db_arch_admin",
+            password="password123",
+            company=self.company,
+            role="admin",
+        )
+        self.regular_user = User.objects.create_user(
+            username="db_arch_regular",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+
+        # Company B for cross-tenant isolation tests
+        self.company_b = Company.objects.create(name="DB Arch Beta Corp")
+        self.user_b = User.objects.create_user(
+            username="db_arch_user_b",
+            password="password123",
+            company=self.company_b,
+            role="finance",
+        )
+
+
+        # Setup basic accounting data for Company A
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            is_closed=False,
+        )
+
+        self.period = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+
+        self.asset_type = AccountType.objects.filter(category="ASSET").first()
+        if not self.asset_type:
+            self.asset_type = AccountType.objects.create(
+                name="Cash & Cash Equivalents", category="ASSET", normal_balance="DEBIT", code_prefix="1"
+            )
+
+        self.equity_type = AccountType.objects.filter(category="EQUITY").first()
+        if not self.equity_type:
+            self.equity_type = AccountType.objects.create(
+                name="Retained Earnings", category="EQUITY", normal_balance="CREDIT", code_prefix="3"
+            )
+
+
+        self.cash_account = Account.objects.create(
+            company=self.company,
+            account_type=self.asset_type,
+            code="1010",
+            name="Cash at Bank",
+            is_active=True,
+            is_reconciled=True,
+        )
+        self.equity_account = Account.objects.create(
+            company=self.company,
+            account_type=self.equity_type,
+            code="3010",
+            name="Share Capital",
+            is_active=True,
+        )
+
+        # Create balanced posted journal entry
+        self.entry = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-ARCH-001",
+            entry_type="manual",
+            transaction_date=date(2026, 1, 15),
+            accounting_period=self.period,
+            status="posted",
+            posted_at=timezone.now(),
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.entry,
+            account=self.cash_account,
+            line_number=1,
+            debit=Decimal("5000.00"),
+            credit=Decimal("0.00"),
+            description="Initial capital deposit",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.entry,
+            account=self.equity_account,
+            line_number=2,
+            debit=Decimal("0.00"),
+            credit=Decimal("5000.00"),
+            description="Capital credit",
+        )
+
+        self.client.force_authenticate(user=self.user)
+
+    def test_database_architecture_metadata_endpoint(self):
+        """Test GET /api/accounting/database-architecture/ returns full schema & entity catalog."""
+        res = self.client.get("/api/accounting/database-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        # 1. Tenant info
+        self.assertEqual(data["tenant"]["company_id"], self.company.id)
+        self.assertEqual(data["tenant"]["company_name"], "DB Arch Alpha Corp")
+
+        # 2. Summary
+        self.assertEqual(data["summary"]["total_logical_entities"], 19)
+        self.assertTrue(data["summary"]["total_accounting_records"] > 0)
+        self.assertIn("Strict Company Isolation", data["summary"]["tenant_isolation_mode"])
+
+        # 3. Entities catalog contains all 18 Blueprint #24 entities
+        entities = {e["entity"]: e for e in data["entities"]}
+        required_entities = [
+            "Company", "Account", "AccountType", "JournalEntry", "JournalLine",
+            "Customer", "Supplier", "Invoice / InvoiceLine", "Bill / BillLine",
+            "Payment", "PaymentAllocation", "Expense", "Tax", "BankAccount",
+            "BankTransaction", "AccountingPeriod", "FiscalYear", "Reconciliation", "AuditLog"
+        ]
+        for ent in required_entities:
+            self.assertIn(ent, entities, f"Entity {ent} must be present in catalog")
+            self.assertIsNotNone(entities[ent]["table_name"])
+            self.assertIsNotNone(entities[ent]["relationships"])
+
+        # 4. Verify ERD flows
+        flow_ids = [f["id"] for f in data["erd_flows"]]
+        self.assertIn("general_ledger_flow", flow_ids)
+        self.assertIn("ar_subledger_flow", flow_ids)
+        self.assertIn("ap_subledger_flow", flow_ids)
+
+        # 5. Verify cross-domain relationships
+        self.assertTrue(len(data["cross_domain_relationships"]) >= 7)
+        sources = [r["source"] for r in data["cross_domain_relationships"]]
+        self.assertIn("Invoice", sources)
+        self.assertIn("Bill", sources)
+        self.assertIn("PaymentAllocation", sources)
+
+        # 6. Verify data design rules
+        rule_ids = [r["rule_id"] for r in data["data_design_rules"]]
+        self.assertIn("fixed_precision_decimals", rule_ids)
+        self.assertIn("multi_tenant_isolation", rule_ids)
+        self.assertIn("debit_xor_credit", rule_ids)
+        self.assertIn("double_entry_balance", rule_ids)
+
+    def test_database_integrity_endpoint_healthy(self):
+        """Test GET /api/accounting/database-architecture/integrity/ passes on valid data."""
+        res = self.client.get("/api/accounting/database-architecture/integrity/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["status"], "HEALTHY")
+        self.assertEqual(data["overall_errors"], 0)
+        self.assertEqual(data["total_checks"], 8)
+        self.assertEqual(data["passing_checks"], 8)
+
+        check_ids = [c["check_id"] for c in data["checks"]]
+        self.assertIn("double_entry_balance", check_ids)
+        self.assertIn("orphaned_lines", check_ids)
+        self.assertIn("debit_xor_credit", check_ids)
+        self.assertIn("non_negative_amounts", check_ids)
+        self.assertIn("account_code_uniqueness", check_ids)
+        self.assertIn("entry_number_uniqueness", check_ids)
+        self.assertIn("subledger_allocations", check_ids)
+        self.assertIn("cross_tenant_isolation", check_ids)
+
+    def test_database_integrity_post_verify_action(self):
+        """Test POST /api/accounting/database-architecture/verify/ executes diagnostic check."""
+        res = self.client.post("/api/accounting/database-architecture/verify/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "HEALTHY")
+
+    def test_database_integrity_detects_unbalanced_entry(self):
+        """Integrity engine flags unbalanced posted journal entries as FAIL."""
+        # Create a valid entry, then corrupt a line to make it unbalanced
+        unbalanced_entry = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-UNBALANCED-999",
+            entry_type="manual",
+            transaction_date=date(2026, 1, 20),
+            accounting_period=self.period,
+            status="posted",
+            posted_at=timezone.now(),
+        )
+        l1 = JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=unbalanced_entry,
+            account=self.cash_account,
+            line_number=1,
+            debit=Decimal("1000.00"),
+            credit=Decimal("0.00"),
+        )
+        l2 = JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=unbalanced_entry,
+            account=self.equity_account,
+            line_number=2,
+            debit=Decimal("0.00"),
+            credit=Decimal("1000.00"),
+        )
+        # Bypass clean() via update() to simulate corrupted unbalanced state
+        JournalEntryLine.objects.filter(id=l2.id).update(credit=Decimal("500.00"))
+
+        diag = verify_database_integrity(self.company)
+        self.assertEqual(diag["status"], "FAIL")
+        self.assertTrue(diag["overall_errors"] >= 1)
+
+        bal_check = next(c for c in diag["checks"] if c["check_id"] == "double_entry_balance")
+        self.assertEqual(bal_check["status"], "FAIL")
+        self.assertIn("JE-UNBALANCED-999", bal_check["details"])
+
+    def test_database_integrity_detects_cross_tenant_line(self):
+        """Integrity engine flags any cross-tenant journal entry line as FAIL."""
+        # Create a line in company A, then update journal_entry to company B
+        entry_b = JournalEntry.objects.create(
+            company=self.company_b,
+            entry_number="JE-BETA-001",
+            entry_type="manual",
+            transaction_date=date(2026, 1, 15),
+            status="draft",
+        )
+        test_line = JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=self.entry,
+            account=self.cash_account,
+            line_number=99,
+            debit=Decimal("100.00"),
+            credit=Decimal("0.00"),
+        )
+        # Update entry to entry_b to simulate cross-tenant corruption
+        JournalEntryLine.objects.filter(id=test_line.id).update(journal_entry=entry_b)
+
+        diag = verify_database_integrity(self.company)
+        self.assertEqual(diag["status"], "FAIL")
+        cross_check = next(c for c in diag["checks"] if c["check_id"] == "cross_tenant_isolation")
+        self.assertEqual(cross_check["status"], "FAIL")
+
+
+    def test_company_isolation(self):
+        """Company B only views its own schema counts and cannot see Company A's entries."""
+        self.client.force_authenticate(user=self.user_b)
+        res = self.client.get("/api/accounting/database-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["tenant"]["company_id"], self.company_b.id)
+        self.assertEqual(data["tenant"]["company_name"], "DB Arch Beta Corp")
+
+        # Company B has 0 journal entries
+        je_catalog = next(e for e in data["entities"] if e["entity"] == "JournalEntry")
+        self.assertEqual(je_catalog["count"], 0)
+
+        # Integrity for Company B is healthy and scans 0 entries
+        res_diag = self.client.get("/api/accounting/database-architecture/integrity/")
+        self.assertEqual(res_diag.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_diag.data["status"], "HEALTHY")
+
+    def test_permissions(self):
+        """Non-finance user receives 403 Forbidden; anonymous user receives 401 Unauthorized."""
+        self.client.force_authenticate(user=self.regular_user)
+        res_forbidden = self.client.get("/api/accounting/database-architecture/")
+        self.assertEqual(res_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_diag_forbidden = self.client.get("/api/accounting/database-architecture/integrity/")
+        self.assertEqual(res_diag_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_unauth = self.client.get("/api/accounting/database-architecture/")
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ==============================================================================
+# BLUEPRINT SECTION #25 — API ARCHITECTURE TESTS
+# ==============================================================================
+
+from accounting.api_architecture import (
+    get_api_architecture_metadata,
+    verify_api_architecture_health,
+    API_CATEGORIES_SPEC,
+    ARCHITECTURAL_CONCERNS_SPEC,
+)
+
+
+class APIArchitectureTestCase(APITestCase):
+    """
+    Automated verification suite for Blueprint Section #25 (API Architecture).
+    Validates:
+    1. Complete endpoint mapping across all 11 core categories from Blueprint Page 30.
+    2. Enforcement of the 8 architectural concerns from Page 37 (JWT, RBAC, Two-tier validation, Atomicity, etc.).
+    3. Layered architecture specification (View -> Serializer -> Service -> Model -> DB).
+    4. Dedicated endpoints for Account activate / deactivate.
+    5. Dedicated endpoint for Journal Entry pre-flight validation.
+    6. Multi-tenant company isolation and permission restrictions (401/403).
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="API Arch Alpha Corp")
+        self.user = User.objects.create_user(
+            username="api_arch_admin",
+            password="password123",
+            company=self.company,
+            role="admin",
+        )
+        self.regular_user = User.objects.create_user(
+            username="api_arch_regular",
+            password="password123",
+            company=self.company,
+            role="operator",
+        )
+
+        # Company B for cross-tenant isolation tests
+        self.company_b = Company.objects.create(name="API Arch Beta Corp")
+        self.user_b = User.objects.create_user(
+            username="api_arch_user_b",
+            password="password123",
+            company=self.company_b,
+            role="finance",
+        )
+
+        # Basic setup
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            is_closed=False,
+        )
+        self.period = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+
+        self.asset_type = AccountType.objects.filter(category="ASSET").first()
+        if not self.asset_type:
+            self.asset_type = AccountType.objects.create(
+                name="Current Asset", category="ASSET", normal_balance="DEBIT", code_prefix="1"
+            )
+
+        self.test_account = Account.objects.create(
+            company=self.company,
+            account_type=self.asset_type,
+            code="1080",
+            name="API Test Cash Account",
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.user)
+
+    def test_api_architecture_metadata_endpoint(self):
+        """Test GET /api/accounting/api-architecture/ returns catalog across all 11 Blueprint categories."""
+        res = self.client.get("/api/accounting/api-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        # 1. Tenant info
+        self.assertEqual(data["tenant"]["company_id"], self.company.id)
+        self.assertEqual(data["tenant"]["company_name"], "API Arch Alpha Corp")
+
+        # 2. Summary
+        self.assertEqual(data["summary"]["total_categories"], 11)
+        self.assertTrue(data["summary"]["total_documented_endpoints"] >= 35)
+        self.assertEqual(data["summary"]["authentication_mode"], "JWT Bearer Token")
+        self.assertEqual(data["summary"]["authorization_mode"], "Role-Based Access Control (IsFinanceOrAdmin)")
+
+        # 3. All 11 categories present from Blueprint Section #25 Page 30
+        category_ids = [c["category_id"] for c in data["categories"]]
+        required_categories = [
+            "authentication",
+            "accounts",
+            "journals",
+            "ledger",
+            "receivables",
+            "payables",
+            "cash_bank",
+            "expenses_taxes",
+            "reports_dashboard",
+            "periods_years",
+            "audit_logs",
+        ]
+        for req_cat in required_categories:
+            self.assertIn(req_cat, category_ids, f"Category {req_cat} must be documented")
+
+        # 4. All 8 architectural concerns present from Research Page 37
+        concern_ids = [c["concern_id"] for c in data["concerns"]]
+        required_concerns = [
+            "authentication",
+            "authorization",
+            "two_tier_validation",
+            "transaction_atomicity",
+            "error_handling",
+            "pagination",
+            "filtering_tenant_scoping",
+            "audit_logging",
+        ]
+        for req_con in required_concerns:
+            self.assertIn(req_con, concern_ids, f"Architectural concern {req_con} must be documented")
+
+        # 5. Layered architecture specification
+        layers = data["layered_architecture"]["layers"]
+        self.assertEqual(len(layers), 4)
+
+    def test_api_architecture_health_endpoint(self):
+        """Test GET /api/accounting/api-architecture/health/ passes all 8 architectural checks."""
+        res = self.client.get("/api/accounting/api-architecture/health/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data
+
+        self.assertEqual(data["status"], "HEALTHY")
+        self.assertEqual(data["overall_errors"], 0)
+        self.assertEqual(data["total_checks"], 8)
+        self.assertEqual(data["passing_checks"], 8)
+
+    def test_api_architecture_verify_post_action(self):
+        """Test POST /api/accounting/api-architecture/verify/ executes diagnostic check."""
+        res = self.client.post("/api/accounting/api-architecture/verify/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "HEALTHY")
+
+    def test_account_activate_and_deactivate_endpoints(self):
+        """Test Blueprint #25 requirement: activate and deactivate account endpoints."""
+        acc_id = self.test_account.id
+
+        # Deactivate
+        res_deact = self.client.post(f"/api/accounting/accounts/{acc_id}/deactivate/")
+        self.assertEqual(res_deact.status_code, status.HTTP_200_OK)
+        self.assertFalse(res_deact.data["is_active"])
+        self.test_account.refresh_from_db()
+        self.assertFalse(self.test_account.is_active)
+
+        # Activate
+        res_act = self.client.post(f"/api/accounting/accounts/{acc_id}/activate/")
+        self.assertEqual(res_act.status_code, status.HTTP_200_OK)
+        self.assertTrue(res_act.data["is_active"])
+        self.test_account.refresh_from_db()
+        self.assertTrue(self.test_account.is_active)
+
+    def test_journal_entry_validate_endpoint(self):
+        """Test Blueprint #25 requirement: journals validate endpoint without posting."""
+        # 1. Create a balanced draft journal entry
+        entry = JournalEntry.objects.create(
+            company=self.company,
+            entry_number="JE-VAL-001",
+            entry_type="manual",
+            transaction_date=date(2026, 1, 15),
+            accounting_period=self.period,
+            status="draft",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=self.test_account,
+            line_number=1,
+            debit=Decimal("250.00"),
+            credit=Decimal("0.00"),
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=self.test_account,
+            line_number=2,
+            debit=Decimal("0.00"),
+            credit=Decimal("250.00"),
+        )
+
+        res_val = self.client.post(f"/api/accounting/journal-entries/{entry.id}/validate/")
+        self.assertEqual(res_val.status_code, status.HTTP_200_OK)
+        self.assertTrue(res_val.data["is_valid"])
+        self.assertEqual(len(res_val.data["errors"]), 0)
+        self.assertEqual(res_val.data["total_debit"], "250.00")
+        self.assertEqual(res_val.data["total_credit"], "250.00")
+
+        # 2. Corrupt line to be unbalanced and re-validate
+        l2 = entry.lines.filter(line_number=2).first()
+        JournalEntryLine.objects.filter(id=l2.id).update(credit=Decimal("200.00"))
+
+        res_unbal = self.client.get(f"/api/accounting/journal-entries/{entry.id}/validate/")
+        self.assertEqual(res_unbal.status_code, status.HTTP_200_OK)
+        self.assertFalse(res_unbal.data["is_valid"])
+        self.assertTrue(len(res_unbal.data["errors"]) >= 1)
+        self.assertIn("out of balance", res_unbal.data["errors"][0])
+
+    def test_company_isolation(self):
+        """Company B only views its own tenant API context and cannot access Company A objects."""
+        self.client.force_authenticate(user=self.user_b)
+        res = self.client.get("/api/accounting/api-architecture/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["tenant"]["company_id"], self.company_b.id)
+
+        # Company B cannot deactivate Company A's account
+        res_cross = self.client.post(f"/api/accounting/accounts/{self.test_account.id}/deactivate/")
+        self.assertEqual(res_cross.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_permissions(self):
+        """Non-finance user receives 403 Forbidden; anonymous user receives 401 Unauthorized."""
+        self.client.force_authenticate(user=self.regular_user)
+        res_forbidden = self.client.get("/api/accounting/api-architecture/")
+        self.assertEqual(res_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_health_forbidden = self.client.get("/api/accounting/api-architecture/health/")
+        self.assertEqual(res_health_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_unauth = self.client.get("/api/accounting/api-architecture/")
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+
