@@ -836,8 +836,13 @@ class InboundOrderEmailViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 class PriceListViewSet(viewsets.ViewSet):
     """Selling prices of finished goods. Sales, Finance and Admin can change the
     price only — the item itself stays managed from Inventory. The price drives
-    sales order totals and invoices, and is mirrored to QuickBooks with the item."""
-    permission_classes = [IsSales | IsAdmin | IsFinance]
+    sales order totals and invoices, and is mirrored to QuickBooks with the item.
+    Store users (who can also raise sales orders) may read prices, not change them."""
+
+    def get_permissions(self):
+        if self.action == "list":
+            return [(IsSales | IsAdmin | IsFinance | IsStore)()]
+        return [(IsSales | IsAdmin | IsFinance)()]
 
     def _items(self, request):
         company = getattr(request.user, "company", None)

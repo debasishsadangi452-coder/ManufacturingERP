@@ -45,3 +45,12 @@ class PriceListTests(APITestCase):
         foreign = Item.objects.create(company=other, name="Cola", category="finished_good")
         self.assertEqual(self.client.patch(f"{URL}{foreign.id}/", {"selling_price": "1"}, format="json").status_code,
                          status.HTTP_404_NOT_FOUND)
+
+    def test_store_users_can_read_but_not_change_prices(self):
+        store = User.objects.create_user(
+            username="sid.store", email="sid@fizz.test", role="store", company=self.company, password="pass",
+        )
+        self.client.force_authenticate(user=store)
+        self.assertEqual(self.client.get(URL).status_code, status.HTTP_200_OK)
+        res = self.client.patch(f"{URL}{self.soda.id}/", {"selling_price": "9"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)

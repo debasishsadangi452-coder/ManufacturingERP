@@ -194,3 +194,7 @@ None of the new modules post automatically; each one posts only when a user clic
   - Fixed a bug from the #22 merge: `FinancialReportsTab` called `getAccountingPeriods(fyId)` with a bare ID, so the period picker loaded every period rather than the chosen year's. It now passes `{ fiscal_year: fyId }`.
   - The frontend is back to the 12 old type errors, and `npm run build` passes.
 - **`seo/crawlable-landing-pages` was not merged, on purpose.** Its only commit (`6e2746a`) is identical (same patch-id) to `d67397e`, which is already on `main`, and `main` has four follow-up commits improving those pages since. Merging would add nothing and would risk the old version overwriting the newer pages during conflict resolution. It is safe to delete on GitHub.
+
+## Follow-up: Base prices always settable from Sales and Procurement
+
+- `/api/sales/price-list/`: Store users, who can raise sales orders, may now **read** base selling prices. Changing them is still limited to Sales, Finance and Admin. A test covers this in `sales/test_price_list.py`.
