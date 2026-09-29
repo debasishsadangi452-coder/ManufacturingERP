@@ -76,18 +76,41 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     vendor_email = serializers.CharField(source="vendor.email", read_only=True)
     vendor_payment_terms = serializers.CharField(source="vendor.payment_terms", read_only=True)
     email_count = serializers.SerializerMethodField()
+    billing = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseOrder
         fields = [
             "id", "vendor", "vendor_name", "vendor_email", "vendor_payment_terms",
             "created_at", "expected_delivery", "priority", "total_amount",
-            "status", "notes", "items", "email_count", "quickbooks_id",
+            "status", "notes", "items", "email_count", "quickbooks_id", "billing",
         ]
         read_only_fields = ["total_amount", "created_at", "quickbooks_id"]
 
     def get_email_count(self, obj):
         return obj.emails.count()
+
+    def get_billing(self, obj):
+        """Vendor bill and payment status for this order (read-only summary;
+        paying happens through the accounting AP flow)."""
+        from django.utils import timezone
+
+        bill = next((b for b in obj.bills.all() if b.status != "cancelled"), None)
+        if bill is None:
+            return {"state": "not_billed"}
+        payments = sorted(bill.payments.all(), key=lambda p: (p.payment_date, p.id))
+        overdue = bill.status != "paid" and bill.due_date is not None and bill.due_date < timezone.localdate()
+        return {
+            "state": "overdue" if overdue else bill.status,  # open / partial / paid / overdue
+            "bill_id": bill.id,
+            "bill_number": bill.bill_number or f"BILL-{bill.id}",
+            "bill_date": bill.bill_date,
+            "due_date": bill.due_date,
+            "total": str(bill.total_amount),
+            "paid": str(bill.amount_paid),
+            "balance_due": str(bill.balance_due),
+            "last_payment_date": payments[-1].payment_date if payments else None,
+        }
 
 
 class VendorEmailAttachmentSerializer(serializers.ModelSerializer):

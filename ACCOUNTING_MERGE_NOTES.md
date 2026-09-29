@@ -212,3 +212,13 @@ None of the new modules post automatically; each one posts only when a user clic
 - **AI receipts:** receipts recorded through the AI tools were not auto-posted before. They are now.
 - **Migration:** `accounting.0012_auto_bill_on_receipt` (one new column with a default; no table rewrite).
 - **Tests:** `procurement/test_auto_bill.py` (5). The manual-billing test now switches auto-billing off, and the reports test relies on the automatic bill.
+
+## Follow-up: Payment status per purchase order, and paying from Procurement
+
+- `PurchaseOrderSerializer.billing` is a read-only summary of each order's vendor bill: state (not_billed / open / partial / overdue / paid), totals, due date and last payment date.
+- New `POST /api/procurement/purchase-orders/{id}/pay_bill/`, **admins only**. It calls the same `record_and_allocate_ap_payment` as Accounting → Accounts Payable, in one transaction:
+  - the bill becomes partial or paid;
+  - a `VendorPayment` is recorded;
+  - Dr 2010 Accounts Payable / Cr 1010 Bank is posted.
+  - If the ledger refuses the posting (closed period, no chart of accounts), nothing is saved.
+- **Tests:** `procurement/test_po_payment.py` (6). These cover: status per order, full and partial payment, overpayment refused, store users can see but not pay, no bill means no payment, and the rollback when the period is closed.

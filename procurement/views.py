@@ -76,7 +76,7 @@ class VendorPriceListViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
 class PurchaseOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "vendor__company"
-    queryset = PurchaseOrder.objects.prefetch_related("items__item").select_related("vendor").all()
+    queryset = PurchaseOrder.objects.prefetch_related("items__item", "bills__payments").select_related("vendor").all()
     serializer_class = PurchaseOrderSerializer
     permission_classes = [IsStore | IsAdmin]
 
@@ -175,6 +175,56 @@ class PurchaseOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 for d in drafts
             ],
         })
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAdmin])
+    def pay_bill(self, request, pk=None):
+        """Pay this order's vendor bill from the Procurement screen (admins).
+
+        Goes through the same accounts-payable flow as Accounting > Accounts
+        Payable, atomically: the bill is marked partial/paid, a VendorPayment is
+        recorded and Dr Accounts Payable / Cr Bank is posted to the ledger. If
+        the ledger posting is refused (closed period, no chart of accounts) the
+        whole payment is rolled back.
+
+        Body: {"amount": optional (default: balance due), "method": "bank_transfer",
+               "reference": "", "payment_date": "YYYY-MM-DD"}
+        """
+        from decimal import Decimal, InvalidOperation
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from accounting.payables import record_and_allocate_ap_payment
+
+        po = self.get_object()
+        bill = po.bills.exclude(status="cancelled").first()
+        if bill is None:
+            return Response({"error": "This order has no vendor bill yet. It is created when the goods are received."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if bill.status == "paid":
+            return Response({"error": "This bill is already paid."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            amount = Decimal(str(request.data.get("amount") or bill.balance_due))
+        except InvalidOperation:
+            return Response({"error": "amount must be a number."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            record_and_allocate_ap_payment(
+                vendor_id=po.vendor_id,
+                amount=amount,
+                user=request.user,
+                company=request.user.company,
+                payment_date=request.data.get("payment_date") or None,
+                method=request.data.get("method") or "bank_transfer",
+                reference=request.data.get("reference", ""),
+                allocations=[{"bill_id": bill.id, "amount": str(amount)}],
+            )
+        except DjangoValidationError as e:
+            return Response({"error": " ".join(e.messages)}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError:
+            return Response({"error": "payment_date must be YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
+
+        log_activity(request.user, "Procurement", "Pay Vendor Bill",
+                     f"Paid {amount} on {bill.bill_number or f'BILL-{bill.id}'} for PO #{po.id}")
+        po = self.get_queryset().get(pk=po.pk)
+        return Response(self.get_serializer(po).data)
 
     @action(detail=True, methods=["post"])
     def request_approval(self, request, pk=None):
