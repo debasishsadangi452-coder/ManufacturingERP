@@ -61,6 +61,8 @@ _RESPONSE_KEYS = {
     "invoice": "Invoice",
     "bill": "Bill",
     "payment": "Payment",
+    "billpayment": "BillPayment",
+    "journalentry": "JournalEntry",
 }
 
 
@@ -101,11 +103,16 @@ def _adopt_duplicate(connection, entity_name, display_name):
 
 def _store_result(connection, entity_type, obj, qb_entity):
     """Save the QuickBooks Id/SyncToken onto the ERP record and entity link."""
-    with suppress_auto_push():
-        obj.quickbooks_id = str(qb_entity.get("Id", ""))
-        obj.quickbooks_sync_token = str(qb_entity.get("SyncToken", ""))
-        obj.quickbooks_last_synced_at = timezone.now()
-        obj.save(update_fields=["quickbooks_id", "quickbooks_sync_token", "quickbooks_last_synced_at"])
+    fields = {
+        "quickbooks_id": str(qb_entity.get("Id", "")),
+        "quickbooks_sync_token": str(qb_entity.get("SyncToken", "")),
+        "quickbooks_last_synced_at": timezone.now(),
+    }
+    # UPDATE rather than save(): no signals, and no model validation (a posted
+    # journal entry in a since-closed period would refuse a plain save()).
+    type(obj).objects.filter(pk=obj.pk).update(**fields)
+    for name, value in fields.items():
+        setattr(obj, name, value)
     QuickBooksEntityLink.objects.update_or_create(
         company=connection.company,
         entity_type=entity_type,
@@ -452,6 +459,228 @@ def push_payment(connection, payment):
 
 
 # ---------------------------------------------------------------------------
+# Main books: bill payments, ERP-only journal entries, deletions
+# ---------------------------------------------------------------------------
+#
+# QuickBooks is the company's main set of books. Every ERP ledger entry must
+# reach it exactly once:
+#   * invoices, bills, customer payments and bill payments are sent as those
+#     QuickBooks documents, and QuickBooks books them itself;
+#   * goods receipts, cost of goods sold, production and inventory valuation
+#     are booked by QuickBooks from its Inventory items (the ERP mirrors stock
+#     quantities to them), and year-end closing is done by QuickBooks itself,
+#     so those ERP entries are NOT sent;
+#   * entries QuickBooks cannot know about are sent as JournalEntry records.
+
+QB_JOURNAL_SOURCES = {"manual", "expenses", "cash_bank", "tax_adjustment"}
+
+
+def journal_entry_goes_to_quickbooks(entry):
+    """Whether this ERP journal entry is mirrored to QuickBooks as a JournalEntry."""
+    if entry.status not in ("posted", "reversed"):
+        return False
+    if entry.source_module in QB_JOURNAL_SOURCES:
+        return True
+    original = entry.reversal_of if entry.source_module == "reversal" else None
+    return bool(original and original.source_module in QB_JOURNAL_SOURCES)
+
+
+# ERP account type -> QuickBooks AccountType, used when auto-mapping accounts.
+_QB_TYPE_FOR_ERP_TYPE = {
+    "Cash & Cash Equivalents": "Bank",
+    "Accounts Receivable": "Accounts Receivable",
+    "Inventory": "Other Current Asset",
+    "Prepaid Expenses & Other Current Assets": "Other Current Asset",
+    "Property, Plant & Equipment": "Fixed Asset",
+    "Accumulated Depreciation": "Fixed Asset",
+    "Accounts Payable": "Accounts Payable",
+    "Accrued Expenses & Other Current Liabilities": "Other Current Liability",
+    "Long-Term Debt": "Long Term Liability",
+    "Operating Sales Revenue": "Income",
+    "Discounts & Returns": "Income",
+    "Other Income": "Other Income",
+}
+_QB_TYPE_FOR_CATEGORY = {
+    "asset": "Other Current Asset",
+    "liability": "Other Current Liability",
+    "equity": "Equity",
+    "revenue": "Income",
+    "expense": "Expense",
+}
+
+
+def list_quickbooks_accounts(connection):
+    return query_entities(connection, "Account", "Active = true")
+
+
+def _qb_type_for(account):
+    type_name = account.account_type.name if account.account_type_id else ""
+    if type_name in _QB_TYPE_FOR_ERP_TYPE:
+        return _QB_TYPE_FOR_ERP_TYPE[type_name]
+    if "cost of goods sold" in type_name.lower():
+        return "Cost of Goods Sold"
+    category = account.account_type.category if account.account_type_id else ""
+    return _QB_TYPE_FOR_CATEGORY.get(category, "")
+
+
+def auto_map_account(connection, account, qb_accounts=None, overwrite=False):
+    """Map an ERP account to a QuickBooks account: same name first, then the
+    first QuickBooks account of the matching type. Returns the mapping or None."""
+    from .models import QuickBooksAccountMapping
+
+    existing = QuickBooksAccountMapping.objects.filter(account=account).first()
+    if existing and (not overwrite or not existing.auto_mapped):
+        return existing
+    qb_accounts = qb_accounts if qb_accounts is not None else list_quickbooks_accounts(connection)
+    wanted_name = account.name.strip().lower()
+    chosen = next((a for a in qb_accounts if (a.get("Name") or "").strip().lower() == wanted_name), None)
+    if chosen is None:
+        qb_type = _qb_type_for(account)
+        chosen = next((a for a in qb_accounts if a.get("AccountType") == qb_type), None)
+    if chosen is None:
+        return existing
+    mapping, _ = QuickBooksAccountMapping.objects.update_or_create(
+        account=account,
+        defaults={
+            "company": account.company,
+            "quickbooks_account_id": str(chosen["Id"]),
+            "quickbooks_account_name": chosen.get("FullyQualifiedName") or chosen.get("Name", ""),
+            "quickbooks_account_type": chosen.get("AccountType", ""),
+            "auto_mapped": True,
+        },
+    )
+    return mapping
+
+
+def _quickbooks_account_ref(connection, account, cache):
+    from .models import QuickBooksAccountMapping
+
+    mapping = QuickBooksAccountMapping.objects.filter(account=account).first()
+    if mapping is None:
+        if "accounts" not in cache:
+            cache["accounts"] = list_quickbooks_accounts(connection)
+        mapping = auto_map_account(connection, account, cache["accounts"])
+    if mapping is None:
+        raise QuickBooksAPIError(
+            f"ERP account {account.code} {account.name} is not mapped to a QuickBooks account. "
+            "Map it in Accounting > QuickBooks > Account mapping, then retry."
+        )
+    return {"value": mapping.quickbooks_account_id}
+
+
+def _bank_account_ref(connection):
+    """The QuickBooks bank account payments are made from: the account mapped
+    to ERP 1010 (Operating Bank) when set, else the first QuickBooks Bank account."""
+    from accounting.models import Account
+    from .models import QuickBooksAccountMapping
+
+    mapping = QuickBooksAccountMapping.objects.filter(
+        company=connection.company, account__in=Account.objects.filter(company=connection.company, code="1010")
+    ).first()
+    if mapping:
+        return {"value": mapping.quickbooks_account_id}
+    bank = _find_account(connection, "Bank")
+    if not bank:
+        raise QuickBooksAPIError("No QuickBooks Bank account found to pay the bill from.")
+    return {"value": bank}
+
+
+def push_bill_payment(connection, vendor_payment):
+    """Mirror an ERP vendor payment as a QuickBooks BillPayment linked to its bill."""
+    vendor_payment.refresh_from_db(fields=["quickbooks_id", "quickbooks_sync_token"])
+    bill = vendor_payment.bill
+    if bill is None:
+        raise ValueError("Vendor payment is not linked to a bill, so it cannot be sent as a BillPayment.")
+    if not bill.quickbooks_id:
+        push_bill(connection, bill)
+    body = {
+        "VendorRef": _ensure_vendor_ref(connection, vendor_payment.vendor),
+        "PayType": "Check",
+        "CheckPayment": {"BankAccountRef": _bank_account_ref(connection)},
+        "TotalAmt": float(vendor_payment.amount),
+        "TxnDate": vendor_payment.payment_date.isoformat(),
+        "Line": [{
+            "Amount": float(vendor_payment.amount),
+            "LinkedTxn": [{"TxnId": bill.quickbooks_id, "TxnType": "Bill"}],
+        }],
+    }
+    if vendor_payment.reference:
+        body["PrivateNote"] = f"ERP payment ref {vendor_payment.reference}"[:4000]
+    result = _write_entity(
+        connection, "billpayment", body, vendor_payment.quickbooks_id, vendor_payment.quickbooks_sync_token
+    )
+    _store_result(connection, "bill_payment", vendor_payment, result)
+    return result
+
+
+def push_journal_entry(connection, entry):
+    """Mirror an ERP-only journal entry (manual, expenses, cash & bank, tax
+    adjustments, or the reversal of one) as a QuickBooks JournalEntry."""
+    entry.refresh_from_db()
+    if not journal_entry_goes_to_quickbooks(entry):
+        raise ValueError(
+            f"Journal entry {entry.entry_number} ({entry.source_module}) is booked by QuickBooks from its own "
+            "documents or inventory and is not sent as a journal entry."
+        )
+    cache = {}
+    lines = []
+    for line in entry.lines.select_related("account").order_by("line_number"):
+        amount = line.debit if line.debit > 0 else line.credit
+        if amount <= 0:
+            continue
+        lines.append({
+            "Description": (line.description or entry.description or "")[:4000],
+            "Amount": float(amount),
+            "DetailType": "JournalEntryLineDetail",
+            "JournalEntryLineDetail": {
+                "PostingType": "Debit" if line.debit > 0 else "Credit",
+                "AccountRef": _quickbooks_account_ref(connection, line.account, cache),
+            },
+        })
+    body = {
+        "TxnDate": entry.transaction_date.isoformat(),
+        "DocNumber": (entry.entry_number or "")[:21],
+        "PrivateNote": f"ERP {entry.entry_number}: {entry.description}"[:4000],
+        "Line": lines,
+    }
+    result = _write_entity(connection, "journalentry", body, entry.quickbooks_id, entry.quickbooks_sync_token)
+    _store_result(connection, "journal_entry", entry, result)
+    return result
+
+
+def delete_in_quickbooks(connection, resource, qb_id, sync_token=""):
+    """Delete a QuickBooks transaction (used when an ERP payment is undone)."""
+    path = f"/v3/company/{connection.realm_id}/{resource}"
+    body = {"Id": qb_id, "SyncToken": sync_token or "0"}
+    try:
+        quickbooks_post(connection, path, body, query={"operation": "delete"})
+    except QuickBooksAPIError as exc:
+        if "Stale Object" not in str(exc):
+            raise
+        fresh = quickbooks_get(connection, f"{path}/{qb_id}", {"minorversion": "75"}).get(_RESPONSE_KEYS[resource], {})
+        body["SyncToken"] = fresh.get("SyncToken", "0")
+        quickbooks_post(connection, path, body, query={"operation": "delete"})
+
+
+def safe_delete(connection, entity_type, resource, qb_id, sync_token="", local_id=None):
+    try:
+        delete_in_quickbooks(connection, resource, qb_id, sync_token)
+        QuickBooksEntityLink.objects.filter(
+            company=connection.company, entity_type=entity_type, quickbooks_id=qb_id
+        ).delete()
+        return True
+    except Exception as exc:
+        QuickBooksSyncError.objects.create(
+            company=connection.company,
+            entity_type=entity_type,
+            quickbooks_id=qb_id,
+            message=f"Could not delete in QuickBooks after the ERP record was removed: {exc}"[:5000],
+            payload={"local_id": local_id, "operation": "delete", "resource": resource},
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Dispatch + bulk push
 # ---------------------------------------------------------------------------
 
@@ -465,6 +694,8 @@ PUSH_HANDLERS = {
     "invoice": push_invoice,
     "bill": push_bill,
     "payment": push_payment,
+    "bill_payment": push_bill_payment,
+    "journal_entry": push_journal_entry,
 }
 
 
@@ -500,8 +731,10 @@ def push_all(connection):
     path focused on unlinked records makes the Settings button finish quickly
     and avoids long-running HTTP requests that rewrite every QuickBooks row.
     """
+    from django.db.models import Q
+    from accounting.models import JournalEntry
     from inventory.models import Item
-    from procurement.models import Bill, PurchaseOrder, Vendor
+    from procurement.models import Bill, PurchaseOrder, Vendor, VendorPayment
     from sales.models import Customer, CustomerPayment, Invoice, SalesOrder
 
     company = connection.company
@@ -538,6 +771,20 @@ def push_all(connection):
         ("invoice", Invoice.objects.filter(company=company, quickbooks_id="").exclude(status="cancelled")),
         ("bill", Bill.objects.filter(company=company, quickbooks_id="").exclude(status="cancelled")),
         ("payment", CustomerPayment.objects.filter(company=company, quickbooks_id="")),
+        (
+            "bill_payment",
+            VendorPayment.objects.filter(company=company, quickbooks_id="", bill__isnull=False)
+            .exclude(bill__status="cancelled"),
+        ),
+        (
+            "journal_entry",
+            JournalEntry.objects.filter(company=company, quickbooks_id="", status__in=["posted", "reversed"])
+            .filter(
+                Q(source_module__in=QB_JOURNAL_SOURCES)
+                | Q(source_module="reversal", reversal_of__source_module__in=QB_JOURNAL_SOURCES)
+            )
+            .order_by("id"),
+        ),
     ]
     created = updated = seen = 0
     failed = False

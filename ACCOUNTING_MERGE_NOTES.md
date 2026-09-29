@@ -222,3 +222,27 @@ None of the new modules post automatically; each one posts only when a user clic
   - Dr 2010 Accounts Payable / Cr 1010 Bank is posted.
   - If the ledger refuses the posting (closed period, no chart of accounts), nothing is saved.
 - **Tests:** `procurement/test_po_payment.py` (6). These cover: status per order, full and partial payment, overpayment refused, store users can see but not pay, no bill means no payment, and the rollback when the period is closed.
+
+## Follow-up: QuickBooks as the main books
+
+QuickBooks is the company's main set of books, and the ERP keeps local books. Every ERP accounting record now reaches QuickBooks **exactly once**:
+
+| ERP activity | Reaches QuickBooks as |
+|---|---|
+| Invoices, bills, customer payments (existing) | The QuickBooks document; QuickBooks books it itself |
+| **Vendor bill payments** (new) | A `BillPayment` linked to the bill, paid from the bank account mapped to 1010 (or the first QuickBooks bank account) |
+| **Customer payments from every screen** (new) | A `Payment`, sent on creation through a `CustomerPayment` signal. This covers Accounts Receivable and Payments & Allocations allocations, not only Sales. |
+| **Undone payments** (new) | The QuickBooks payment is deleted when the ERP payment row is deleted (for example when an allocation is undone) |
+| **Manual journals, expenses, cash & bank, tax adjustments, and reversals of these** (new) | A `JournalEntry`, sent when posted, using the account mapping |
+| Goods receipts, cost of goods sold, production, inventory valuation, year-end closing | **Not sent.** QuickBooks derives these from its Inventory items, the mirrored stock quantities, and its own year-end close. Sending them would double-count. |
+
+**Details:**
+- **Account mapping:** new model `QuickBooksAccountMapping`. Auto-mapping matches by name first, then by account type. If an account can't be mapped, the entry is not sent and the error says which account to map.
+- **Payments:** the Payments-module `Payment` record itself is **not** sent. Its per-invoice or per-bill allocations already create `CustomerPayment`/`VendorPayment` rows, and those are what gets sent. Sending both would record the money twice. Unallocated advances reach QuickBooks once they're allocated.
+- **Storing QuickBooks IDs:** `_store_result` now writes IDs with an `UPDATE` instead of `save()`. A posted journal entry in a since-closed period would otherwise fail validation on save.
+- **Push all:** also sends bill payments and ERP-only journal entries.
+- **New endpoints:** `/api/quickbooks/overview/`, `accounts/`, `account-mappings/` (GET/POST), `account-mappings/auto/` and `retry-errors/`. The OAuth return path now allows `/accounting`.
+- **Removed:** the duplicate explicit payment push in `sales/views.py`; the signal handles it now.
+- **Migrations:** `accounting.0013`, `procurement.0012` and `quickbooks.0003`. They add QuickBooks ID columns and the mapping table, all additive.
+- **Tests:** `quickbooks/test_main_books.py` (9). All 36 QuickBooks tests pass.
+- **Date fix found while testing:** Sales (payment date, invoice due date), the Procurement bill date and `billing.py` used the machine's local date (`date.today()`), while reports and the rest of the app use Django's date (`timezone.localdate()`, UTC). On an IST machine between 00:00 and 05:30, a payment was dated "tomorrow", so the Balance Sheet left it out. All four places now use `timezone.localdate()`, and the tests written this session do the same. On Railway both clocks are UTC, so production wasn't affected.

@@ -257,6 +257,10 @@ class VendorPayment(models.Model):
     payment_date = models.DateField(default=timezone.localdate)
     method = models.CharField(max_length=20, choices=METHOD_CHOICES, default="bank_transfer")
     reference = models.CharField(max_length=100, blank=True)
+    # Mirrored to QuickBooks as a BillPayment against the bill.
+    quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True, default="")
+    quickbooks_sync_token = models.CharField(max_length=100, blank=True, default="")
+    quickbooks_last_synced_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

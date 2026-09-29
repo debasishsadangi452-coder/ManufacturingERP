@@ -28,7 +28,7 @@ from .services import (
 
 
 # Paths on the frontend that the OAuth callback may send the user back to.
-ALLOWED_RETURN_PATHS = {"/settings", "/onboarding"}
+ALLOWED_RETURN_PATHS = {"/settings", "/onboarding", "/accounting"}
 
 
 def _frontend_redirect(return_path=""):
@@ -168,8 +168,9 @@ def sync(request):
 
 def _pushable_queryset(entity_type, company):
     """Company-scoped queryset for each entity type that can be pushed."""
+    from accounting.models import JournalEntry
     from inventory.models import Item
-    from procurement.models import Bill, PurchaseOrder, Vendor
+    from procurement.models import Bill, PurchaseOrder, Vendor, VendorPayment
     from sales.models import Customer, CustomerPayment, Invoice, SalesOrder
 
     querysets = {
@@ -182,6 +183,8 @@ def _pushable_queryset(entity_type, company):
         "invoice": Invoice.objects.filter(company=company),
         "bill": Bill.objects.filter(company=company),
         "payment": CustomerPayment.objects.filter(company=company),
+        "bill_payment": VendorPayment.objects.filter(company=company),
+        "journal_entry": JournalEntry.objects.filter(company=company),
     }
     return querysets.get(entity_type)
 
@@ -228,3 +231,195 @@ def push_all_view(request):
         return Response({"detail": "QuickBooks is not connected."}, status=status.HTTP_400_BAD_REQUEST)
     run = push_all(connection)
     return Response(QuickBooksSyncRunSerializer(run).data)
+
+
+# ---------------------------------------------------------------------------
+# Accounting > QuickBooks tab
+# ---------------------------------------------------------------------------
+
+def _active_connection(request):
+    return QuickBooksConnection.objects.filter(company=request.user.company, is_active=True).first()
+
+
+def _sync_counts(company):
+    """Per record type: how many exist in the ERP and how many reached QuickBooks."""
+    from django.db.models import Q
+    from accounting.models import JournalEntry
+    from inventory.models import Item
+    from procurement.models import Bill, PurchaseOrder, Vendor, VendorPayment
+    from sales.models import Customer, CustomerPayment, Invoice, SalesOrder
+    from .push import QB_JOURNAL_SOURCES
+
+    journal_to_qb = Q(source_module__in=QB_JOURNAL_SOURCES) | Q(
+        source_module="reversal", reversal_of__source_module__in=QB_JOURNAL_SOURCES
+    )
+    posted_journals = JournalEntry.objects.filter(company=company, status__in=["posted", "reversed"])
+    groups = [
+        ("customer", "Customers", Customer.objects.filter(company=company)),
+        ("vendor", "Vendors", Vendor.objects.filter(company=company)),
+        ("item", "Items", Item.objects.filter(company=company)),
+        ("sales_order", "Sales orders (as Estimates)",
+         SalesOrder.objects.filter(customer__company=company).exclude(status__in=["draft", "cancelled"])),
+        ("purchase_order", "Purchase orders",
+         PurchaseOrder.objects.filter(vendor__company=company, items__isnull=False)
+         .exclude(status__in=["draft", "cancelled"]).distinct()),
+        ("invoice", "Invoices", Invoice.objects.filter(company=company).exclude(status="cancelled")),
+        ("bill", "Vendor bills", Bill.objects.filter(company=company).exclude(status="cancelled")),
+        ("payment", "Customer payments", CustomerPayment.objects.filter(company=company)),
+        ("bill_payment", "Bill payments", VendorPayment.objects.filter(company=company, bill__isnull=False)),
+        ("journal_entry", "Journal entries (ERP-only)", posted_journals.filter(journal_to_qb)),
+    ]
+    rows = []
+    for key, label, queryset in groups:
+        total = queryset.count()
+        sent = queryset.exclude(quickbooks_id="").count()
+        rows.append({"entity_type": key, "label": label, "total": total, "sent": sent, "pending": total - sent})
+    local_only = posted_journals.exclude(journal_to_qb).count()
+    return rows, local_only
+
+
+@api_view(["GET"])
+@permission_classes([IsFinanceOrAdmin])
+def overview(request):
+    """Everything the Accounting > QuickBooks tab shows, in one call."""
+    from .models import QuickBooksSyncError
+    from .serializers import QuickBooksSyncErrorSerializer
+
+    company = request.user.company
+    connection = _active_connection(request)
+    rows, local_only = _sync_counts(company)
+    runs = QuickBooksSyncRun.objects.filter(company=company).order_by("-started_at")[:10]
+    errors = QuickBooksSyncError.objects.filter(company=company).order_by("-created_at")[:30]
+    return Response({
+        "configured": bool(settings.QUICKBOOKS_CONFIG["CLIENT_ID"] and settings.QUICKBOOKS_CONFIG["CLIENT_SECRET"]),
+        "environment": settings.QUICKBOOKS_CONFIG["ENVIRONMENT"],
+        "connected": bool(connection),
+        "connection": QuickBooksConnectionSerializer(connection).data if connection else None,
+        "entities": rows,
+        "local_only_journal_entries": local_only,
+        "recent_sync_runs": QuickBooksSyncRunSerializer(runs, many=True).data,
+        "errors": QuickBooksSyncErrorSerializer(errors, many=True).data,
+        "error_count": QuickBooksSyncError.objects.filter(company=company).count(),
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsFinanceOrAdmin])
+def quickbooks_accounts(request):
+    """QuickBooks chart of accounts, for the account-mapping dropdowns."""
+    from .push import list_quickbooks_accounts
+
+    connection = _active_connection(request)
+    if not connection:
+        return Response({"detail": "QuickBooks is not connected."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        accounts = list_quickbooks_accounts(connection)
+    except QuickBooksAPIError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+    return Response([
+        {"id": str(a.get("Id")), "name": a.get("FullyQualifiedName") or a.get("Name", ""), "type": a.get("AccountType", "")}
+        for a in sorted(accounts, key=lambda a: (a.get("AccountType", ""), a.get("Name", "")))
+    ])
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsFinanceOrAdmin])
+def account_mappings(request):
+    """GET: every ERP account with its QuickBooks mapping.
+    POST {"account", "quickbooks_account_id", "quickbooks_account_name", "quickbooks_account_type"}
+    sets a mapping; an empty quickbooks_account_id clears it."""
+    from accounting.models import Account
+    from .models import QuickBooksAccountMapping
+
+    company = request.user.company
+    if request.method == "POST":
+        account = Account.objects.filter(company=company, pk=request.data.get("account")).first()
+        if not account:
+            return Response({"detail": "Account not found."}, status=status.HTTP_404_NOT_FOUND)
+        qb_id = str(request.data.get("quickbooks_account_id") or "").strip()
+        if not qb_id:
+            QuickBooksAccountMapping.objects.filter(account=account).delete()
+        else:
+            QuickBooksAccountMapping.objects.update_or_create(
+                account=account,
+                defaults={
+                    "company": company,
+                    "quickbooks_account_id": qb_id,
+                    "quickbooks_account_name": request.data.get("quickbooks_account_name", ""),
+                    "quickbooks_account_type": request.data.get("quickbooks_account_type", ""),
+                    "auto_mapped": False,
+                },
+            )
+    mappings = {m.account_id: m for m in QuickBooksAccountMapping.objects.filter(company=company)}
+    rows = []
+    for account in Account.objects.filter(company=company).select_related("account_type").order_by("code"):
+        m = mappings.get(account.id)
+        rows.append({
+            "account": account.id,
+            "code": account.code,
+            "name": account.name,
+            "type": account.account_type.name if account.account_type_id else "",
+            "is_header": account.is_header,
+            "quickbooks_account_id": m.quickbooks_account_id if m else "",
+            "quickbooks_account_name": m.quickbooks_account_name if m else "",
+            "auto_mapped": m.auto_mapped if m else False,
+        })
+    return Response(rows)
+
+
+@api_view(["POST"])
+@permission_classes([IsFinanceOrAdmin])
+def auto_map_accounts(request):
+    """Map every unmapped ERP ledger (leaf) account automatically."""
+    from accounting.models import Account
+    from .push import auto_map_account, list_quickbooks_accounts
+
+    connection = _active_connection(request)
+    if not connection:
+        return Response({"detail": "QuickBooks is not connected."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        qb_accounts = list_quickbooks_accounts(connection)
+    except QuickBooksAPIError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+    mapped = unmapped = 0
+    for account in Account.objects.filter(company=request.user.company, is_active=True).select_related("account_type"):
+        if account.is_header:
+            continue
+        if auto_map_account(connection, account, qb_accounts):
+            mapped += 1
+        else:
+            unmapped += 1
+    return Response({"mapped": mapped, "unmapped": unmapped})
+
+
+@api_view(["POST"])
+@permission_classes([IsFinanceOrAdmin])
+def retry_errors(request):
+    """Retry every failed push (and failed deletion) recorded for the company."""
+    from .models import QuickBooksSyncError
+    from .push import safe_delete, safe_push
+
+    connection = _active_connection(request)
+    if not connection:
+        return Response({"detail": "QuickBooks is not connected."}, status=status.HTTP_400_BAD_REQUEST)
+    company = request.user.company
+    fixed = failed = skipped = 0
+    for error in list(QuickBooksSyncError.objects.filter(company=company).order_by("created_at")):
+        payload = error.payload or {}
+        if payload.get("operation") == "delete":
+            error.delete()
+            ok = safe_delete(connection, error.entity_type, payload.get("resource", ""), error.quickbooks_id,
+                             local_id=payload.get("local_id"))
+        else:
+            queryset = _pushable_queryset(error.entity_type, company)
+            obj = queryset.filter(pk=payload.get("local_id")).first() if queryset is not None else None
+            error.delete()
+            if obj is None:
+                skipped += 1
+                continue
+            ok = safe_push(connection, error.entity_type, obj)
+        if ok:
+            fixed += 1
+        else:
+            failed += 1
+    return Response({"fixed": fixed, "failed": failed, "skipped": skipped})

@@ -79,6 +79,8 @@ class QuickBooksEntityLink(models.Model):
         ("payment", "Payment"),
         ("sales_order", "Sales Order"),
         ("purchase_order", "Purchase Order"),
+        ("bill_payment", "Bill Payment"),
+        ("journal_entry", "Journal Entry"),
         ("report", "Report"),
     ]
 
@@ -106,3 +108,24 @@ class QuickBooksSyncError(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+
+class QuickBooksAccountMapping(models.Model):
+    """Which QuickBooks account an ERP ledger account posts to when ERP journal
+    entries are mirrored into QuickBooks (the company's main books)."""
+
+    company = models.ForeignKey("accounts.Company", on_delete=models.CASCADE)
+    account = models.OneToOneField(
+        "accounting.Account", on_delete=models.CASCADE, related_name="quickbooks_mapping"
+    )
+    quickbooks_account_id = models.CharField(max_length=100)
+    quickbooks_account_name = models.CharField(max_length=255, blank=True)
+    quickbooks_account_type = models.CharField(max_length=100, blank=True)
+    auto_mapped = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["account__code"]
+
+    def __str__(self):
+        return f"{self.account.code} -> QB {self.quickbooks_account_name or self.quickbooks_account_id}"

@@ -76,3 +76,59 @@ def _purchase_order_saved(sender, instance, **kwargs):
 @receiver(post_save, sender=Stock, dispatch_uid="qb_push_stock")
 def _stock_saved(sender, instance, **kwargs):
     _queue_push("item_quantity", instance.item, instance.item.company)
+
+
+# ---------------------------------------------------------------------------
+# Main books: payments and ERP-only journal entries (see push.py)
+# ---------------------------------------------------------------------------
+# Every path that records money against an invoice or bill creates one of
+# these per-document payment rows (Sales, Accounts Receivable/Payable, pay from
+# Procurement, Payments & Allocations), so hooking the rows covers them all.
+
+from django.db.models.signals import pre_delete  # noqa: E402
+
+from accounting.models import JournalEntry  # noqa: E402
+from procurement.models import VendorPayment  # noqa: E402
+from sales.models import CustomerPayment  # noqa: E402
+
+from .push import journal_entry_goes_to_quickbooks, safe_delete  # noqa: E402
+
+
+@receiver(post_save, sender=CustomerPayment, dispatch_uid="qb_push_customer_payment")
+def _customer_payment_saved(sender, instance, created, **kwargs):
+    if created:
+        _queue_push("payment", instance, instance.company)
+
+
+@receiver(post_save, sender=VendorPayment, dispatch_uid="qb_push_vendor_payment")
+def _vendor_payment_saved(sender, instance, created, **kwargs):
+    if created and instance.bill_id:
+        _queue_push("bill_payment", instance, instance.company)
+
+
+@receiver(post_save, sender=JournalEntry, dispatch_uid="qb_push_journal_entry")
+def _journal_entry_saved(sender, instance, **kwargs):
+    if instance.status == "posted" and not instance.quickbooks_id and journal_entry_goes_to_quickbooks(instance):
+        _queue_push("journal_entry", instance, instance.company)
+
+
+def _queue_delete(entity_type, resource, instance):
+    """An ERP payment that reached QuickBooks was removed (e.g. an allocation
+    was undone): remove it from QuickBooks too, once the deletion commits."""
+    if auto_push_suppressed() or not instance.quickbooks_id:
+        return
+    connection = get_active_connection(instance.company)
+    if not connection:
+        return
+    qb_id, token, local_id = instance.quickbooks_id, instance.quickbooks_sync_token, instance.pk
+    transaction.on_commit(lambda: safe_delete(connection, entity_type, resource, qb_id, token, local_id))
+
+
+@receiver(pre_delete, sender=CustomerPayment, dispatch_uid="qb_delete_customer_payment")
+def _customer_payment_deleted(sender, instance, **kwargs):
+    _queue_delete("payment", "payment", instance)
+
+
+@receiver(pre_delete, sender=VendorPayment, dispatch_uid="qb_delete_vendor_payment")
+def _vendor_payment_deleted(sender, instance, **kwargs):
+    _queue_delete("bill_payment", "billpayment", instance)

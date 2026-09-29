@@ -772,6 +772,11 @@ class JournalEntry(models.Model):
         default="draft",
         db_index=True
     )
+    # Entries QuickBooks cannot derive from its own documents are mirrored
+    # there as JournalEntry records (see quickbooks/push.py).
+    quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True, default="")
+    quickbooks_sync_token = models.CharField(max_length=100, blank=True, default="")
+    quickbooks_last_synced_at = models.DateTimeField(null=True, blank=True)
     posted_at = models.DateTimeField(null=True, blank=True)
     posted_by = models.ForeignKey(
         "accounts.User",
