@@ -15,6 +15,7 @@ from .inventory_accounting import determine_movement_accounting_requirement, pos
 from .models import JournalEntry
 from .purchase_accounting import post_purchase_to_accounting
 from .test_auto_posting import AutoPostingTestBase, lines_of
+from django.utils import timezone
 
 
 class SubledgerReconciliationTests(AutoPostingTestBase):
@@ -40,7 +41,7 @@ class SubledgerReconciliationTests(AutoPostingTestBase):
         po = self.receive_po()
         bill = Bill.objects.create(  # created directly, so only the manual path posts it
             company=self.company, purchase_order=po, vendor=self.vendor,
-            bill_date=date.today(), total_amount=po.total_amount,
+            bill_date=timezone.localdate(), total_amount=po.total_amount,
         )
         entry = post_purchase_to_accounting(bill.id, self.admin, self.company)
         self.assertEqual(lines_of(entry), {
@@ -74,7 +75,7 @@ class SubledgerReconciliationTests(AutoPostingTestBase):
         movement = StockMovement.objects.get(reference=f"GRN PO#{po.id}")
         other = Company.objects.create(name="Other Co", slug="otherco")
         JournalEntry.objects.create(
-            company=other, transaction_date=date.today(), reference="X", description="other tenant",
+            company=other, transaction_date=timezone.localdate(), reference="X", description="other tenant",
             source_module="inventory", source_id=movement.id, status="draft",
         )
         data = StockMovementSerializer(movement).data

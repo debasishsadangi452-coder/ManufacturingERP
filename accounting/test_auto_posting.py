@@ -14,6 +14,7 @@ from sales.models import Customer, SalesOrder, SalesOrderItem
 from .auto_posting import execute_auto_post
 from .models import AccountingSettings, AutoPostingLog, FiscalYear, JournalEntry
 from .seeds import seed_standard_chart_of_accounts, seed_standard_fiscal_year
+from django.utils import timezone
 
 
 def lines_of(entry):
@@ -33,7 +34,7 @@ class AutoPostingTestBase(APITestCase):
             company=self.company, password="pass",
         )
         seed_standard_chart_of_accounts(self.company)
-        seed_standard_fiscal_year(self.company, date.today().year)
+        seed_standard_fiscal_year(self.company, timezone.localdate().year)
 
         self.warehouse = Warehouse.objects.create(company=self.company, name="Plant", location="HQ")
         self.sugar = Item.objects.create(
@@ -176,7 +177,7 @@ class SafetyTests(AutoPostingTestBase):
         self.assertEqual(log.status, "failed")
         self.assertIn("period", log.message.lower())
 
-        seed_standard_fiscal_year(self.company, date.today().year)
+        seed_standard_fiscal_year(self.company, timezone.localdate().year)
         res = self.client.post(f"/api/accounting/auto-posting/{log.id}/retry/")
         self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
         self.assertEqual(res.data["status"], "posted")

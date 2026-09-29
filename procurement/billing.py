@@ -8,7 +8,9 @@ on receipt" on — raises the vendor bill from the PO, which is auto-posted too
 """
 import logging
 import re
-from datetime import date, timedelta
+from datetime import timedelta
+
+from django.utils import timezone
 
 from core.utils import log_activity
 
@@ -36,7 +38,7 @@ def existing_bill(po):
 def create_bill_from_po(po, bill_date=None, due_date=None, bill_number=""):
     """Create a vendor bill copying the purchase order's lines and total.
     The due date defaults from the vendor's payment terms."""
-    bill_date = bill_date or date.today()
+    bill_date = bill_date or timezone.localdate()
     if due_date is None:
         days = payment_terms_days(po.vendor.payment_terms)
         due_date = bill_date + timedelta(days=days) if days is not None else None

@@ -6,6 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from django.db.models import Sum
+from django.utils import timezone
 from accounts.permission import IsSales, IsAdmin, IsStore, IsFinance, IsProduction, IsQuality
 
 from .models import Customer, CustomerPayment, Invoice, InvoiceLine, SalesOrder, SalesOrderItem, Shipment
@@ -591,7 +592,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             except ValueError:
                 return Response({"error": "due_date must be YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
         if due_date is None:
-            due_date = date.today() + timedelta(days=30)
+            due_date = timezone.localdate() + timedelta(days=30)
 
         invoice = Invoice.objects.create(
             company=order.customer.company,
@@ -657,7 +658,7 @@ class InvoiceViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        payment_date = date.today()
+        payment_date = timezone.localdate()
         if request.data.get('payment_date'):
             try:
                 payment_date = date.fromisoformat(str(request.data['payment_date']))
@@ -674,11 +675,7 @@ class InvoiceViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
             reference=request.data.get('reference', ''),
         )
         invoice.apply_payment(amount)
-
-        from quickbooks.push import get_active_connection, safe_push
-        connection = get_active_connection(invoice.company)
-        if connection:
-            safe_push(connection, "payment", payment)
+        # Mirrored to QuickBooks by the CustomerPayment post_save signal.
 
         from accounting.auto_posting import queue_auto_post
         queue_auto_post("customer_payment", invoice.company, payment.id, request.user)

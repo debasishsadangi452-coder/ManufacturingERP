@@ -8,6 +8,7 @@ from accounts.models import Company, User
 
 from .models import AccountingPeriod, AccountingSettings, FiscalYear
 from .seeds import ensure_account_types, start_next_fiscal_year
+from django.utils import timezone
 
 URL = "/api/accounting/fiscal-years/"
 
@@ -21,7 +22,7 @@ class FiscalYearLifecycleTests(APITestCase):
         )
         ensure_account_types()
         self.client.force_authenticate(user=self.user)
-        self.this_year = date.today().year
+        self.this_year = timezone.localdate().year
 
     def test_current_year_is_opened_by_default(self):
         res = self.client.get(URL)

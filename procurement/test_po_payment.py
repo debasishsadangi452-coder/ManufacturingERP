@@ -8,6 +8,7 @@ from accounting.models import AccountingPeriod, JournalEntry
 from accounting.test_auto_posting import AutoPostingTestBase, lines_of
 from accounts.models import User
 from procurement.models import Bill, PurchaseOrder, PurchaseOrderItem, VendorPayment
+from django.utils import timezone
 
 PO_URL = "/api/procurement/purchase-orders/"
 
@@ -71,7 +72,7 @@ class PurchaseOrderPaymentTests(AutoPostingTestBase):
     def test_payment_refused_by_the_ledger_is_rolled_back(self):
         po = self.received_po()
         AccountingPeriod.objects.filter(
-            company=self.company, start_date__lte=date.today(), end_date__gte=date.today()
+            company=self.company, start_date__lte=timezone.localdate(), end_date__gte=timezone.localdate()
         ).update(status="closed")
         res = self.client.post(f"{PO_URL}{po.id}/pay_bill/", {}, format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)

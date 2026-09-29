@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
+from django.utils import timezone
 
 from .models import (
     Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt,
@@ -444,7 +445,7 @@ class BillViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
             return date.fromisoformat(str(raw))
 
         try:
-            bill_date = parse_date("bill_date", date.today())
+            bill_date = parse_date("bill_date", timezone.localdate())
             due_date = parse_date("due_date")
         except ValueError:
             return Response({"error": "Dates must be YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)

@@ -10,6 +10,7 @@ from accounts.models import Company, User
 from inventory.models import Item, Warehouse
 from procurement.billing import payment_terms_days
 from procurement.models import Bill, PurchaseOrder, PurchaseOrderItem, Vendor
+from django.utils import timezone
 
 
 class AutoBillOnReceiptTests(AutoPostingTestBase):
@@ -36,7 +37,7 @@ class AutoBillOnReceiptTests(AutoPostingTestBase):
         bill = Bill.objects.get(purchase_order=po)
         self.assertEqual(bill.total_amount, Decimal("200.00"))
         self.assertEqual(bill.lines.count(), 1)
-        self.assertEqual(bill.due_date, date.today() + timedelta(days=30))
+        self.assertEqual(bill.due_date, timezone.localdate() + timedelta(days=30))
         self.assertEqual(lines_of(self.entry("procurement.receipt")), {
             "1210": (Decimal("200.00"), Decimal("0.00")),
             "2050": (Decimal("0.00"), Decimal("200.00")),
@@ -55,7 +56,7 @@ class AutoBillOnReceiptTests(AutoPostingTestBase):
     def test_an_existing_bill_is_not_duplicated(self):
         po = self.make_po()
         Bill.objects.create(company=self.company, purchase_order=po, vendor=self.vendor,
-                            bill_date=date.today(), total_amount=Decimal("200.00"))
+                            bill_date=timezone.localdate(), total_amount=Decimal("200.00"))
         self.receive(po)
         self.assertEqual(Bill.objects.filter(purchase_order=po).count(), 1)
 
