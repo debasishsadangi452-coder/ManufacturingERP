@@ -33,6 +33,8 @@ from .views import (
     AccountingDashboardViewSet,
     DatabaseArchitectureViewSet,
     APIArchitectureViewSet,
+    UIArchitectureViewSet,
+    RolesPermissionsViewSet,
 )
 
 router = DefaultRouter()
@@ -68,6 +70,8 @@ router.register(r'reports', FinancialReportsViewSet, basename='accounting-report
 router.register(r'dashboard', AccountingDashboardViewSet, basename='accounting-dashboard')
 router.register(r'database-architecture', DatabaseArchitectureViewSet, basename='accounting-database-architecture')
 router.register(r'api-architecture', APIArchitectureViewSet, basename='accounting-api-architecture')
+router.register(r'ui-architecture', UIArchitectureViewSet, basename='accounting-ui-architecture')
+router.register(r'roles-permissions', RolesPermissionsViewSet, basename='accounting-roles-permissions')
 
 
 

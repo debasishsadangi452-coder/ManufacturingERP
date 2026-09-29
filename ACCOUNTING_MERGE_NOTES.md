@@ -176,3 +176,21 @@ None of the new modules post automatically; each one posts only when a user clic
 | Stock movement list (branch) | The accounting-status lookup was **not scoped by company**, so one company could see another company's journal number for a matching ID. | Scoped to the movement's company. |
 
 **Tests:** `accounting/test_subledger_reconciliation.py` (4 tests, new). `test_auto_posting.py` is updated for the Manufacturing module delegation.
+
+---
+
+# Third merge: Accounting Blueprints #26–#27 (2026-09-29)
+
+**Rollback point:** local tag `pre-accounting-merge-3`.
+
+- #22–#25 (Financial Reports and three more) were already merged into `main` on 2026-09-28, outside this session. Only #26 (UI architecture) and #27 (roles and permissions) were new.
+- **Backend:**
+  - Adds `accounting/ui_architecture.py`, `roles_permissions.py` and `permissions.py`, plus two read-only endpoints for Finance and Admin: `/api/accounting/ui-architecture/` and `/api/accounting/roles-permissions/`.
+  - The new permission classes are **not** applied to any existing endpoint, so nobody's access changes.
+  - There are no migrations.
+  - The one conflict was in `views.py`, where both sides appended a section at the end. Both are kept.
+- **Frontend:**
+  - Adds `RolesPermissionsTab` and `UIArchitectureTab`. It merged cleanly.
+  - Fixed a bug from the #22 merge: `FinancialReportsTab` called `getAccountingPeriods(fyId)` with a bare ID, so the period picker loaded every period rather than the chosen year's. It now passes `{ fiscal_year: fyId }`.
+  - The frontend is back to the 12 old type errors, and `npm run build` passes.
+- **`seo/crawlable-landing-pages` was not merged, on purpose.** Its only commit (`6e2746a`) is identical (same patch-id) to `d67397e`, which is already on `main`, and `main` has four follow-up commits improving those pages since. Merging would add nothing and would risk the old version overwriting the newer pages during conflict resolution. It is safe to delete on GitHub.
