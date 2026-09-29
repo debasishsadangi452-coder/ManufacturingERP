@@ -56,6 +56,8 @@ class AutoPostingTestBase(APITestCase):
 
 class PurchaseCycleTests(AutoPostingTestBase):
     def test_goods_receipt_then_bill_capitalises_inventory_and_clears_grni(self):
+        # Manual billing path; automatic billing on receipt is covered in procurement/test_auto_bill.py.
+        AccountingSettings.objects.filter(company=self.company).update(auto_bill_on_receipt=False)
         po = PurchaseOrder.objects.create(vendor=self.vendor, status="ordered")
         PurchaseOrderItem.objects.create(purchase_order=po, item=self.sugar, quantity=100, unit_price=Decimal("2.00"))
 

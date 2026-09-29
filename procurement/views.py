@@ -399,30 +399,11 @@ class BillViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
         except ValueError:
             return Response({"error": "Dates must be YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
 
-        bill = Bill.objects.create(
-            company=po.vendor.company,
-            purchase_order=po,
-            vendor=po.vendor,
-            bill_number=request.data.get("bill_number", ""),
-            bill_date=bill_date,
-            due_date=due_date,
-            total_amount=po.total_amount,
+        from .billing import create_bill_from_po, push_bill_to_quickbooks
+        bill = create_bill_from_po(
+            po, bill_date=bill_date, due_date=due_date, bill_number=request.data.get("bill_number", ""),
         )
-        for po_item in po.items.all():
-            BillLine.objects.create(
-                bill=bill,
-                item=po_item.item,
-                description=po_item.item.name,
-                quantity=po_item.quantity,
-                unit_price=po_item.unit_price,
-                amount=po_item.total_price,
-            )
-
-        # Mirror to QuickBooks (Level 1 sync); failures land in sync errors.
-        from quickbooks.push import get_active_connection, safe_push
-        connection = get_active_connection(po.vendor.company)
-        if connection:
-            safe_push(connection, "bill", bill)
+        push_bill_to_quickbooks(bill)
 
         from accounting.auto_posting import queue_auto_post
         queue_auto_post("vendor_bill", bill.company, bill.id, request.user)
@@ -468,8 +449,9 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         po.save()
         from finance.services import record_procurement_cost
         record_procurement_cost(po, user=self.request.user)
-        from accounting.auto_posting import queue_auto_post
-        queue_auto_post("goods_receipt", po.vendor.company, receipt.id, self.request.user)
+        # Ledger posting and (per Accounting setup) the vendor bill.
+        from .billing import on_goods_received
+        on_goods_received(po, receipt, self.request.user)
 
         # Close the loop back to production. Material was procured because a
         # production order was short of it; now that it has landed, the people

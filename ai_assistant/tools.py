@@ -463,8 +463,11 @@ def create_goods_receipt(user, po_id, warehouse_id):
         po.save()
         from finance.services import record_procurement_cost
         cost = record_procurement_cost(po, user=user)
+        from procurement.billing import on_goods_received
+        bill = on_goods_received(po, receipt, user)
         return json.dumps({
             "success": True, "receipt_id": receipt.id, "po_id": po.id,
+            "vendor_bill_id": bill.id if bill else None,
             "stock_booked_into": warehouse.name, "items_received": received,
             "finance_cost_recorded": float(po.total_amount or 0) if cost else "already recorded",
         })

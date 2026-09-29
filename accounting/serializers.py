@@ -305,6 +305,7 @@ class AccountingSettingsSerializer(serializers.ModelSerializer):
             "lock_date",
             "allow_direct_posting_to_parent_accounts",
             "auto_post_enabled",
+            "auto_bill_on_receipt",
             "inventory_accounting_enabled",
             "inventory_costing_method",
             "inventory_raw_material_account",

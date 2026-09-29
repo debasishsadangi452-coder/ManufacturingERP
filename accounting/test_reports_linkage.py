@@ -25,11 +25,10 @@ class ReportsReflectErpActivityTests(AutoPostingTestBase):
         return res
 
     def run_cycle(self):
-        # Buy 100 kg sugar at 2.00 -> receive -> vendor bill
+        # Buy 100 kg sugar at 2.00 -> receive (the vendor bill is created on receipt)
         po = PurchaseOrder.objects.create(vendor=self.vendor, status="ordered")
         PurchaseOrderItem.objects.create(purchase_order=po, item=self.sugar, quantity=100, unit_price=Decimal("2.00"))
         self.call("post", "/api/procurement/goods-receipts/", {"purchase_order": po.id, "warehouse": self.warehouse.id})
-        self.call("post", "/api/procurement/bills/from_purchase_order/", {"purchase_order": po.id})
 
         # Make 20 bottles (10 kg sugar = 20.00), sell them at 5.00, collect 40.00
         order = ProductionOrder.objects.create(recipe=self.recipe, quantity=20, warehouse=self.warehouse)

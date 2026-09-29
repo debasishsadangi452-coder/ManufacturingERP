@@ -703,12 +703,17 @@ def receive_procurement(user, po_id, warehouse_name=None):
     po.save()
     from finance.services import record_procurement_cost
     record_procurement_cost(po, user=user)
+    from procurement.billing import on_goods_received
+    bill = on_goods_received(po, receipt, user)
+    bill_note = (
+        f"Vendor bill created: {bill.bill_number or f'BILL-{bill.id}'} ({bill.total_amount:g})\n" if bill else ""
+    )
 
     return json.dumps({"template": (
         f"GOODS RECEIVED · PO-{po.id:04d}\n"
         f"Warehouse: {warehouse.name}\n"
         f"Booked into inventory:\n" + "\n".join(lines) + "\n"
-        f"Cost recorded in Finance: {po.total_amount:g}"
+        f"Cost recorded in Finance: {po.total_amount:g}\n" + bill_note
     )})
 
 

@@ -405,6 +405,10 @@ class AccountingSettings(models.Model):
         help_text="Automatically post goods receipts, vendor bills, production, shipments, "
                   "sales invoices and customer payments to the General Ledger."
     )
+    auto_bill_on_receipt = models.BooleanField(
+        default=True,
+        help_text="Create the vendor bill from the purchase order automatically when its goods are received."
+    )
     # Section #14 — Inventory Accounting Policy Configuration
     inventory_accounting_enabled = models.BooleanField(
         default=True,

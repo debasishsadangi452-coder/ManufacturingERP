@@ -198,3 +198,17 @@ None of the new modules post automatically; each one posts only when a user clic
 ## Follow-up: Base prices always settable from Sales and Procurement
 
 - `/api/sales/price-list/`: Store users, who can raise sales orders, may now **read** base selling prices. Changing them is still limited to Sales, Finance and Admin. A test covers this in `sales/test_price_list.py`.
+
+## Follow-up: Vendor bill created automatically on goods receipt
+
+- **New `procurement/billing.py`:**
+  - `create_bill_from_po` is shared with the existing `bills/from_purchase_order` API.
+  - `on_goods_received(po, receipt, user)` is the single hook every receiving path calls: the Procurement **Receive Goods** screen, the AI Procurement "receive PO" tool and the assistant's `create_goods_receipt` tool.
+  - The hook auto-posts the receipt (Dr 1210 / Cr 2050). When **`AccountingSettings.auto_bill_on_receipt`** is on (the default), it also creates the vendor bill from the PO, pushes it to QuickBooks if connected, and auto-posts it (Dr 2050 GRNI / Cr 2010 AP).
+  - The bill's due date comes from the vendor's payment terms (`net30` gives 30 days, "due on receipt" gives 0).
+  - A PO that already has a bill is not billed again.
+  - Companies with no Accounting setup keep the old behaviour, with no automatic bill.
+  - Failures never block the receipt.
+- **AI receipts:** receipts recorded through the AI tools were not auto-posted before. They are now.
+- **Migration:** `accounting.0012_auto_bill_on_receipt` (one new column with a default; no table rewrite).
+- **Tests:** `procurement/test_auto_bill.py` (5). The manual-billing test now switches auto-billing off, and the reports test relies on the automatic bill.
