@@ -305,6 +305,10 @@ AI_CONFIG = {
     "VISION_MODEL": os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
 }
 
+# Long QuickBooks jobs (send everything, import from the Accounting tab) run in a
+# background thread; set to 0 to run them inside the request instead.
+QUICKBOOKS_BACKGROUND_JOBS = os.getenv("QUICKBOOKS_BACKGROUND_JOBS", "1") != "0"
+
 QUICKBOOKS_CONFIG = {
     "CLIENT_ID": os.getenv("QUICKBOOKS_CLIENT_ID", ""),
     "CLIENT_SECRET": os.getenv("QUICKBOOKS_CLIENT_SECRET", ""),

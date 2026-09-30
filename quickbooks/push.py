@@ -724,19 +724,20 @@ def safe_push(connection, entity_type, obj, sync_run=None):
         return False
 
 
-def push_all(connection):
+def push_all(connection, run=None):
     """Backfill records that do not yet have a QuickBooks link.
 
     Auto-push handles normal updates after a record is linked. Keeping the bulk
-    path focused on unlinked records makes the Settings button finish quickly
-    and avoids long-running HTTP requests that rewrite every QuickBooks row.
+    path focused on unlinked records avoids rewriting every QuickBooks row.
+    `run` is passed when the caller already created the sync run (background
+    jobs, see background.py); otherwise one is started here.
     """
-    from django.db.models import Q
-    from accounting.models import JournalEntry
-    from inventory.models import Item
-    from procurement.models import Bill, PurchaseOrder, Vendor, VendorPayment
-    from sales.models import Customer, CustomerPayment, Invoice, SalesOrder
+    if run is None:
+        run = _start_push_all_run(connection)
+    return _push_all_into(connection, run)
 
+
+def _start_push_all_run(connection):
     company = connection.company
     QuickBooksSyncRun.objects.filter(
         company=company,
@@ -748,9 +749,19 @@ def push_all(connection):
         error_message="Bulk push was abandoned before it finished.",
         finished_at=timezone.now(),
     )
-    run = QuickBooksSyncRun.objects.create(
+    return QuickBooksSyncRun.objects.create(
         company=company, connection=connection, sync_type="push_all"
     )
+
+
+def _push_all_into(connection, run):
+    from django.db.models import Q
+    from accounting.models import JournalEntry
+    from inventory.models import Item
+    from procurement.models import Bill, PurchaseOrder, Vendor, VendorPayment
+    from sales.models import Customer, CustomerPayment, Invoice, SalesOrder
+
+    company = connection.company
     batches = [
         ("customer", Customer.objects.filter(company=company, quickbooks_id="")),
         ("vendor", Vendor.objects.filter(company=company, quickbooks_id="")),

@@ -246,3 +246,14 @@ QuickBooks is the company's main set of books, and the ERP keeps local books. Ev
 - **Migrations:** `accounting.0013`, `procurement.0012` and `quickbooks.0003`. They add QuickBooks ID columns and the mapping table, all additive.
 - **Tests:** `quickbooks/test_main_books.py` (9). All 36 QuickBooks tests pass.
 - **Date fix found while testing:** Sales (payment date, invoice due date), the Procurement bill date and `billing.py` used the machine's local date (`date.today()`), while reports and the rest of the app use Django's date (`timezone.localdate()`, UTC). On an IST machine between 00:00 and 05:30, a payment was dated "tomorrow", so the Balance Sheet left it out. All four places now use `timezone.localdate()`, and the tests written this session do the same. On Railway both clocks are UTC, so production wasn't affected.
+
+## Fix: "Send everything to QuickBooks" failing in production with a CORS error
+
+- **Cause** (confirmed by the Railway log): the start command runs gunicorn with its defaults, one worker and a **30-second** request limit. "Send everything" makes one QuickBooks call per unsent record, so with a backlog it ran past 30 seconds. Gunicorn aborted the worker (`handle_abort` → `SystemExit: 1`), the browser got a bare 502 with no CORS headers and reported it as a CORS error, and every other request queued behind it. CORS itself was fine (`CORS_ALLOW_ALL_ORIGINS = True`).
+- **Fix:** new `quickbooks/background.py`. The `push-all/` endpoint now starts the job in a background thread and returns **202** with its sync run straight away. `sync/` does the same when called with `"background": true`, which the Accounting tab does; the onboarding wizard still gets immediate results.
+  - Only one job runs per company at a time. Starting another returns **409** "already running".
+  - A run still marked "running" after 30 minutes (for example cut off by a redeploy) is marked failed, so it doesn't block new jobs.
+  - `retry-errors/` handles 50 records per click and returns how many remain.
+- **Setting:** `QUICKBOOKS_BACKGROUND_JOBS` (default on; `0` runs jobs inside the request, as before).
+- **Tests:** 5 new cases in `quickbooks/test_main_books.py`. All 41 QuickBooks tests pass.
+- **Recommended (not changed):** add `--workers 3 --timeout 120` to the gunicorn start command in `railway.json`, so any other slow request (such as the onboarding imports) doesn't hold up the whole app.

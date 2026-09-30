@@ -203,7 +203,7 @@ def fetch_company_info(connection):
     return info
 
 
-def sync_master_data(connection, sync_type="all"):
+def sync_master_data(connection, sync_type="all", run=None):
     # Local import: push.py imports from this module.
     from .push import suppress_auto_push
 
@@ -211,11 +211,12 @@ def sync_master_data(connection, sync_type="all"):
     if sync_type not in allowed:
         raise ValueError(f"Unsupported sync type '{sync_type}'.")
 
-    run = QuickBooksSyncRun.objects.create(
-        company=connection.company,
-        connection=connection,
-        sync_type=sync_type,
-    )
+    if run is None:
+        run = QuickBooksSyncRun.objects.create(
+            company=connection.company,
+            connection=connection,
+            sync_type=sync_type,
+        )
     totals = {"created": 0, "updated": 0, "seen": 0}
     try:
         # Suppress auto-push while writing pulled records so the pull sync

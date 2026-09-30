@@ -225,3 +225,57 @@ class MainBooksTests(TestCase):
         self.assertEqual(QuickBooksSyncError.objects.count(), 0)
 
         self.assertEqual(client.get("/api/quickbooks/accounts/").status_code, 200)
+
+
+@override_settings(QUICKBOOKS_CONFIG=TEST_QB_CONFIG, QUICKBOOKS_BACKGROUND_JOBS=False)
+class BackgroundJobTests(TestCase):
+    """Send everything / import return at once (202) instead of holding the
+    request open past the server's time limit."""
+
+    setUp = MainBooksTests.setUp
+
+    def test_send_everything_returns_202_and_records_the_run(self):
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        res = client.post("/api/quickbooks/push-all/")
+        self.assertEqual(res.status_code, 202, res.data)
+        self.assertEqual(res.data["sync_type"], "push_all")
+        from .models import QuickBooksSyncRun
+        run = QuickBooksSyncRun.objects.get(pk=res.data["id"])
+        self.assertIn(run.status, ("success", "failed"))
+        self.assertIsNotNone(run.finished_at)
+
+    def test_a_second_job_is_refused_while_one_is_running(self):
+        from .models import QuickBooksSyncRun
+        QuickBooksSyncRun.objects.create(company=self.company, connection=self.connection, sync_type="push_all")
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        res = client.post("/api/quickbooks/push-all/")
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("already running", res.data["detail"])
+
+    def test_abandoned_job_does_not_block_a_new_one(self):
+        from .models import QuickBooksSyncRun
+        stale = QuickBooksSyncRun.objects.create(company=self.company, connection=self.connection, sync_type="push_all")
+        QuickBooksSyncRun.objects.filter(pk=stale.pk).update(started_at=timezone.now() - timedelta(hours=1))
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        self.assertEqual(client.post("/api/quickbooks/push-all/").status_code, 202)
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, "failed")
+
+    def test_import_in_background_only_when_asked(self):
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        self.assertEqual(client.post("/api/quickbooks/sync/", {"sync_type": "company", "background": True},
+                                     format="json").status_code, 202)
+        self.assertEqual(client.post("/api/quickbooks/sync/", {"sync_type": "company"}, format="json").status_code, 200)
+
+    def test_job_errors_mark_the_run_failed(self):
+        with mock.patch.object(push, "_push_all_into", side_effect=RuntimeError("boom")):
+            client = APIClient()
+            client.force_authenticate(self.admin)
+            res = client.post("/api/quickbooks/push-all/")
+        from .models import QuickBooksSyncRun
+        run = QuickBooksSyncRun.objects.get(pk=res.data["id"])
+        self.assertEqual((run.status, run.error_message), ("failed", "boom"))

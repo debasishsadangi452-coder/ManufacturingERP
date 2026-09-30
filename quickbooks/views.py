@@ -157,6 +157,16 @@ def sync(request):
             {"detail": f"sync_type must be one of: company, customers, vendors, items, sales, estimates, invoices, payments, procurement, purchase_orders, bills, all."},
             status=status.HTTP_400_BAD_REQUEST,
         )
+    if request.data.get("background"):
+        # Accounting > QuickBooks: import in the background (see background.py).
+        from .background import running_job, start_job
+
+        busy = running_job(connection.company)
+        if busy:
+            return Response({"detail": f"A QuickBooks {busy.sync_type.replace('_', ' ')} is already running.",
+                             "run": QuickBooksSyncRunSerializer(busy).data}, status=status.HTTP_409_CONFLICT)
+        run = start_job(connection, sync_type, lambda run: sync_master_data(connection, sync_type=sync_type, run=run))
+        return Response(QuickBooksSyncRunSerializer(run).data, status=status.HTTP_202_ACCEPTED)
     try:
         run = sync_master_data(connection, sync_type=sync_type)
         return Response(QuickBooksSyncRunSerializer(run).data)
@@ -225,17 +235,27 @@ def push(request):
 @api_view(["POST"])
 @permission_classes([IsFinanceOrAdmin])
 def push_all_view(request):
-    """Backfill every ERP record for the company into QuickBooks."""
+    """Send every ERP record not yet in QuickBooks. Runs in the background and
+    returns 202 with the run at once; progress shows in the sync history."""
+    from .background import running_job, start_job
+
     connection = QuickBooksConnection.objects.filter(company=request.user.company, is_active=True).first()
     if not connection:
         return Response({"detail": "QuickBooks is not connected."}, status=status.HTTP_400_BAD_REQUEST)
-    run = push_all(connection)
-    return Response(QuickBooksSyncRunSerializer(run).data)
+    busy = running_job(connection.company)
+    if busy:
+        return Response({"detail": f"A QuickBooks {busy.sync_type.replace('_', ' ')} is already running.",
+                         "run": QuickBooksSyncRunSerializer(busy).data}, status=status.HTTP_409_CONFLICT)
+    run = start_job(connection, "push_all", lambda run: push_all(connection, run=run))
+    return Response(QuickBooksSyncRunSerializer(run).data, status=status.HTTP_202_ACCEPTED)
 
 
 # ---------------------------------------------------------------------------
 # Accounting > QuickBooks tab
 # ---------------------------------------------------------------------------
+
+RETRY_BATCH = 50
+
 
 def _active_connection(request):
     return QuickBooksConnection.objects.filter(company=request.user.company, is_active=True).first()
@@ -404,7 +424,9 @@ def retry_errors(request):
         return Response({"detail": "QuickBooks is not connected."}, status=status.HTTP_400_BAD_REQUEST)
     company = request.user.company
     fixed = failed = skipped = 0
-    for error in list(QuickBooksSyncError.objects.filter(company=company).order_by("created_at")):
+    # A batch per click keeps the request well inside the server's time limit.
+    batch = list(QuickBooksSyncError.objects.filter(company=company).order_by("created_at")[:RETRY_BATCH])
+    for error in batch:
         payload = error.payload or {}
         if payload.get("operation") == "delete":
             error.delete()
@@ -422,4 +444,5 @@ def retry_errors(request):
             fixed += 1
         else:
             failed += 1
-    return Response({"fixed": fixed, "failed": failed, "skipped": skipped})
+    remaining = QuickBooksSyncError.objects.filter(company=company).count() - failed
+    return Response({"fixed": fixed, "failed": failed, "skipped": skipped, "remaining": max(remaining, 0)})
