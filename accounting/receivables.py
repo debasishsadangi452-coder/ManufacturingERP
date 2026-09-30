@@ -593,6 +593,8 @@ def get_ar_invoices(company, customer_id=None, status_filter=None, search=None, 
         result.append({
             "id": inv.id,
             "invoice_number": f"INV-{inv.id}",
+            "sales_order_id": inv.sales_order_id,
+            "sales_order_number": f"SO-{inv.sales_order_id}" if inv.sales_order_id else "",
             "customer_id": inv.customer.id,
             "customer_name": inv.customer.name,
             "invoice_date": inv.invoice_date.isoformat(),
