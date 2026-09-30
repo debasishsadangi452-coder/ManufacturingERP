@@ -39,6 +39,7 @@ from sales.models import (
 )
 
 SLUG = "nexal"
+ADMIN_USERNAME = "maya.admin@dummy"
 COMPANY_NAME = "Nexal"
 D = Decimal
 
@@ -157,6 +158,9 @@ class Command(BaseCommand):
                 username=generate_username(first, role, self.company), password=password, role=role,
                 company=self.company, first_name=first, last_name="Nexal", is_staff=(role == "admin"),
             )
+        # The demo admin logs in with a neutral username.
+        users["admin"].username = ADMIN_USERNAME
+        users["admin"].save(update_fields=["username"])
         return users
 
     def _day(self, days_ago):
