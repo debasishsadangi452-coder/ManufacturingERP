@@ -69,7 +69,8 @@ class Command(BaseCommand):
                 continue
             uom = uoms.get(uom_code) if uom_code else None
             Item.objects.create(
-                company=company, name=name, category="raw_material", unit=unit, sku=sku,
+                company=company, name=name, category="raw_material", erp_classification="raw_material",
+                unit=unit, sku=sku,
                 base_unit=uom, purchase_unit=uom, purchase_cost=Decimal(cost),
             )
 
