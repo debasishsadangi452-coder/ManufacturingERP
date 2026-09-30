@@ -66,7 +66,7 @@ class Command(BaseCommand):
         self.today = timezone.localdate()
         self.year_start = date(self.today.year, 1, 1)
         self.company_name = options["company"].strip()
-        self.slug = options["slug"].strip() or slugify(self.company_name).replace("-", "")
+        self.slug = (options["slug"].strip() or slugify(self.company_name).replace("-", "")).lower()
         if not self.company_name or not self.slug:
             raise CommandError("A company name is required.")
         self.admin_username = options["admin_username"].strip() or f"admin@{self.slug}"

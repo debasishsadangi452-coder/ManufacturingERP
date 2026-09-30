@@ -161,9 +161,15 @@ class EmailOrUsernameTokenObtainPairSerializer(TokenObtainPairSerializer):
     address in the username field — admins always log in with their email."""
 
     def validate(self, attrs):
-        login = attrs.get(self.username_field, "")
+        login = attrs.get(self.username_field, "").strip()
+        attrs[self.username_field] = login
         if login and not User.objects.filter(username=login).exists():
             match = User.objects.filter(email__iexact=login).order_by("id").first()
+            if not match:
+                # Usernames are matched ignoring case (admin@dummycompany for
+                # admin@dummyCompany), but only when that points to one user.
+                same = list(User.objects.filter(username__iexact=login)[:2])
+                match = same[0] if len(same) == 1 else None
             if match:
                 attrs[self.username_field] = match.username
         return super().validate(attrs)
