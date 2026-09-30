@@ -33,10 +33,11 @@ def record_journal_audit_log(entry, action, user=None, details=None, ip_address=
         return None
 
 
-def post_journal_entry(entry_id, user, company=None):
+def post_journal_entry(entry_id, user, company=None, emergency_override=False, emergency_reason=""):
     """
     Atomically posts a draft or approved JournalEntry to the General Ledger.
     Enforces double-entry equilibrium, period status, lock dates,
+    Blueprint Section #28 approval thresholds, emergency override controls,
     and prevents duplicate posting or modification.
     """
     with transaction.atomic():
@@ -56,8 +57,30 @@ def post_journal_entry(entry_id, user, company=None):
             raise ValidationError(_("Cannot post a reversed journal entry."))
         if entry.status == "rejected":
             raise ValidationError(_("Cannot post a rejected journal entry. Re-open or adjust the draft entry first."))
-        if entry.status not in ["draft", "approved"]:
-            raise ValidationError(_(f"Invalid entry status '{entry.status}'. Only draft or approved entries can be posted."))
+
+        # Blueprint Section #28: Approval Workflow enforcement & Emergency Override
+        if emergency_override:
+            if not emergency_reason or len(str(emergency_reason).strip()) < 10:
+                raise ValidationError(_("Emergency override requires a documented business justification of at least 10 characters."))
+        else:
+            # Check company approval policy
+            from .models import ApprovalThreshold
+            effective_company = company or entry.company
+            policy = ApprovalThreshold.objects.filter(
+                company=effective_company,
+                module__in=["journal_entry", "all"],
+                is_active=True
+            ).order_by("-module").first()
+
+            if policy and policy.is_active:
+                if entry.total_debit >= policy.standard_threshold and entry.status != "approved":
+                    raise ValidationError(_(
+                        f"Posting blocked: Journal entry total ({entry.total_debit:.2f}) exceeds configured "
+                        f"approval threshold ({policy.standard_threshold:.2f}). Entry must be approved prior to posting."
+                    ))
+
+            if entry.status not in ["draft", "approved"]:
+                raise ValidationError(_(f"Invalid entry status '{entry.status}'. Only draft or approved entries can be posted."))
 
         # 2. Assign and validate period
         entry.auto_assign_period()
@@ -83,16 +106,22 @@ def post_journal_entry(entry_id, user, company=None):
         entry.save()
 
         # 6. Immutable audit log record
+        action = "EMERGENCY_OVERRIDE" if emergency_override else "POSTED"
+        audit_details = {
+            "entry_number": entry.entry_number,
+            "total_debit": str(entry.total_debit),
+            "total_credit": str(entry.total_credit),
+            "period": entry.accounting_period.name if entry.accounting_period else None,
+        }
+        if emergency_override:
+            audit_details["emergency_override"] = True
+            audit_details["emergency_reason"] = str(emergency_reason).strip()
+
         record_journal_audit_log(
             entry,
-            action="POSTED",
+            action=action,
             user=user,
-            details={
-                "entry_number": entry.entry_number,
-                "total_debit": str(entry.total_debit),
-                "total_credit": str(entry.total_credit),
-                "period": entry.accounting_period.name if entry.accounting_period else None,
-            }
+            details=audit_details
         )
 
         return entry

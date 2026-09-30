@@ -95,3 +95,20 @@ class HasActionPermission(BasePermission):
         if not request.user or not request.user.is_authenticated:
             return False
         return can_perform_action(request.user, self.required_action)
+
+
+class IsApproverUser(BasePermission):
+    """Allows approval actions to Finance Managers and Accounting Admins (Blueprint #28)."""
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return resolve_accounting_role(request.user) in ["accounting_admin", "finance_manager"]
+
+
+class CanEmergencyOverride(BasePermission):
+    """Allows emergency override postings to Accounting Admins and Finance Managers (Blueprint #28)."""
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return resolve_accounting_role(request.user) in ["accounting_admin", "finance_manager"]
+

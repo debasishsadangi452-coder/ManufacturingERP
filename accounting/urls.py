@@ -34,6 +34,7 @@ from .views import (
     APIArchitectureViewSet,
     UIArchitectureViewSet,
     RolesPermissionsViewSet,
+    ApprovalWorkflowViewSet,
 )
 
 router = DefaultRouter()
@@ -70,6 +71,7 @@ router.register(r'database-architecture', DatabaseArchitectureViewSet, basename=
 router.register(r'api-architecture', APIArchitectureViewSet, basename='accounting-api-architecture')
 router.register(r'ui-architecture', UIArchitectureViewSet, basename='accounting-ui-architecture')
 router.register(r'roles-permissions', RolesPermissionsViewSet, basename='accounting-roles-permissions')
+router.register(r'approval-workflow', ApprovalWorkflowViewSet, basename='accounting-approval-workflow')
 
 
 

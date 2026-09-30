@@ -641,15 +641,28 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="approve")
     def approve_entry(self, request, pk=None):
-        """Approve a submitted journal entry."""
+        """Approve a submitted journal entry (Blueprint #20 / #28)."""
         entry = self.get_object()
+        company = getattr(request.user, "company", None) or entry.company
         if entry.accounting_period and entry.accounting_period.status != "open":
             return Response(
                 {"error": f"Cannot approve journal entry in an accounting period with status '{entry.accounting_period.status}'."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         try:
-            entry.approve_entry(user=request.user)
+            from .models import ApprovalThreshold
+            policy = ApprovalThreshold.objects.filter(
+                company=company, module__in=["journal_entry", "all"], is_active=True
+            ).order_by("-module").first()
+
+            if policy and policy.is_active:
+                from .approval_workflow import approve_document
+                notes = request.data.get("notes", "")
+                approve_document(company=company, document_type="journal_entry", document_id=entry.id, user=request.user, notes=notes)
+            else:
+                entry.approve_entry(user=request.user)
+
+            entry.refresh_from_db()
             serializer = self.get_serializer(entry)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except DjangoValidationError as e:
@@ -660,11 +673,23 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="reject")
     def reject_entry(self, request, pk=None):
-        """Reject a submitted journal entry with reason."""
+        """Reject a submitted journal entry with reason (Blueprint #20 / #28)."""
         entry = self.get_object()
+        company = getattr(request.user, "company", None) or entry.company
         reason = request.data.get("reason", "")
         try:
-            entry.reject_entry(user=request.user, reason=reason)
+            from .models import ApprovalThreshold
+            policy = ApprovalThreshold.objects.filter(
+                company=company, module__in=["journal_entry", "all"], is_active=True
+            ).order_by("-module").first()
+
+            if policy and policy.is_active:
+                from .approval_workflow import reject_document
+                reject_document(company=company, document_type="journal_entry", document_id=entry.id, user=request.user, reason=reason)
+            else:
+                entry.reject_entry(user=request.user, reason=reason)
+
+            entry.refresh_from_db()
             serializer = self.get_serializer(entry)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except DjangoValidationError as e:
@@ -689,11 +714,19 @@ class JournalEntryViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="post")
     def post_entry(self, request, pk=None):
-        """Atomically post a draft or approved journal entry."""
+        """Atomically post a draft or approved journal entry, with optional emergency override."""
         entry = self.get_object()
-        company = getattr(request.user, "company", None)
+        company = getattr(request.user, "company", None) or entry.company
+        emergency_override = request.data.get("emergency_override", False)
+        emergency_reason = request.data.get("emergency_reason", "")
         try:
-            posted_entry = post_journal_entry(entry.id, request.user, company=company)
+            posted_entry = post_journal_entry(
+                entry.id,
+                request.user,
+                company=company,
+                emergency_override=emergency_override,
+                emergency_reason=emergency_reason
+            )
             serializer = self.get_serializer(posted_entry)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except DjangoValidationError as e:
@@ -3916,6 +3949,204 @@ class RolesPermissionsViewSet(viewsets.ViewSet):
             return Response(data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ApprovalWorkflowViewSet(viewsets.ViewSet):
+    """
+    Blueprint Section #28: Approval Workflow APIs.
+    Endpoints:
+    - GET /api/accounting/approval-workflow/queue/ - List items awaiting approval
+    - GET /api/accounting/approval-workflow/policies/ - List threshold rules
+    - POST /api/accounting/approval-workflow/policies/ - Configure threshold rules
+    - POST /api/accounting/approval-workflow/submit/ - Submit document for approval
+    - POST /api/accounting/approval-workflow/approve/ - Approve document
+    - POST /api/accounting/approval-workflow/reject/ - Reject document with reason
+    - POST /api/accounting/approval-workflow/emergency-override/ - Emergency posting override
+    - GET /api/accounting/approval-workflow/history/ - Immutable approval audit log
+    - GET /api/accounting/approval-workflow/summary/ - KPI overview
+    """
+    permission_classes = [IsAuthenticated, IsFinanceOrAdmin]
+
+    @action(detail=False, methods=["get"], url_path="queue")
+    def queue(self, request):
+        """GET /api/accounting/approval-workflow/queue/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        module = request.query_params.get("module")
+        try:
+            from .approval_workflow import get_pending_approvals_queue
+            items = get_pending_approvals_queue(company=company, user=request.user, module=module)
+            return Response(items, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get", "post"], url_path="policies")
+    def policies(self, request):
+        """GET/POST /api/accounting/approval-workflow/policies/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .approval_workflow import get_or_create_threshold_policy
+        from .models import ApprovalThreshold
+
+        if request.method == "GET":
+            modules = ["all", "journal_entry", "expense"]
+            policies = []
+            for mod in modules:
+                pol = get_or_create_threshold_policy(company=company, module=mod)
+                policies.append({
+                    "id": pol.id,
+                    "module": pol.module,
+                    "module_display": pol.get_module_display(),
+                    "standard_threshold": float(pol.standard_threshold),
+                    "high_value_threshold": float(pol.high_value_threshold),
+                    "approver_role": pol.approver_role,
+                    "high_value_approver_role": pol.high_value_approver_role,
+                    "enforce_segregation_of_duties": pol.enforce_segregation_of_duties,
+                    "allow_emergency_override": pol.allow_emergency_override,
+                    "is_active": pol.is_active,
+                })
+            return Response(policies, status=status.HTTP_200_OK)
+
+        elif request.method == "POST":
+            module = request.data.get("module", "all")
+            std_thresh = request.data.get("standard_threshold", "1000.00")
+            high_thresh = request.data.get("high_value_threshold", "10000.00")
+            approver_role = request.data.get("approver_role", "finance_manager")
+            high_approver_role = request.data.get("high_value_approver_role", "accounting_admin")
+            enforce_segregation = request.data.get("enforce_segregation_of_duties", True)
+            allow_emergency = request.data.get("allow_emergency_override", True)
+            is_active = request.data.get("is_active", True)
+
+            pol = get_or_create_threshold_policy(company=company, module=module)
+            pol.standard_threshold = Decimal(str(std_thresh))
+            pol.high_value_threshold = Decimal(str(high_thresh))
+            pol.approver_role = approver_role
+            pol.high_value_approver_role = high_approver_role
+            pol.enforce_segregation_of_duties = bool(enforce_segregation)
+            pol.allow_emergency_override = bool(allow_emergency)
+            pol.is_active = bool(is_active)
+            pol.save()
+
+            return Response({
+                "id": pol.id,
+                "module": pol.module,
+                "module_display": pol.get_module_display(),
+                "standard_threshold": float(pol.standard_threshold),
+                "high_value_threshold": float(pol.high_value_threshold),
+                "approver_role": pol.approver_role,
+                "high_value_approver_role": pol.high_value_approver_role,
+                "enforce_segregation_of_duties": pol.enforce_segregation_of_duties,
+                "allow_emergency_override": pol.allow_emergency_override,
+                "is_active": pol.is_active,
+            }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="submit")
+    def submit_action(self, request):
+        """POST /api/accounting/approval-workflow/submit/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        doc_type = request.data.get("document_type")
+        doc_id = request.data.get("document_id")
+        notes = request.data.get("notes", "")
+        try:
+            from .approval_workflow import submit_document_for_approval
+            res = submit_document_for_approval(company=company, document_type=doc_type, document_id=doc_id, user=request.user, notes=notes)
+            return Response(res, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="approve")
+    def approve_action(self, request):
+        """POST /api/accounting/approval-workflow/approve/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        doc_type = request.data.get("document_type")
+        doc_id = request.data.get("document_id")
+        notes = request.data.get("notes", "")
+        try:
+            from .approval_workflow import approve_document
+            res = approve_document(company=company, document_type=doc_type, document_id=doc_id, user=request.user, notes=notes)
+            return Response(res, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="reject")
+    def reject_action(self, request):
+        """POST /api/accounting/approval-workflow/reject/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        doc_type = request.data.get("document_type")
+        doc_id = request.data.get("document_id")
+        reason = request.data.get("reason", "")
+        try:
+            from .approval_workflow import reject_document
+            res = reject_document(company=company, document_type=doc_type, document_id=doc_id, user=request.user, reason=reason)
+            return Response(res, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="emergency-override")
+    def emergency_override(self, request):
+        """POST /api/accounting/approval-workflow/emergency-override/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        doc_type = request.data.get("document_type")
+        doc_id = request.data.get("document_id")
+        reason = request.data.get("emergency_reason", "")
+        try:
+            from .approval_workflow import emergency_override_posting
+            res = emergency_override_posting(company=company, document_type=doc_type, document_id=doc_id, user=request.user, emergency_reason=reason)
+            return Response(res, status=status.HTTP_200_OK)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else e.messages
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="history")
+    def history(self, request):
+        """GET /api/accounting/approval-workflow/history/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        doc_type = request.query_params.get("document_type")
+        doc_id = request.query_params.get("document_id")
+        try:
+            from .approval_workflow import get_approval_audit_history
+            records = get_approval_audit_history(company=company, document_type=doc_type, document_id=doc_id)
+            return Response(records, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """GET /api/accounting/approval-workflow/summary/"""
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({"error": "User company context required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            from .approval_workflow import get_approval_summary_metrics
+            data = get_approval_summary_metrics(company=company)
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 
 
 
