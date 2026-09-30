@@ -321,6 +321,8 @@ def sync_bills(connection, run):
 def _sync_records(records, entity_type, connection, run, upsert):
     result = {"created": 0, "updated": 0, "seen": len(records)}
     for payload in records:
+        # Heartbeat so a long import is not mistaken for a dead one.
+        QuickBooksSyncRun.objects.filter(pk=run.pk).update(last_activity_at=timezone.now())
         try:
             created = upsert(connection, payload)
             result["created" if created else "updated"] += 1

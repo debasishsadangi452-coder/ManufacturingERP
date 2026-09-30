@@ -257,3 +257,4 @@ QuickBooks is the company's main set of books, and the ERP keeps local books. Ev
 - **Setting:** `QUICKBOOKS_BACKGROUND_JOBS` (default on; `0` runs jobs inside the request, as before).
 - **Tests:** 5 new cases in `quickbooks/test_main_books.py`. All 41 QuickBooks tests pass.
 - **Recommended (not changed):** add `--workers 3 --timeout 120` to the gunicorn start command in `railway.json`, so any other slow request (such as the onboarding imports) doesn't hold up the whole app.
+- **Follow-up: 409 "already running" after deploying the fix.** Runs left "running" by the pre-fix crash kept blocking new jobs, because the stale rule was 30 minutes from the start time. Sync runs now carry a `last_activity_at` heartbeat, updated per record in both send-everything and imports (migration `quickbooks.0004`). A run with no activity for **3 minutes** is marked failed. The overview endpoint also expires dead runs, so the tab's buttons re-enable on their own. Tests: 43 pass.

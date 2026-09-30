@@ -305,8 +305,11 @@ def overview(request):
     from .models import QuickBooksSyncError
     from .serializers import QuickBooksSyncErrorSerializer
 
+    from .background import running_job
+
     company = request.user.company
     connection = _active_connection(request)
+    running_job(company)  # expire jobs that died, so the tab's buttons re-enable
     rows, local_only = _sync_counts(company)
     runs = QuickBooksSyncRun.objects.filter(company=company).order_by("-started_at")[:10]
     errors = QuickBooksSyncError.objects.filter(company=company).order_by("-created_at")[:30]

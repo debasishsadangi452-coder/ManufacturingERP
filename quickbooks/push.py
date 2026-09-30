@@ -813,7 +813,8 @@ def _push_all_into(connection, run):
             run.records_created = created
             run.records_updated = updated
             run.records_seen = seen
-            run.save(update_fields=["records_created", "records_updated", "records_seen"])
+            run.last_activity_at = timezone.now()
+            run.save(update_fields=["records_created", "records_updated", "records_seen", "last_activity_at"])
     run.records_created = created
     run.records_updated = updated
     run.records_seen = seen

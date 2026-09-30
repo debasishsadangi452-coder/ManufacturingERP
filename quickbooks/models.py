@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.core import signing
 from django.db import models
+from django.utils import timezone
 
 
 class QuickBooksConnection(models.Model):
@@ -64,6 +65,9 @@ class QuickBooksSyncRun(models.Model):
     error_message = models.TextField(blank=True)
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    # Heartbeat while a run is working; a "running" run that stops beating was
+    # cut off (worker killed, redeploy) and is expired by background.running_job.
+    last_activity_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         ordering = ["-started_at"]

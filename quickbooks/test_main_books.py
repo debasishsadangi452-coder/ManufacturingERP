@@ -254,15 +254,34 @@ class BackgroundJobTests(TestCase):
         self.assertEqual(res.status_code, 409)
         self.assertIn("already running", res.data["detail"])
 
-    def test_abandoned_job_does_not_block_a_new_one(self):
+    def test_job_that_stopped_making_progress_does_not_block_a_new_one(self):
+        """A run left "running" by a killed worker (e.g. the pre-fix crash) is
+        expired once it has shown no activity for a few minutes."""
         from .models import QuickBooksSyncRun
-        stale = QuickBooksSyncRun.objects.create(company=self.company, connection=self.connection, sync_type="push_all")
-        QuickBooksSyncRun.objects.filter(pk=stale.pk).update(started_at=timezone.now() - timedelta(hours=1))
+        dead = QuickBooksSyncRun.objects.create(company=self.company, connection=self.connection, sync_type="push_all")
+        QuickBooksSyncRun.objects.filter(pk=dead.pk).update(last_activity_at=timezone.now() - timedelta(minutes=4))
         client = APIClient()
         client.force_authenticate(self.admin)
         self.assertEqual(client.post("/api/quickbooks/push-all/").status_code, 202)
-        stale.refresh_from_db()
-        self.assertEqual(stale.status, "failed")
+        dead.refresh_from_db()
+        self.assertEqual(dead.status, "failed")
+
+    def test_opening_the_tab_expires_dead_jobs_so_buttons_re_enable(self):
+        from .models import QuickBooksSyncRun
+        dead = QuickBooksSyncRun.objects.create(company=self.company, connection=self.connection, sync_type="push_all")
+        QuickBooksSyncRun.objects.filter(pk=dead.pk).update(last_activity_at=timezone.now() - timedelta(minutes=4))
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        runs = client.get("/api/quickbooks/overview/").data["recent_sync_runs"]
+        self.assertEqual(next(r for r in runs if r["id"] == dead.id)["status"], "failed")
+
+    def test_a_job_still_making_progress_keeps_blocking(self):
+        from .models import QuickBooksSyncRun
+        live = QuickBooksSyncRun.objects.create(company=self.company, connection=self.connection, sync_type="push_all")
+        QuickBooksSyncRun.objects.filter(pk=live.pk).update(started_at=timezone.now() - timedelta(hours=1))
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        self.assertEqual(client.post("/api/quickbooks/push-all/").status_code, 409)
 
     def test_import_in_background_only_when_asked(self):
         client = APIClient()

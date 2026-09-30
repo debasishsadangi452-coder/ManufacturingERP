@@ -19,16 +19,19 @@ from .models import QuickBooksSyncRun
 
 logger = logging.getLogger(__name__)
 
-# A run still "running" after this long was cut off (e.g. a redeploy).
-STALE_RUN = timedelta(minutes=30)
+# A "running" run with no progress for this long was cut off (worker killed,
+# redeploy). Each QuickBooks call times out after 30 s, so a live job always
+# beats well within it.
+STALE_RUN = timedelta(minutes=3)
 
 
 def running_job(company):
     """The job in progress for this company, after expiring abandoned ones."""
     QuickBooksSyncRun.objects.filter(
         company=company, status="running", finished_at__isnull=True,
-        started_at__lt=timezone.now() - STALE_RUN,
-    ).update(status="failed", error_message="Stopped before finishing (server restarted).", finished_at=timezone.now())
+        last_activity_at__lt=timezone.now() - STALE_RUN,
+    ).update(status="failed", error_message="Stopped before finishing (the server stopped the job).",
+             finished_at=timezone.now())
     return QuickBooksSyncRun.objects.filter(company=company, status="running", finished_at__isnull=True).first()
 
 
