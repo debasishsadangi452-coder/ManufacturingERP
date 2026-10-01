@@ -1,3 +1,4 @@
+from django.db.models import Sum
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 
@@ -164,18 +165,28 @@ def on_production_order_change(sender, instance, created, **kwargs):
             _notify('admin', f'New Production Order #{instance.id} created for {instance.quantity} units.', instance.id, 'ProductionOrder', company, 'production')
 
             shortages = []
+            to_make = []
             # Ingredient quantities are per batch — scale by whole batches.
             for ing, required in instance.recipe.material_requirements(instance.quantity):
-                stock = Stock.objects.filter(item=ing.item, warehouse=instance.warehouse).first()
-                current_qty = stock.quantity if stock else 0
-                if current_qty < required:
-                    shortages.append(ing.item.name)
-                    InventoryRequest.objects.get_or_create(
-                        item=ing.item,
-                        warehouse=instance.warehouse,
-                        production_order=instance,
-                        defaults={'quantity': required - current_qty, 'status': 'pending'},
-                    )
+                # Stock anywhere counts: completion draws from every warehouse.
+                current_qty = Stock.objects.filter(item=ing.item).aggregate(total=Sum('quantity'))['total'] or 0
+                if current_qty >= required:
+                    continue
+                if ing.item.category != 'raw_material':
+                    # An intermediate (e.g. baked cookies) is produced, not bought:
+                    # no inventory request, production is told to make it first.
+                    to_make.append(f'{ing.item.name} ({required - current_qty:g})')
+                    continue
+                shortages.append(ing.item.name)
+                InventoryRequest.objects.get_or_create(
+                    item=ing.item,
+                    warehouse=instance.warehouse,
+                    production_order=instance,
+                    defaults={'quantity': required - current_qty, 'status': 'pending'},
+                )
+
+            if to_make:
+                _notify('production', f'Production #{instance.id} needs intermediates produced first: {", ".join(to_make)}.', instance.id, 'ProductionOrder', company, 'production')
 
             if shortages:
                 # Step 3: production is blocked on raw material. Store is told on

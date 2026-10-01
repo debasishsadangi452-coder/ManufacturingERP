@@ -97,3 +97,20 @@ class IntermediatePlanningTests(TestCase):
                                 format="json")
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.data["default_line_name"], "Baking")
+
+    def test_creating_an_order_requests_only_short_raw_materials(self):
+        from inventory.models import InventoryRequest
+
+        # Packing 100 bags: cookies short (intermediate). Baking 1,000 cookies: flour short (raw).
+        pack = self.client.post("/api/production/production-orders/", {
+            "recipe": self.pack.id, "quantity": 100, "warehouse": self.plant.id,
+        }, format="json").data
+        self.assertFalse(InventoryRequest.objects.filter(production_order_id=pack["id"]).exists())
+
+        # Stock in another warehouse still counts.
+        other = Warehouse.objects.create(company=self.company, name="Annex", location="Back")
+        bake = self.client.post("/api/production/production-orders/", {
+            "recipe": self.bake.id, "quantity": 1000, "warehouse": other.id,
+        }, format="json").data
+        [request] = InventoryRequest.objects.filter(production_order_id=bake["id"])
+        self.assertEqual((request.item, request.quantity), (self.flour, 7))  # 12 kg needed, 5 on hand
