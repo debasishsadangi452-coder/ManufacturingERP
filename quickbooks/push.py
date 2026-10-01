@@ -246,7 +246,14 @@ def push_item(connection, item):
         raise QuickBooksAPIError(
             "Could not resolve QuickBooks income/expense accounts required to create items."
         )
-    return _push_named_entity(connection, "item", "item", item, body, item.name)
+    created_by_erp = not item.quickbooks_id
+    result = _push_named_entity(connection, "item", "item", item, body, item.name)
+    if created_by_erp and not item.erp_classification:
+        # An ERP item is already classified by its category; without this the
+        # QuickBooks setup wizard would list it as an imported item to classify.
+        type(item).objects.filter(pk=item.pk).update(erp_classification=item.category)
+        item.erp_classification = item.category
+    return result
 
 
 def push_item_quantity(connection, item):

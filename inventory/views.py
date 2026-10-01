@@ -427,6 +427,14 @@ class StockMovementViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
         return qs
 
 
+def _items_awaiting_classification(company):
+    """Items imported from QuickBooks that still need an ERP classification.
+    quickbooks_id is a CharField ("" when unset, never NULL), so ERP-only items
+    must be excluded explicitly; items the ERP created and pushed are marked
+    classified by the push itself."""
+    return Item.objects.filter(company=company, erp_classification__isnull=True).exclude(quickbooks_id="")
+
+
 class QuickBooksOnboardingViewSet(viewsets.ViewSet):
     """Manage QB onboarding workflow."""
     permission_classes = [IsAdmin]
@@ -442,7 +450,7 @@ class QuickBooksOnboardingViewSet(viewsets.ViewSet):
     def items_to_classify(self, request):
         """Get QB items that need classification."""
         company = request.user.company
-        items = Item.objects.filter(company=company, quickbooks_id__isnull=False, erp_classification__isnull=True)
+        items = _items_awaiting_classification(company)
         return Response(ItemSerializer(items, many=True).data)
 
     @action(detail=False, methods=['post'])
@@ -485,7 +493,7 @@ class QuickBooksOnboardingViewSet(viewsets.ViewSet):
 
         # Check if all items classified
         onboarding, _ = QuickBooksOnboarding.objects.get_or_create(company=company)
-        unclassified = Item.objects.filter(company=company, quickbooks_id__isnull=False, erp_classification__isnull=True).count()
+        unclassified = _items_awaiting_classification(company).count()
 
         if unclassified == 0:
             onboarding.status = 'bom_setup'
@@ -637,7 +645,10 @@ class BOMViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return Response({'error': 'raw_material_id and quantity required'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            raw_material = Item.objects.get(id=raw_material_id, category='raw_material')
+            raw_material = Item.objects.get(
+                id=raw_material_id, company=bom.finished_good.company,
+                category__in=['raw_material', 'intermediate'],
+            )
             line, created = BOMLine.objects.get_or_create(
                 bom=bom, raw_material=raw_material,
                 defaults={'quantity': quantity, 'unit': unit}

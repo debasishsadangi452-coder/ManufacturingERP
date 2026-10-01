@@ -147,6 +147,34 @@ class PushTestCase(TestCase):
         item.refresh_from_db()
         self.assertTrue(item.quickbooks_id)
 
+    def test_setup_wizard_lists_only_items_imported_from_quickbooks(self):
+        from rest_framework.test import APIClient
+
+        from accounts.models import User
+
+        _, _, erp_item = self._make_masters()
+        with push.suppress_auto_push():
+            imported = Item.objects.create(
+                company=self.company, name="Garden Supplies", category="finished_good", quickbooks_id="QB-9",
+            )
+        admin = User.objects.create_user(username="ann.admin", role="admin", company=self.company, password="pass")
+        client = APIClient()
+        client.force_authenticate(admin)
+        url = "/api/inventory/onboarding/items_to_classify/"
+
+        # An ERP-only item (quickbooks_id == "") is not a QuickBooks item.
+        self.assertEqual([row["name"] for row in client.get(url).data], ["Garden Supplies"])
+
+        # Pushing the ERP item marks it classified, so it stays off the list...
+        push.push_item(self.connection, erp_item)
+        erp_item.refresh_from_db()
+        self.assertEqual(erp_item.erp_classification, "finished_good")
+        # ...while re-pushing an imported item leaves it for the user to classify.
+        push.push_item(self.connection, imported)
+        imported.refresh_from_db()
+        self.assertIsNone(imported.erp_classification)
+        self.assertEqual([row["name"] for row in client.get(url).data], ["Garden Supplies"])
+
     def test_push_raw_material_as_quickbooks_inventory_purchase_item(self):
         with push.suppress_auto_push():
             item = Item.objects.create(
