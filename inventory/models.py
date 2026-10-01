@@ -40,13 +40,17 @@ class UnitOfMeasure(models.Model):
 
 
 class Item(models.Model):
+    # intermediate: made in-house by one recipe and consumed by another (e.g.
+    # a baked cookie that is then packed); never bought or sold directly.
     CATEGORY_CHOICES = [
         ("raw_material", "Raw Material"),
+        ("intermediate", "Intermediate (semi-finished)"),
         ("finished_good", "Finished Good"),
     ]
 
     ERP_CLASSIFICATION_CHOICES = [
         ("raw_material", "Raw Material"),
+        ("intermediate", "Intermediate (semi-finished)"),
         ("finished_good", "Finished Good"),
         ("out_of_scope", "Out of Scope"),
     ]
@@ -424,9 +428,10 @@ class ProcurementQuickBooksConfig(models.Model):
 
 
 class BOM(models.Model):
-    """Bill of Materials for finished goods."""
+    """Bill of Materials for a finished good or an intermediate."""
     finished_good = models.OneToOneField(
-        Item, on_delete=models.CASCADE, related_name="bom", limit_choices_to={"category": "finished_good"}
+        Item, on_delete=models.CASCADE, related_name="bom",
+        limit_choices_to={"category__in": ["finished_good", "intermediate"]},
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -438,8 +443,9 @@ class BOM(models.Model):
 class BOMLine(models.Model):
     """Individual line item in a BOM."""
     bom = models.ForeignKey(BOM, on_delete=models.CASCADE, related_name="lines")
+    # A raw material, or an intermediate made by its own BOM (multi-level BOM).
     raw_material = models.ForeignKey(
-        Item, on_delete=models.CASCADE, limit_choices_to={"category": "raw_material"}
+        Item, on_delete=models.CASCADE, limit_choices_to={"category__in": ["raw_material", "intermediate"]}
     )
     quantity = models.FloatField(help_text="Quantity of raw material per unit of finished good")
     unit = models.CharField(max_length=50, default="unit")

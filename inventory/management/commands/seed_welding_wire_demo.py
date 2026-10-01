@@ -5,7 +5,8 @@ completed production with QC, shipped/invoiced/paid and open sales orders,
 vendor bills and payments, and ERP-only journals (capital and operating expenses).
 
     python manage.py seed_welding_wire_demo --company "Dummy Company"
-    python manage.py seed_welding_wire_demo --company "Dummy Company" --slug dummycompany         --admin-username admin@dummycompany --password demo12345 [--brand Acme] [--replace]
+    python manage.py seed_welding_wire_demo --company "Dummy Company" --slug dummycompany
+        --admin-username admin@dummycompany --password demo12345 [--brand Acme] [--replace]
 
 --slug defaults to the company name without spaces or dashes, lowercased;
 --admin-username defaults to admin@<slug>. The other users are named
@@ -50,6 +51,8 @@ D = Decimal
 
 class Command(BaseCommand):
     help = "Seed an aluminium welding-wire demo company with a month of operating and accounting history."
+    # Quality check recorded on each completed batch: (test type, parameter, result, target, remarks)
+    QC = ("Tensile & chemistry", "Si/Mg content, wire diameter", "Within AWS A5.10 spec", "AWS A5.10", "Released for sale")
 
     def add_arguments(self, parser):
         parser.add_argument("--company", required=True, help='Company name, e.g. "Dummy Company".')
@@ -89,11 +92,18 @@ class Command(BaseCommand):
         company = self.company = Company.objects.create(name=self.company_name, slug=self.slug)
         CompanySubscription.objects.create(company=company, plan="premium_ai", status="active", onboarding_completed=True)
         self.users = self._users(options["password"])
-        admin = self.admin = self.users["admin"]
+        self.admin = self.users["admin"]
 
         seed_standard_chart_of_accounts(company)
         seed_standard_fiscal_year(company, self.today.year)
 
+        self.build_history()
+        self._report(options["password"])
+
+    def build_history(self):
+        """Plant, catalogue and a month of operating history. Subclasses seeding
+        a different business override this and reuse the helpers below."""
+        company = self.company
         plant = Warehouse.objects.create(company=company, name="Main Plant - Casting & Drawing", location="Plant floor")
         fg = Warehouse.objects.create(company=company, name="Finished Goods Warehouse", location="Shipping dock")
         lines = {
@@ -163,8 +173,6 @@ class Command(BaseCommand):
         self._journal(8, "Outbound freight - LTL carriers", [("6030", "1250.00", "0"), ("1010", "0", "1250.00")])
         self._journal(6, "Plant electricity - wire drawing furnaces", [("5200", "4800.00", "0"), ("1010", "0", "4800.00")])
         self._journal(1, "Admin & sales salaries", [("6010", "12000.00", "0"), ("1010", "0", "12000.00")])
-
-        self._report(options["password"])
 
     # ------------------------------------------------------------------ helpers
 
@@ -321,7 +329,7 @@ class Command(BaseCommand):
             allocations=[{"bill_id": bill.id, "amount": str(amount)}],
         )
 
-    def _produce(self, recipe, quantity, line, plant, fg, days_ago):
+    def _produce(self, recipe, quantity, line, plant, fg, days_ago, qc=None):
         """Complete a production batch: consume raw stock/lots, add finished stock/lot, approve QC, post."""
         order = ProductionOrder.objects.create(recipe=recipe, quantity=quantity, warehouse=fg, line=line,
                                                status="running", start_time=self._at(days_ago, 7))
@@ -333,9 +341,9 @@ class Command(BaseCommand):
         order.status = "completed"
         order.end_time = self._at(days_ago, 16)
         order.save()
-        QualityCheck.objects.create(production_order=order, lot=lot, status="approved", test_type="Tensile & chemistry",
-                                    parameter="Si/Mg content, wire diameter", result="Within AWS A5.10 spec",
-                                    target="AWS A5.10", remarks="Released for sale")
+        test_type, parameter, result, target, remarks = qc or self.QC
+        QualityCheck.objects.create(production_order=order, lot=lot, status="approved", test_type=test_type,
+                                    parameter=parameter, result=result, target=target, remarks=remarks)
         self._post("production_completed", order.id, self.users["production"])
         return order
 

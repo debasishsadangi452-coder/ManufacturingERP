@@ -363,6 +363,15 @@ def calculate_item_unit_cost(item, company):
     if item_cost > Decimal("0.00"):
         return item_cost.quantize(Decimal("0.01"))
 
+    # Made in-house (e.g. an intermediate consumed by a later recipe): its own
+    # recipe cost, the same value its production posted into inventory.
+    from accounting.inventory_accounting import recipe_unit_cost
+    rolled = recipe_unit_cost(item)
+    if rolled and rolled > Decimal("0.00"):
+        # Not rounded to cents: a made input is often worth fractions of a cent
+        # per unit, and line totals are rounded after multiplying by quantity.
+        return rolled.quantize(Decimal("0.000001"))
+
     poi = PurchaseOrderItem.objects.filter(
         item=item,
         po__vendor__company=company
@@ -528,9 +537,18 @@ def get_manufacturing_accounting_preview(
         raise ValidationError(_(f"Sum of completed ({effective_completed_qty}) and scrap ({effective_scrap_qty}) exceeds planned quantity ({planned_qty})."))
 
     unit_cost = costs["unit_production_cost"]
-    fg_value = (effective_completed_qty * unit_cost).quantize(Decimal("0.01"))
-    scrap_value = (effective_scrap_qty * unit_cost).quantize(Decimal("0.01"))
     total_cost = costs["total_production_cost"]
+    # Value output as its share of the accumulated cost rather than qty x the
+    # rounded unit cost, so a fully completed order clears WIP exactly (cheap
+    # items such as a $0.08395 cookie would otherwise leave rounding in WIP).
+    if planned_qty > Decimal("0.00"):
+        fg_value = (total_cost * effective_completed_qty / planned_qty).quantize(Decimal("0.01"))
+        if effective_completed_qty + effective_scrap_qty == planned_qty and effective_scrap_qty > 0:
+            scrap_value = total_cost - fg_value
+        else:
+            scrap_value = (total_cost * effective_scrap_qty / planned_qty).quantize(Decimal("0.01"))
+    else:
+        fg_value = scrap_value = Decimal("0.00")
     remaining_wip = (total_cost - fg_value - scrap_value).quantize(Decimal("0.01"))
 
     # Resolve Accounts

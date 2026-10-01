@@ -72,6 +72,7 @@ def seed_standard_chart_of_accounts(company):
         ("1200", "Inventories", "Inventory", "1000", "Header for all production and warehouse inventory"),
         ("1210", "Raw Materials Inventory", "Inventory", "1200", "Stock of ingredients, metals, syrups, and packaging components"),
         ("1220", "Work-in-Progress (WIP)", "Inventory", "1200", "Items currently in active production batches"),
+        ("1225", "Semi-Finished Goods Inventory", "Inventory", "1200", "Intermediate goods made in-house and held for further production"),
         ("1230", "Finished Goods Inventory", "Inventory", "1200", "Completed manufactured products ready for sale/shipment"),
         ("1300", "Prepaid Expenses", "Prepaid Expenses & Other Current Assets", "1000", "Prepaid commercial insurance, annual licenses"),
         

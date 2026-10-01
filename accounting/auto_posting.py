@@ -308,14 +308,11 @@ def standard_unit_cost(item):
     """(unit cost, inventory account code) for a finished unit of `item`.
     Manufactured items cost their recipe's ingredients per finished unit and sit
     in Finished Goods; bought-in items use purchase cost from Raw Materials."""
-    recipe = item.recipes.prefetch_related("recipeingredient_set__item").first()
-    if recipe:
-        batch_cost = sum(
-            Decimal(str(ing.quantity)) * (ing.item.purchase_cost or Decimal("0"))
-            for ing in recipe.recipeingredient_set.all()
-        )
-        batch_size = Decimal(str(recipe.batch_size or 1))
-        return batch_cost / batch_size, "1230"
+    from accounting.inventory_accounting import recipe_unit_cost
+
+    rolled = recipe_unit_cost(item)  # made inputs (intermediates) at their own recipe cost
+    if rolled is not None:
+        return rolled, "1225" if item.category == "intermediate" else "1230"
     return item.purchase_cost or Decimal("0"), "1210"
 
 

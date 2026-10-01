@@ -258,8 +258,8 @@ class BOMLineSerializer(serializers.ModelSerializer):
         fields = ['id', 'raw_material', 'raw_material_name', 'raw_material_unit', 'quantity', 'unit']
 
     def validate_raw_material(self, value):
-        if value.category != "raw_material":
-            raise serializers.ValidationError("Only raw materials can be used in BOM.")
+        if value.category not in ("raw_material", "intermediate"):
+            raise serializers.ValidationError("Only raw materials and intermediates can be used in a BOM.")
         return value
 
 

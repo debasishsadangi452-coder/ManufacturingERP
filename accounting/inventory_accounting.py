@@ -49,6 +49,47 @@ def get_inventory_policy(company):
     }
 
 
+def resolve_semi_finished_account(company):
+    """1225 Semi-Finished Goods Inventory: intermediates made by one recipe and
+    consumed by another. Provisioned under 1200 Inventories when missing."""
+    acc = Account.objects.filter(company=company, code="1225", is_active=True).first()
+    if acc and not acc.is_header:
+        return acc
+    parent = Account.objects.filter(company=company, code__in=["1200", "1000"]).order_by("-code").first()
+    acc_type = AccountType.objects.filter(name="Inventory").first() or AccountType.objects.filter(category="asset").first()
+    acc, _ = Account.objects.get_or_create(
+        company=company,
+        code="1225",
+        defaults={
+            "name": "Semi-Finished Goods Inventory",
+            "account_type": acc_type,
+            "parent": parent,
+            "description": "Intermediate goods made in-house and held for further production",
+            "currency": getattr(company, "currency", "USD") or "USD",
+            "is_active": True,
+        },
+    )
+    return acc
+
+
+def recipe_unit_cost(item, _depth=0):
+    """Material cost of one unit of a manufactured item, rolled up through its
+    recipe: bought inputs at purchase cost, made inputs (intermediates) at their
+    own recipe cost. None when the item has no recipe."""
+    if _depth > 5:  # guard against a recipe that (indirectly) contains itself
+        return None
+    recipe = item.recipes.prefetch_related("recipeingredient_set__item").first()
+    if not recipe:
+        return None
+    batch_cost = Decimal("0")
+    for ing in recipe.recipeingredient_set.all():
+        cost = ing.item.purchase_cost or Decimal("0")
+        if cost <= 0:
+            cost = recipe_unit_cost(ing.item, _depth + 1) or Decimal("0")
+        batch_cost += Decimal(str(ing.quantity)) * cost
+    return batch_cost / Decimal(str(recipe.batch_size or 1))
+
+
 def resolve_inventory_asset_account(item, company, account_id=None):
     """
     Resolves or provisions the active leaf Inventory Asset account for an item.
@@ -64,6 +105,9 @@ def resolve_inventory_asset_account(item, company, account_id=None):
         if acc.is_header:
             raise ValidationError(_("Cannot post inventory asset to a header account. Select a leaf account."))
         return acc
+
+    if getattr(item, "category", "") == "intermediate":
+        return resolve_semi_finished_account(company)
 
     settings = AccountingSettings.objects.filter(company=company).first()
     is_finished = getattr(item, "category", "") == "finished_good" or getattr(item, "is_finished_good", False)
