@@ -115,6 +115,11 @@ class Command(BaseCommand):
         rm = self._raw_materials()
         fgs = self._finished_goods()
         recipes = self._recipes_and_boms(rm, fgs)
+        line_for = {"er4043_spool": "spool", "er5356_spool": "spool", "er4043_basket": "spool",
+                    "er5356_tig": "tig", "er4043_drum": "drawing", "er5356_reel": "drawing"}
+        for key, recipe in recipes.items():
+            recipe.default_line = lines[line_for[key]]
+            recipe.save(update_fields=["default_line"])
         vendors = self._vendors(rm)
         customers = self._customers()
 

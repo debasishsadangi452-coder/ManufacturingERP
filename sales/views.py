@@ -168,7 +168,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             for ing, required_qty in requirements:
                 available = Stock.objects.filter(item=ing.item).aggregate(Sum('quantity'))['quantity__sum'] or 0
                 if available < required_qty:
-                    shortages.append(f"{ing.item.name} (short {required_qty - available:.0f})")
+                    made_in_house = " - intermediate, produce it first" if ing.item.category == "intermediate" else ""
+                    shortages.append(f"{ing.item.name} (short {required_qty - available:.0f}{made_in_house})")
 
             # --- Step 3: Reserve what IS on hand (never more than available) ---
             for ing, required_qty in requirements:
@@ -193,10 +194,12 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             # materials_reserved is only True when nothing was short; otherwise
             # production must wait for procurement to top the material up.
             fully_reserved = not shortages
+            from production.planning import default_line_for
             prod_order = ProductionOrder.objects.create(
                 recipe=recipe,
                 quantity=remaining_to_produce,
                 warehouse=warehouse,
+                line=default_line_for(recipe),  # the product's predefined line, if any
                 status='scheduled',
                 sales_order=order,  # so Production's Requests tab can trace the batch back
                 materials_reserved=fully_reserved,

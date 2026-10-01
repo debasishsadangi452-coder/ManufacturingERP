@@ -122,6 +122,18 @@ class RecipeViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return Response({"error": "units must be a number."}, status=status.HTTP_400_BAD_REQUEST)
         return Response({"product": recipe.product.name, **recipe.batches_for(units)})
 
+    @action(detail=True, methods=["get"])
+    def material_check(self, request, pk=None):
+        """?quantity=<units> -> stock check for one run, including intermediates
+        that must be produced first (multi-level BOM)."""
+        from .planning import material_check
+        recipe = self.get_object()
+        try:
+            quantity = float(request.query_params.get("quantity", 0))
+        except (TypeError, ValueError):
+            return Response({"error": "quantity must be a number."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"product": recipe.product.name, "quantity": quantity, **material_check(recipe, quantity)})
+
 
 # -------------------------------------------------
 # 🧪 Recipe Ingredient ViewSet
@@ -150,6 +162,12 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         line = serializer.validated_data.get('line')
+        if line is None:
+            # No line chosen: use the recipe's predefined line.
+            from .planning import default_line_for
+            line = default_line_for(serializer.validated_data['recipe'])
+            if line is not None:
+                serializer.validated_data['line'] = line
         start_time = serializer.validated_data.get('start_time')
         end_time = serializer.validated_data.get('end_time')
 
@@ -252,10 +270,12 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                         total_available = sum(s.quantity for s in available_stocks)
 
                         if total_available < required_qty:
-                            errors.append(
-                                f"Insufficient stock for {ing.item.name}: "
-                                f"Required {required_qty}, Available {total_available}"
-                            )
+                            message = (f"Insufficient stock for {ing.item.name}: "
+                                       f"Required {required_qty}, Available {total_available}")
+                            if ing.item.category == "intermediate":
+                                message += (f". {ing.item.name} is an intermediate: produce "
+                                            f"{required_qty - total_available:g} more first.")
+                            errors.append(message)
                             continue
 
                         # Deduct from warehouses in descending stock order

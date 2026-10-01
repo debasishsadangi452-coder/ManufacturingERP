@@ -14,6 +14,11 @@ class Recipe(models.Model):
     batch_size = models.FloatField(
         default=1, help_text="Finished units produced per production batch"
     )
+    # Line that orders for this product go to automatically (e.g. batches
+    # planned from a sales order). Optional; skipped while under maintenance.
+    default_line = models.ForeignKey(
+        "production.ProductionLine", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
 
     def batches_for(self, units):
         """How many whole batches are needed to make `units` of product.

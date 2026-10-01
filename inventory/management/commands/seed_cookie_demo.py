@@ -18,7 +18,9 @@ History (all dates in the current month, posted to the ledger by auto-posting):
   * 5 purchase orders received (vendor bills auto-created; 1 paid, 1 part-paid),
     plus 2 open purchase orders
   * 3 baking runs (18,000 cookies) and 2 packing runs (1,200 bags), each QC
-    approved, plus 1 scheduled packing run; 3,600 baked cookies stay in stock
+    approved; 3,600 baked cookies stay in stock. A scheduled packing run of 480
+    bags needs 5,760 cookies, so it shows a "bake more cookies first" warning
+  * Each recipe has a default line (baking / packing) used automatically
   * 4 sales orders shipped and invoiced (1 paid, 1 part-paid), plus 2 open orders
   * ERP-only journals: owner capital, rent, oven power, freight, salaries
 
@@ -52,6 +54,11 @@ class Command(DemoCommand):
         rm = self._raw_materials()
         cookie, bag = self._products()
         bake_recipe, pack_recipe = self._recipes_and_boms(rm, cookie, bag)
+        # Predefined lines: orders for each product (incl. ones planned from a
+        # sales order) are assigned to these automatically.
+        for recipe, line in ((bake_recipe, baking), (pack_recipe, packing)):
+            recipe.default_line = line
+            recipe.save(update_fields=["default_line"])
         vendors = self._vendors(rm)
         customers = self._customers()
 
@@ -81,7 +88,9 @@ class Command(DemoCommand):
         # --- Manufacturing, level 2: pack cookies + Smarties into bags (finished good) -
         for days in (15, 12):
             self._produce(pack_recipe, 600, packing, plant, fg, days, qc=self.PACK_QC)
-        ProductionOrder.objects.create(recipe=pack_recipe, quantity=240, warehouse=fg, line=packing,
+        # Scheduled packing run larger than the cookies on hand (needs 5,760, 3,600 in
+        # stock): the Production screen warns to bake 2,160 more cookies first.
+        ProductionOrder.objects.create(recipe=pack_recipe, quantity=480, warehouse=fg, line=packing,
                                        status="scheduled", start_time=self._at(-2))
 
         # --- Sales: finished bags only -------------------------------------------------
