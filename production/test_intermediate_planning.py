@@ -38,8 +38,8 @@ class IntermediatePlanningTests(TestCase):
         self.assertFalse(check["can_produce"])
         [warning] = check["intermediate_warnings"]
         self.assertIn("Produce 600 more Baked Cookie first: 1 batch(es) of 1,000", warning)
-        # ...and that the flour to bake them is short too (12 kg needed, 5 on hand).
-        self.assertIn("To make it: Short 7 kg of Flour", warning)
+        # Only the intermediate is mentioned, not the flour needed to bake it.
+        self.assertNotIn("Flour", warning)
 
         ok = material_check(self.pack, 50)
         self.assertTrue(ok["can_produce"])

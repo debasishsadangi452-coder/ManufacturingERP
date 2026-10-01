@@ -28,13 +28,14 @@ def _amount_of(value, item):
     return f"{_qty(value)} {item.unit} of {item.name}"
 
 
-def material_check(recipe, quantity, _depth=0):
+def material_check(recipe, quantity):
     """Compare what `quantity` units of the recipe's product needs with stock.
 
     Returns {"rows": [...], "warnings": [...], "intermediate_warnings": [...],
     "can_produce": bool}. An intermediate that is short (e.g. baked cookies for
-    a packing run) gets a warning saying how many to make first and how many
-    batches that is, plus any raw-material shortage for making them.
+    a packing run) gets a short warning saying how many to make first and how
+    many batches that is; its own raw materials are checked when that batch is
+    planned.
     """
     rows, warnings, intermediate_warnings = [], [], []
     for ing, required in recipe.material_requirements(quantity):
@@ -66,10 +67,6 @@ def material_check(recipe, quantity, _depth=0):
                 message = (f"Needs {_amount_of(required, item)} (intermediate) but only "
                            f"{_qty(available)} in stock. Produce {_qty(short)} more {item.name} first: "
                            f"{plan['batches']} batch(es) of {_qty(sub_recipe.batch_size or 1)}.")
-                if _depth < 3:
-                    nested = material_check(sub_recipe, short, _depth + 1)
-                    for nested_warning in nested["warnings"]:
-                        message += f" To make it: {nested_warning}"
             intermediate_warnings.append(message)
             warnings.append(message)
         else:
