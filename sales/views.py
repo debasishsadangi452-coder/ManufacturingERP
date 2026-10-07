@@ -19,6 +19,13 @@ from core.utils import send_notification, log_activity
 from core.tenancy import CompanyScopedMixin
 
 
+def approved_finished_goods_available(item, company, order=None):
+    """Sellable FG for `order`: QA-approved stock (FG stock only grows on QA
+    acceptance) minus what is allocated to other customer orders."""
+    from fulfillment.services import available_for_order
+    return available_for_order(item, company, order)
+
+
 class CustomerViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
     queryset = Customer.objects.all()
@@ -44,17 +51,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             item = order_item.item
             requested_qty = order_item.quantity
             
-            # Check physical stock across all warehouses
-            physical_stock = Stock.objects.filter(item=item).aggregate(Sum('quantity'))['quantity__sum'] or 0
-            
-            # Check if we have enough "ready to sell" (approved) stock
-            approved_qty = ProductionOrder.objects.filter(
-                recipe__product=item,
-                status='completed',
-                qualitycheck__status='approved'
-            ).aggregate(Sum('quantity'))['quantity__sum'] or 0
-            
-            available_qty = min(physical_stock, approved_qty)
+            available_qty = approved_finished_goods_available(item, order.customer.company)
             
             if available_qty < requested_qty:
                 shortage = requested_qty - available_qty
@@ -123,23 +120,23 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         errors = []
         production_orders_created = []
 
+        from fulfillment.services import allocate
+        from production.execution import create_production_order, reserve_materials
+
         for order_item in order.salesorderitem_set.all():
             item = order_item.item
             qty_needed = order_item.quantity
 
-            # Check if we already have quality-approved stock for this item
-            physical_stock = Stock.objects.filter(item=item).aggregate(Sum('quantity'))['quantity__sum'] or 0
-            approved_qty = ProductionOrder.objects.filter(
-                recipe__product=item,
-                status='completed',
-                qualitycheck__status='approved'
-            ).aggregate(Sum('quantity'))['quantity__sum'] or 0
-            
-            available_sellable = min(physical_stock, approved_qty)
+            # MTO: QA-approved stock on hand is allocated to this order first so
+            # no other order can take it; only the remainder is produced.
+            available_sellable = approved_finished_goods_available(item, order.customer.company, order)
+            if available_sellable > 0:
+                allocate(order, request.user, [{
+                    "order_item_id": order_item.id,
+                    "quantity": min(available_sellable, qty_needed),
+                }])
 
             if available_sellable >= qty_needed:
-                # We have enough stock! No need to produce more.
-                # We could potentially reserve it here, but for now we just mark as confirmed.
                 send_notification(
                     "sales",
                     f"STOCK ALLOCATED: SO#{order.id} for {item.name} is covered by existing stock.",
@@ -157,56 +154,32 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 continue
 
             remaining_to_produce = qty_needed - available_sellable
-            # Ingredient quantities are per batch, so scale by whole batches.
-            requirements = recipe.material_requirements(remaining_to_produce)
 
-            # --- Step 2: Check raw material availability ---
-            # A shortage does NOT block the order. We record it, then still
-            # schedule the batch below — creating the ProductionOrder fires the
-            # signal that raises the inventory requests (one place, no dupes).
-            shortages = []
-            for ing, required_qty in requirements:
-                available = Stock.objects.filter(item=ing.item).aggregate(Sum('quantity'))['quantity__sum'] or 0
-                if available < required_qty:
-                    made_in_house = " - intermediate, produce it first" if ing.item.category == "intermediate" else ""
-                    shortages.append(f"{ing.item.name} (short {required_qty - available:.0f}{made_in_house})")
-
-            # --- Step 3: Reserve what IS on hand (never more than available) ---
-            for ing, required_qty in requirements:
-                stock_entry = Stock.objects.filter(item=ing.item).order_by('-quantity').first()
-                if not stock_entry:
-                    continue
-                to_reserve = min(required_qty, stock_entry.quantity)
-                if to_reserve <= 0:
-                    continue
-                try:
-                    decrease_stock(
-                        ing.item,
-                        stock_entry.warehouse,
-                        to_reserve,
-                        user=request.user,
-                        reference=f"Reserved for SO#{order.id} production"
-                    )
-                except ValueError as e:
-                    errors.append(str(e))
-
-            # --- Step 4: Create a Production Order (Only for the remaining) ---
-            # materials_reserved is only True when nothing was short; otherwise
-            # production must wait for procurement to top the material up.
-            fully_reserved = not shortages
-            from production.planning import default_line_for
-            prod_order = ProductionOrder.objects.create(
-                recipe=recipe,
-                quantity=remaining_to_produce,
-                warehouse=warehouse,
-                line=default_line_for(recipe),  # the product's predefined line, if any
-                status='scheduled',
-                sales_order=order,  # so Production's Requests tab can trace the batch back
-                materials_reserved=fully_reserved,
-            )
+            # --- Step 2: Create the production order (TB-01 conversion). ---
+            # The creation signal raises inventory requests for the true
+            # shortage; available material is then issued onto the ledger, so
+            # completion never deducts it a second time.
+            try:
+                prod_order, _checks = create_production_order(
+                    recipe, remaining_to_produce, warehouse, sales_order=order, status="scheduled",
+                )
+            except ValidationError as e:
+                detail = e.detail.get("conversion", e.detail) if isinstance(e.detail, dict) else e.detail
+                errors.append(f"'{item.name}': " + " ".join(str(d) for d in (detail if isinstance(detail, list) else [detail])))
+                continue
             production_orders_created.append(prod_order.id)
 
-            if shortages:
+            # --- Step 3: Issue what IS on hand (never more than available). ---
+            shortage_rows = reserve_materials(prod_order, request.user, f"Reserved for SO#{order.id} production")
+            fully_reserved = not shortage_rows
+            if not fully_reserved:
+                prod_order.status = "material_pending"
+                prod_order.save(update_fields=["status"])
+                shortages = [
+                    f"{it.name} (short {qty:.0f}"
+                    + (" - intermediate, produce it first" if it.category == "intermediate" else "") + ")"
+                    for it, qty in shortage_rows
+                ]
                 errors.append(
                     f"'{item.name}': awaiting materials — {', '.join(shortages)}. "
                     f"Inventory requests raised."
@@ -221,10 +194,10 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     module="inventory",
                 )
 
-            # --- Step 5: Notify Production ---
+            # --- Step 4: Notify Production ---
             send_notification(
                 "production",
-                f"NEW BATCH: Produce {remaining_to_produce} {item.unit} of {item.name} for SO#{order.id} (PO#{prod_order.id}). "
+                f"NEW BATCH: Produce {remaining_to_produce} {item.unit} of {item.name} for SO#{order.id} ({prod_order.order_number}). "
                 + ("Materials reserved." if fully_reserved else "AWAITING MATERIALS."),
                 related_id=prod_order.id,
                 related_type="production_order",
@@ -334,7 +307,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 "id": item.id,
                 "name": item.name,
                 "total_stock": physical_stock,
-                "available_for_sales": physical_stock,
+                "available_for_sales": approved_finished_goods_available(item, company),
                 "unit": item.unit
             })
             
@@ -373,10 +346,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             if qty_needed <= 0:
                 continue
 
-            # Available = physical finished-goods stock in this company's warehouses
-            available = Stock.objects.filter(
-                item=item, warehouse__company=company
-            ).aggregate(Sum('quantity'))['quantity__sum'] or 0
+            available = approved_finished_goods_available(item, company, order)
 
             if available < qty_needed:
                 errors.append(
@@ -408,6 +378,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     )
                     order_item.shipped_quantity += qty_needed
                     order_item.save()
+                    from fulfillment.services import consume_allocations
+                    consume_allocations(order_item, qty_needed)
                     shipped_lines.append({"item_id": order_item.item_id, "quantity": qty_needed})
                 except ValueError as e:
                     return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -490,16 +462,17 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Check available stock
-            physical_stock = Stock.objects.filter(item=order_item.item).aggregate(Sum('quantity'))['quantity__sum'] or 0
-            if physical_stock < ship_qty:
+            available = approved_finished_goods_available(order_item.item, order.customer.company, order)
+            if available < ship_qty:
                 return Response(
-                    {"error": f"Insufficient stock for '{order_item.item.name}': need {ship_qty}, have {physical_stock}."},
+                    {"error": f"Insufficient QA-approved stock for '{order_item.item.name}': need {ship_qty}, have {available}."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
             # Deduct from inventory
-            stock_entry = Stock.objects.filter(item=order_item.item).order_by('-quantity').first()
+            stock_entry = Stock.objects.filter(
+                item=order_item.item, warehouse__company=order.customer.company
+            ).order_by('-quantity').first()
             if stock_entry:
                 try:
                     decrease_stock(
@@ -514,6 +487,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
                 order_item.shipped_quantity += ship_qty
                 order_item.save()
+                from fulfillment.services import consume_allocations
+                consume_allocations(order_item, ship_qty)
                 shipped_lines.append({"item_id": order_item.item_id, "quantity": ship_qty})
 
             shipped_summary.append(f"{ship_qty} {order_item.item.unit} of {order_item.item.name}")
@@ -573,18 +548,33 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def generate_invoice(self, request, pk=None):
         """
-        Create an Invoice from this sales order (lines priced from item
-        selling prices). The invoice is mirrored to QuickBooks automatically.
+        Create an Invoice from this sales order using the order line agreed price.
+        The invoice is mirrored to QuickBooks automatically.
         Optional payload: { "due_date": "YYYY-MM-DD" }
         """
         order = self.get_object()
 
         if order.status == 'cancelled':
             return Response({"error": "Cannot invoice a cancelled order."}, status=status.HTTP_400_BAD_REQUEST)
-        existing = order.invoices.exclude(status='cancelled').first()
+        # Invoices whose lines are not tied to order lines bill the whole order.
+        existing = order.invoices.exclude(status='cancelled').exclude(
+            lines__sales_order_item__isnull=False
+        ).first()
         if existing:
             return Response(
                 {"error": f"Invoice INV-{existing.id} already exists for this order."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        from fulfillment.services import invoiced_quantity
+        billable = {}
+        for order_item in order.salesorderitem_set.all():
+            basis = order_item.shipped_quantity or order_item.quantity
+            remaining = basis - invoiced_quantity(order_item)
+            if remaining > 0:
+                billable[order_item.id] = remaining
+        if not billable:
+            return Response(
+                {"error": "Everything on this order has already been invoiced."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -605,13 +595,19 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         )
         total = Decimal("0")
         for order_item in order.salesorderitem_set.select_related('item'):
-            unit_price = order_item.item.selling_price or Decimal("0")
-            amount = unit_price * Decimal(str(order_item.quantity))
+            if order_item.id not in billable:
+                continue
+            # The agreed order price; the item master price only for legacy
+            # lines entered before prices were captured on the order.
+            unit_price = order_item.unit_price or order_item.item.selling_price or Decimal("0")
+            invoice_qty = billable[order_item.id]
+            amount = unit_price * Decimal(str(invoice_qty))
             InvoiceLine.objects.create(
                 invoice=invoice,
+                sales_order_item=order_item,
                 item=order_item.item,
                 description=order_item.item.name,
-                quantity=order_item.quantity,
+                quantity=invoice_qty,
                 unit_price=unit_price,
                 amount=amount,
             )
@@ -713,26 +709,42 @@ class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
 
+        order = serializer.validated_data["sales_order"]
+        company = order.customer.company
+        # Only the unshipped balance leaves, and only from QA-approved stock
+        # that is free or allocated to this order (Track B QA gate).
+        to_ship = [
+            (oi, oi.quantity - oi.shipped_quantity)
+            for oi in order.salesorderitem_set.all() if oi.quantity - oi.shipped_quantity > 0
+        ]
+        for oi, qty in to_ship:
+            available = approved_finished_goods_available(oi.item, company, order)
+            if available < qty:
+                raise ValidationError({
+                    "error": f"Insufficient QA-approved stock for '{oi.item.name}': need {qty}, have {available}."
+                })
         shipment = serializer.save()
-
-        order = shipment.sales_order
 
         # Deduct finished goods stock on shipment
         from inventory.lots import ship_lots_fifo
-        for item in order.salesorderitem_set.all():
+        from fulfillment.services import consume_allocations
+        for item, qty in to_ship:
             decrease_stock(
                 item.item,
                 shipment.warehouse,
-                item.quantity,
+                qty,
                 user=self.request.user,
                 reference=f"Shipment SO#{order.id}"
             )
             # 🔗 SQF traceability: record which finished lots left on this
             # shipment (FIFO), closing the receive→produce→QC→ship chain.
             ship_lots_fifo(
-                shipment, item.item, item.quantity,
+                shipment, item.item, qty,
                 company=getattr(item.item, "company", None),
             )
+            item.shipped_quantity += qty
+            item.save(update_fields=["shipped_quantity"])
+            consume_allocations(item, qty)
 
         # Update order status
         order.status = "shipped"
@@ -740,8 +752,8 @@ class ShipmentViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
         from accounting.auto_posting import queue_auto_post
         queue_auto_post(
-            "sales_shipment", order.customer.company, order.id, self.request.user,
-            {"lines": [{"item_id": i.item_id, "quantity": i.quantity} for i in order.salesorderitem_set.all()]},
+            "sales_shipment", company, order.id, self.request.user,
+            {"lines": [{"item_id": i.item_id, "quantity": q} for i, q in to_ship]},
         )
 
 

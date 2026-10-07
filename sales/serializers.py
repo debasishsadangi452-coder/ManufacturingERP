@@ -12,7 +12,7 @@ class SalesOrderItemSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = SalesOrderItem
-        fields = ["id", "item", "item_name", "quantity", "shipped_quantity"]
+        fields = ["id", "item", "item_name", "quantity", "unit_price", "shipped_quantity"]
 
 class SalesOrderSerializer(serializers.ModelSerializer):
     # Read-only nested items for display
@@ -82,12 +82,24 @@ class SalesOrderSerializer(serializers.ModelSerializer):
                     raise drf_serializers.ValidationError(
                         {"items": f"Only finished goods can be sold. '{item.name}' is a raw material."}
                     )
+                # The agreed price for this order; the catalog price is only
+                # the default. Invoices always bill this captured price.
+                agreed = item_data.get('unit_price')
+                try:
+                    agreed = Decimal(str(agreed)) if agreed not in (None, "") else (item.selling_price or Decimal("0"))
+                except Exception:
+                    order.delete()
+                    raise drf_serializers.ValidationError({"items": f"Invalid unit price for '{item.name}'."})
+                if agreed < 0:
+                    order.delete()
+                    raise drf_serializers.ValidationError({"items": f"Unit price for '{item.name}' cannot be negative."})
                 so_item = SalesOrderItem.objects.create(
                     sales_order=order,
                     item=item,
-                    quantity=float(quantity)
+                    quantity=float(quantity),
+                    unit_price=agreed,
                 )
-                total += (so_item.item.selling_price or Decimal("0")) * Decimal(str(so_item.quantity))
+                total += so_item.unit_price * Decimal(str(so_item.quantity))
         # Price the order from item selling prices unless a total was supplied
         if not order.total_amount and total:
             order.total_amount = total

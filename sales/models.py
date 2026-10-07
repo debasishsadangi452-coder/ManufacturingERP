@@ -69,7 +69,13 @@ class SalesOrderItem(models.Model):
     sales_order = models.ForeignKey(SalesOrder, on_delete=models.CASCADE)
     item = models.ForeignKey(Item, on_delete=models.CASCADE)
     quantity = models.FloatField()
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     shipped_quantity = models.FloatField(default=0.0)
+
+    def save(self, *args, **kwargs):
+        if self.item_id and not self.unit_price:
+            self.unit_price = self.item.selling_price or 0
+        super().save(*args, **kwargs)
 
 # -------------------------------------------------
 # 💰 Invoice & Payments (Accounts Receivable)
@@ -118,6 +124,11 @@ class Invoice(models.Model):
 
 class InvoiceLine(models.Model):
     invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="lines")
+    # The order line billed, so invoiced quantity can never exceed what was
+    # dispatched (Track B). Null on manual / legacy invoices.
+    sales_order_item = models.ForeignKey(
+        "sales.SalesOrderItem", null=True, blank=True, on_delete=models.SET_NULL, related_name="invoice_lines"
+    )
     item = models.ForeignKey(Item, on_delete=models.CASCADE)
     description = models.CharField(max_length=255, blank=True)
     quantity = models.FloatField()

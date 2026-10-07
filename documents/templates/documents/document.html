@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ doc.title }} {{ doc.number }}</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#5b6470; --line:#d5d9de; --head:#f2f4f6; }
+  * { box-sizing: border-box; }
+  body { font: 13px/1.45 "Segoe UI", Arial, sans-serif; color: var(--ink); background: #fff; margin: 0; padding: 24px; }
+  .sheet { max-width: 900px; margin: 0 auto; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2px solid var(--ink); padding-bottom: 12px; margin-bottom: 16px; }
+  .company { font-size: 18px; font-weight: 700; }
+  .doc-title { text-align: right; }
+  .doc-title h1 { font-size: 20px; margin: 0; letter-spacing: .5px; text-transform: uppercase; }
+  .doc-title .number { font-size: 15px; font-weight: 600; margin-top: 2px; }
+  .doc-title .status { display: inline-block; margin-top: 6px; padding: 2px 8px; border: 1px solid var(--ink); border-radius: 3px; font-size: 11px; text-transform: uppercase; }
+  .meta { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px 16px; margin-bottom: 16px; }
+  .meta div { border-bottom: 1px dotted var(--line); padding: 3px 0; }
+  .meta span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .3px; }
+  h2 { font-size: 14px; margin: 18px 0 6px; text-transform: uppercase; letter-spacing: .4px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+  th, td { border: 1px solid var(--line); padding: 5px 7px; text-align: left; vertical-align: top; }
+  th { background: var(--head); font-size: 11px; text-transform: uppercase; letter-spacing: .3px; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  tfoot td { font-weight: 700; }
+  .note { color: var(--muted); margin: 8px 0; white-space: pre-line; }
+  .totals { margin-left: auto; width: 320px; }
+  .totals td { border: none; border-bottom: 1px solid var(--line); }
+  .signatures { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 24px; margin-top: 40px; }
+  .signatures div { border-top: 1px solid var(--ink); padding-top: 4px; font-size: 12px; color: var(--muted); }
+  footer { margin-top: 28px; border-top: 1px solid var(--line); padding-top: 8px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+  .toolbar { max-width: 900px; margin: 0 auto 12px; text-align: right; }
+  .toolbar button { font: inherit; padding: 6px 14px; cursor: pointer; }
+  @media print { body { padding: 0; } .toolbar { display: none; } @page { margin: 14mm; } }
+</style>
+</head>
+<body>
+<div class="toolbar"><button onclick="window.print()">Print / Save as PDF</button></div>
+<div class="sheet">
+  <header>
+    <div>
+      <div class="company">{{ doc.company }}</div>
+      {% if doc.subtitle %}<div class="note">{{ doc.subtitle }}</div>{% endif %}
+    </div>
+    <div class="doc-title">
+      <h1>{{ doc.title }}</h1>
+      <div class="number">{{ doc.number }}</div>
+      {% if doc.status %}<div class="status">{{ doc.status }}</div>{% endif %}
+    </div>
+  </header>
+
+  {% if doc.meta %}
+  <section class="meta">
+    {% for label, value in doc.meta %}<div><span>{{ label }}</span>{{ value|default:"—" }}</div>{% endfor %}
+  </section>
+  {% endif %}
+
+  {% for table in doc.tables %}
+    <h2>{{ table.title }}</h2>
+    <table>
+      <thead><tr>{% for col in table.columns %}<th{% if col.num %} class="num"{% endif %}>{{ col.label }}</th>{% endfor %}</tr></thead>
+      <tbody>
+        {% for row in table.rows %}
+          <tr>{% for cell in row %}<td{% if cell.num %} class="num"{% endif %}>{{ cell.value|default_if_none:"" }}</td>{% endfor %}</tr>
+        {% empty %}
+          <tr><td colspan="{{ table.columns|length }}">No lines.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+
+  {% if doc.totals %}
+  <table class="totals">
+    {% for label, value in doc.totals %}<tr><td>{{ label }}</td><td class="num">{{ value }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+
+  {% for note in doc.notes %}<p class="note">{{ note }}</p>{% endfor %}
+
+  {% if doc.signatures %}
+  <section class="signatures">
+    {% for s in doc.signatures %}<div>{{ s }}</div>{% endfor %}
+  </section>
+  {% endif %}
+
+  <footer>
+    <span>{{ doc.references }}</span>
+    <span>Printed {{ printed_at|date:"Y-m-d H:i" }}</span>
+  </footer>
+</div>
+</body>
+</html>

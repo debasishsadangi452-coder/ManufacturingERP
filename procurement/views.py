@@ -484,18 +484,41 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         receipt = serializer.save()
         items_received = []
         from inventory.lots import create_raw_lot
+        from production.models import ManufacturingSettings
+        # Track B (TB-04): with incoming QC on, received material is held as a
+        # QA-pending lot and only becomes usable stock when quality accepts it.
+        hold_for_qc = ManufacturingSettings.for_company(po.vendor.company).incoming_qc_required
         for poi in po.items.all():
-            increase_stock(
-                poi.item, receipt.warehouse, poi.quantity,
-                user=self.request.user, reference=f"GRN PO#{po.id}",
-            )
+            if not hold_for_qc:
+                increase_stock(
+                    poi.item, receipt.warehouse, poi.quantity,
+                    user=self.request.user, reference=f"GRN PO#{po.id}",
+                )
             # 🔗 SQF traceability: every received line becomes a raw lot tied to
             # this goods receipt (and thus the vendor delivery).
-            create_raw_lot(
+            lot = create_raw_lot(
                 poi.item, receipt.warehouse, poi.quantity, receipt,
                 company=getattr(poi.item, "company", None),
             )
+            if hold_for_qc:
+                from quality.models import QualityCheck
+                lot.qa_status, lot.remaining_quantity = "pending", 0
+                lot.save(update_fields=["qa_status", "remaining_quantity"])
+                QualityCheck.objects.create(
+                    inspection_type="incoming", goods_receipt=receipt, vendor=po.vendor,
+                    item=poi.item, warehouse=receipt.warehouse, lot=lot,
+                    received_quantity=poi.quantity, status="pending",
+                    test_type="Incoming Inspection",
+                )
             items_received.append(f"{poi.quantity} x {poi.item.name}")
+        if hold_for_qc:
+            from core.utils import send_notification
+            send_notification(
+                "quality",
+                f"Goods received for PO #{po.id} ({', '.join(items_received)}) await incoming inspection.",
+                related_id=receipt.id, related_type="GoodsReceipt",
+                company=po.vendor.company, module="quality",
+            )
         po.status = "received"
         po.save()
         from finance.services import record_procurement_cost

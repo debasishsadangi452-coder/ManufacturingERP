@@ -31,6 +31,9 @@ urlpatterns = [
     path('api/accounting/', include('accounting.urls')),
     path('api/ai/', include('ai_assistant.urls')),
     path('api/quickbooks/', include('quickbooks.urls')),
+    path('api/fulfillment/', include('fulfillment.urls')),
+    path('api/insights/', include('insights.urls')),
+    path('api/documents/', include('documents.urls')),
 
     # ⭐ REQUIRED FOR SWAGGER
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),

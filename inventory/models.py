@@ -161,6 +161,25 @@ class Batch(models.Model):
     remaining_quantity = models.FloatField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, null=True)
 
+    # QA disposition (Track B). Only "approved" and "not_required" lots are
+    # usable: they are the only ones FIFO consumption and shipping draw from.
+    # Rejected / quarantined / rework portions of a lot are split into child
+    # lots that point back at the original through `parent`.
+    QA_STATUS_CHOICES = [
+        ("not_required", "Not Required"),
+        ("pending", "QA Pending"),
+        ("approved", "QA Approved"),
+        ("rejected", "QA Rejected"),
+        ("quarantine", "Quarantine"),
+        ("rework", "Rework"),
+        ("scrapped", "Scrapped"),
+    ]
+    USABLE_QA_STATUSES = ("not_required", "approved")
+    qa_status = models.CharField(max_length=20, choices=QA_STATUS_CHOICES, default="not_required", db_index=True)
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="split_lots"
+    )
+
     def __str__(self):
         return f"Lot {self.batch_number} · {self.item.name}"
 

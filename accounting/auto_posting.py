@@ -10,6 +10,7 @@ move when goods or money move:
   vendor_bill         (bill from PO)         Dr 2050 GRNI (or 1210)    / Cr 2010 Accounts Payable
   production_completed                       via Manufacturing-to-Accounting (#15): RM -> WIP -> FG
   sales_shipment      (SO fulfilled/shipped) Dr 5050 COGS              / Cr 1230 Finished Goods
+  dispatch_shipment   (dispatch confirmed)   Dr 5050 COGS per dispatch / Cr 1230 Finished Goods
                                              (bought-in items without a recipe: Cr 1210)
   sales_invoice       (invoice from SO)      Dr 1100 AR                / Cr 4010 Sales
   customer_payment                           Dr 1010 Bank              / Cr 1100 AR
@@ -207,7 +208,19 @@ def _post_production(company, order_id, user, payload):
     required, reason, _ = determine_production_order_accounting_requirement(order, company)
     if not required:
         raise SkipPosting(reason)
-    entry, _created = post_manufacturing_accounting(order.id, company, user=user)
+    labor_override = overhead_override = None
+    try:
+        from production.costing import gl_cost_overrides
+        labor_override, overhead_override = gl_cost_overrides(order)
+    except Exception:
+        logger.exception("Costing engine unavailable for production #%s; using policy rates", order.id)
+    entry, _created = post_manufacturing_accounting(
+        order.id, company, user=user,
+        completed_qty=payload.get("completed_qty"),
+        scrap_qty=payload.get("scrap_qty"),
+        labor_cost_override=labor_override,
+        overhead_cost_override=overhead_override,
+    )
     return entry
 
 
@@ -246,6 +259,114 @@ def _post_sales_shipment(company, order_id, user, payload):
         source_module="sales.shipment",
         source_id=order.id,
         lines=lines,
+    )
+
+
+def _post_dispatch(company, dispatch_id, user, payload):
+    """COGS for one confirmed dispatch (partial dispatches each post their own)."""
+    from fulfillment.models import Dispatch
+
+    dispatch = Dispatch.objects.select_related("sales_order__customer").filter(
+        pk=dispatch_id, company=company
+    ).first()
+    if not dispatch:
+        raise ValidationError(f"Dispatch #{dispatch_id} not found.")
+    _skip_if_posted(company, "fulfillment.dispatch", dispatch.id)
+    _skip_if_movements_posted(company, "dispatch", dispatch.id)
+
+    credits = {}
+    for line in dispatch.lines.select_related("item"):
+        qty = Decimal(str(line.quantity or 0))
+        if qty <= 0:
+            continue
+        unit_cost, inventory_code = standard_unit_cost(line.item)
+        amount = _money(unit_cost * qty)
+        if amount > 0:
+            credits[inventory_code] = credits.get(inventory_code, Decimal("0")) + amount
+    total = sum(credits.values(), Decimal("0"))
+    if total <= 0:
+        raise SkipPosting(f"{dispatch.dispatch_number} items have no standard cost; nothing to post.")
+    so = dispatch.sales_order
+    lines = [(_account(company, "5050"), total, 0, f"Cost of goods dispatched - {dispatch.dispatch_number} / SO-{so.id}")]
+    for code, amount in sorted(credits.items()):
+        lines.append((_account(company, code), 0, amount, f"Inventory relieved - {dispatch.dispatch_number}"))
+    return _create_and_post(
+        company, user,
+        date=timezone.localdate(),
+        reference=dispatch.dispatch_number,
+        description=f"Cost of goods sold for {dispatch.dispatch_number} (SO-{so.id}, {so.customer.name})",
+        source_module="fulfillment.dispatch",
+        source_id=dispatch.id,
+        lines=lines,
+    )
+
+
+def _post_scrap(company, scrap_id, user, payload):
+    """Write off scrap that the manufacturing entry does not already include."""
+    from accounting.manufacturing_accounting import resolve_manufacturing_scrap_account
+    from production.models import ScrapRecord
+
+    record = ScrapRecord.objects.select_related("item", "production_order").filter(
+        pk=scrap_id, production_order__recipe__product__company=company
+    ).first()
+    if not record:
+        raise ValidationError(f"Scrap record #{scrap_id} not found.")
+    _skip_if_posted(company, "production.scrap", record.id)
+    if record.gl_treatment == "covered":
+        raise SkipPosting("Included in the production order's manufacturing entry.")
+    amount = _money(record.cost_impact)
+    if amount <= 0:
+        raise SkipPosting("Scrap has no cost.")
+    if record.gl_treatment == "raw_material":
+        _cost, credit_code = standard_unit_cost(record.item)
+    else:
+        credit_code = "1230"
+    order = record.production_order.order_number or f"#{record.production_order_id}"
+    return _create_and_post(
+        company, user,
+        date=timezone.localdate(),
+        reference=f"SCRAP-{record.id}",
+        description=f"Scrap write-off: {record.quantity:g} {record.item.name} on {order} ({record.reason or record.source})",
+        source_module="production.scrap",
+        source_id=record.id,
+        lines=[
+            (resolve_manufacturing_scrap_account(company), amount, 0, f"Scrap - {record.item.name}"),
+            (_account(company, credit_code), 0, amount, f"Inventory written off - {order}"),
+        ],
+    )
+
+
+def _post_incoming_rejection(company, source_id, user, payload):
+    """Rejected incoming material: Dr GRNI (a claim against the vendor until the
+    debit note / bill adjustment) / Cr Raw Materials, at the PO price."""
+    from procurement.models import GoodsReceipt, PurchaseOrderItem
+
+    module = payload.get("source_module", "quality.incoming_rejection")
+    _skip_if_posted(company, module, source_id)
+    receipt = GoodsReceipt.objects.select_related("purchase_order__vendor").filter(
+        pk=payload.get("receipt_id"), purchase_order__vendor__company=company
+    ).first()
+    if not receipt:
+        raise ValidationError("Goods receipt not found.")
+    if not JournalEntry.objects.filter(company=company, source_module="procurement.receipt",
+                                       source_id=receipt.id, status="posted").exists():
+        raise SkipPosting("The goods receipt was not posted, so there is no inventory value to reverse.")
+    line = PurchaseOrderItem.objects.filter(purchase_order=receipt.purchase_order, item_id=payload.get("item_id")).first()
+    amount = _money((line.unit_price if line else 0) * Decimal(str(payload.get("quantity") or 0)))
+    if amount <= 0:
+        raise SkipPosting("Rejected material has no PO price.")
+    po = receipt.purchase_order
+    return _create_and_post(
+        company, user,
+        date=timezone.localdate(),
+        reference=f"REJ-GRN-{receipt.id}",
+        description=f"Incoming material rejected by QA: {payload.get('quantity')} of item #{payload.get('item_id')} on PO-{po.id} ({po.vendor.name})",
+        source_module=module,
+        source_id=source_id,
+        lines=[
+            (_account(company, "2050"), amount, 0, f"Claim against {po.vendor.name} - PO-{po.id}"),
+            (_account(company, "1210"), 0, amount, f"Rejected material out of inventory - GRN-{receipt.id}"),
+        ],
     )
 
 
@@ -295,6 +416,9 @@ HANDLERS = {
     "vendor_bill": _post_vendor_bill,
     "production_completed": _post_production,
     "sales_shipment": _post_sales_shipment,
+    "dispatch_shipment": _post_dispatch,
+    "scrap_write_off": _post_scrap,
+    "incoming_rejection": _post_incoming_rejection,
     "sales_invoice": _post_sales_invoice,
     "customer_payment": _post_customer_payment,
 }
@@ -349,6 +473,7 @@ def _create_and_post(company, user, *, date, reference, description, source_modu
 MOVEMENT_EVENT_PATTERNS = {
     "grn": re.compile(r"^GRN PO#(\d+)\b", re.I),
     "shipment": re.compile(r"^(?:Fulfilled|Partial fulfillment|Shipment) SO#(\d+)\b", re.I),
+    "dispatch": re.compile(r"^Dispatch #(\d+)\b", re.I),
 }
 
 
@@ -367,7 +492,8 @@ def _skip_if_movements_posted(company, kind, document_id):
     from inventory.models import StockMovement
 
     candidates = StockMovement.objects.filter(
-        item__company=company, reference__icontains="PO#" if kind == "grn" else "SO#"
+        item__company=company,
+        reference__icontains={"grn": "PO#", "dispatch": "Dispatch #"}.get(kind, "SO#"),
     ).values_list("id", "reference")
     movement_ids = [mid for mid, ref in candidates if movement_event(ref) == (kind, document_id)]
     existing = JournalEntry.objects.filter(
@@ -391,6 +517,10 @@ def auto_posted_event_for_movement(movement, company):
     if kind == "shipment":
         return JournalEntry.objects.filter(
             company=company, source_module="sales.shipment", source_id=document_id, status="posted"
+        ).first()
+    if kind == "dispatch":
+        return JournalEntry.objects.filter(
+            company=company, source_module="fulfillment.dispatch", source_id=document_id, status="posted"
         ).first()
     return None
 

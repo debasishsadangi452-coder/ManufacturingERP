@@ -10,6 +10,7 @@ from rest_framework import status
 
 from procurement.models import PurchaseOrder, PurchaseOrderItem
 from production.models import ProductionOrder
+from quality.models import QualityCheck
 from sales.models import SalesOrder, SalesOrderItem
 
 from .models import AccountingSettings
@@ -33,6 +34,8 @@ class ReportsReflectErpActivityTests(AutoPostingTestBase):
         # Make 20 bottles (10 kg sugar = 20.00), sell them at 5.00, collect 40.00
         order = ProductionOrder.objects.create(recipe=self.recipe, quantity=20, warehouse=self.warehouse)
         self.call("post", f"/api/production/production-orders/{order.id}/complete/")
+        qc = QualityCheck.objects.get(production_order=order)
+        self.call("post", f"/api/quality/quality-checks/{qc.id}/approve/")
         so = SalesOrder.objects.create(customer=self.customer, status="confirmed")
         SalesOrderItem.objects.create(sales_order=so, item=self.soda, quantity=20)
         self.call("post", f"/api/sales/sales-orders/{so.id}/fulfill_order/")

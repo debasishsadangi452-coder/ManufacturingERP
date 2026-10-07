@@ -9,6 +9,7 @@ from accounts.models import Company, User
 from inventory.models import Item, Stock, Warehouse
 from procurement.models import PurchaseOrder, PurchaseOrderItem, Vendor
 from production.models import ProductionOrder, Recipe, RecipeIngredient
+from quality.models import QualityCheck
 from sales.models import Customer, SalesOrder, SalesOrderItem
 
 from .auto_posting import execute_auto_post
@@ -89,6 +90,11 @@ class ProductionAndSalesCycleTests(AutoPostingTestBase):
         order = ProductionOrder.objects.create(recipe=self.recipe, quantity=20, warehouse=self.warehouse)
         with self.captureOnCommitCallbacks(execute=True):
             res = self.client.post(f"/api/production/production-orders/{order.id}/complete/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertFalse(JournalEntry.objects.filter(company=self.company, source_module="manufacturing").exists())
+        qc = QualityCheck.objects.get(production_order=order)
+        with self.captureOnCommitCallbacks(execute=True):
+            res = self.client.post(f"/api/quality/quality-checks/{qc.id}/approve/")
         self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
         # Posted through Manufacturing-to-Accounting (#15): raw materials out,
         # finished goods in, WIP cleared.

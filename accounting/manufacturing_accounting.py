@@ -480,7 +480,10 @@ def determine_production_order_accounting_requirement(order, company):
     if not order.recipe or not order.recipe.product:
         return False, "Production order has no valid recipe or finished good product.", "missing_recipe"
 
-    if order.status not in ["running", "completed"]:
+    if getattr(order, "rework_of_id", None):
+        return False, "Rework orders reuse the material already posted on the original order.", "rework"
+
+    if order.status not in ["running", "partially_completed", "completed", "closed"]:
         return False, f"Production order status '{order.status}' is not eligible for accounting posting (must be running or completed).", "ineligible_status"
 
     return True, f"Production order #{order.id} ({order.recipe.product.name}) is eligible for manufacturing accounting.", "production_order"

@@ -52,8 +52,11 @@ def create_finished_lot(item, warehouse, quantity, production_order, company=Non
 
 
 def _available_lots(item, company=None):
-    """Lots of `item` with stock left, oldest first (FIFO)."""
-    qs = Batch.objects.filter(item=item, remaining_quantity__gt=0)
+    """Usable lots of `item` with stock left, oldest first (FIFO). QA-pending,
+    rejected, quarantined and rework lots are never drawn from."""
+    qs = Batch.objects.filter(
+        item=item, remaining_quantity__gt=0, qa_status__in=Batch.USABLE_QA_STATUSES
+    )
     if company is not None:
         qs = qs.filter(company=company)
     return qs.order_by("created_at", "id")

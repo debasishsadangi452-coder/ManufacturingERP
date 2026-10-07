@@ -9,6 +9,8 @@ from accounts.models import Company
 from inventory.models import Stock, StockMovement
 from inventory.serializers import StockMovementSerializer
 from procurement.models import Bill, PurchaseOrder, PurchaseOrderItem
+from production.models import ProductionOrder
+from quality.models import QualityCheck
 from sales.models import SalesOrder, SalesOrderItem
 
 from .inventory_accounting import determine_movement_accounting_requirement, post_inventory_movement_to_accounting
@@ -51,6 +53,10 @@ class SubledgerReconciliationTests(AutoPostingTestBase):
 
     def test_auto_posted_shipment_is_not_posted_again_but_reservations_still_are(self):
         Stock.objects.create(item=self.soda, warehouse=self.warehouse, quantity=50)
+        production = ProductionOrder.objects.create(
+            recipe=self.recipe, quantity=50, warehouse=self.warehouse, status="completed"
+        )
+        QualityCheck.objects.create(production_order=production, status="approved")
         Stock.objects.create(item=self.sugar, warehouse=self.warehouse, quantity=50)
         so = SalesOrder.objects.create(customer=self.customer, status="confirmed")
         SalesOrderItem.objects.create(sales_order=so, item=self.soda, quantity=10)

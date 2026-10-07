@@ -122,6 +122,15 @@ def on_inventory_request_change(sender, instance, created, **kwargs):
 
     company = _company_of_item(instance.item)
 
+    # Track B: a Material Pending order becomes Ready once its material is in.
+    if instance.status == 'supplied' and instance.production_order_id:
+        try:
+            from production.execution import refresh_material_status
+            refresh_material_status(instance.production_order)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception('Material status refresh failed for request #%s', instance.pk)
+
     # A goods receipt releases every request on the PO at once. Notifying per
     # request would give production one message per material; the receipt
     # emits a single summary per production order instead.
@@ -244,6 +253,9 @@ def on_quality_check_change(sender, instance, created, **kwargs):
     _push('QualityCheck', instance, 'created' if created else 'updated', payload, QUALITY_ROLES)
 
     order = instance.production_order
+    if order is None:
+        # Incoming raw-material inspection: notified by quality.services.
+        return
     company = _company_of_production_order(order)
     # Set when this batch was raised to fill a customer order, null for
     # make-to-stock. It decides whether sales has anyone to notify.

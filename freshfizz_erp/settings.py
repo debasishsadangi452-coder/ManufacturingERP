@@ -141,6 +141,10 @@ INSTALLED_APPS = [
     'django_filters',
     'ai_assistant',
     'quickbooks',
+    # Track B
+    'fulfillment',
+    'insights',
+    'documents',
 ]
 
 REST_FRAMEWORK = {
