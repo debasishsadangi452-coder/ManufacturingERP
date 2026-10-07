@@ -49,8 +49,78 @@ class VendorPriceList(models.Model):
         return f"{self.vendor.name} → {self.item.name} @ {self.currency} {self.unit_price}"
 
 
+class PurchaseRequisition(models.Model):
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("submitted", "Submitted"),
+        ("approved", "Approved"),
+        ("converted", "Converted"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    requisition_number = models.CharField(max_length=64, unique=True, db_index=True)
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="purchase_requisitions"
+    )
+    warehouse = models.ForeignKey(
+        Warehouse, null=True, blank=True, on_delete=models.SET_NULL, related_name="purchase_requisitions"
+    )
+    production_plan = models.ForeignKey(
+        "production.ProductionPlan", null=True, blank=True, on_delete=models.SET_NULL, related_name="purchase_requisitions"
+    )
+    sales_order = models.ForeignKey(
+        "sales.SalesOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="purchase_requisitions"
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
+    notes = models.TextField(blank=True, default="")
+    created_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        if not self.requisition_number:
+            import time
+            plan_id = self.production_plan_id or "0"
+            ts = int(time.time() * 1000) % 1000000
+            candidate = f"PR-{plan_id}-{ts}"
+            while PurchaseRequisition.objects.filter(requisition_number=candidate).exists():
+                ts += 1
+                candidate = f"PR-{plan_id}-{ts}"
+            self.requisition_number = candidate
+        if self.production_plan and not self.sales_order_id and getattr(self.production_plan, 'sales_order_id', None):
+            self.sales_order = self.production_plan.sales_order
+        if self.production_plan and not self.company_id and getattr(self.production_plan, 'company_id', None):
+            self.company = self.production_plan.company
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.requisition_number} ({self.get_status_display()})"
+
+
+class PurchaseRequisitionItem(models.Model):
+    requisition = models.ForeignKey(PurchaseRequisition, on_delete=models.CASCADE, related_name="items")
+    item = models.ForeignKey(Item, on_delete=models.CASCADE)
+    required_quantity = models.FloatField()
+    available_quantity = models.FloatField(default=0.0)
+    shortage_quantity = models.FloatField()
+    uom = models.CharField(max_length=20, blank=True, default="")
+    estimated_unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
+    notes = models.TextField(blank=True, default="")
+
+    def __str__(self):
+        return f"{self.item.name} - Required: {self.required_quantity}, Shortage: {self.shortage_quantity} {self.uom}"
+
+
 class PurchaseOrder(models.Model):
     vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE)
+    requisition = models.ForeignKey(
+        PurchaseRequisition, null=True, blank=True, on_delete=models.SET_NULL, related_name="purchase_orders"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     expected_delivery = models.DateField(null=True, blank=True)
     priority = models.CharField(max_length=20, default="normal")

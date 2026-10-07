@@ -6,6 +6,7 @@ from .views import (
     RecipeIngredientViewSet,
     ProductionOrderViewSet,
     ProductionLineViewSet,
+    ProductionPlanViewSet,
 )
 
 router = DefaultRouter()
@@ -13,7 +14,10 @@ router = DefaultRouter()
 router.register(r'recipes', RecipeViewSet)
 router.register(r'recipe-ingredients', RecipeIngredientViewSet)
 router.register(r'production-orders', ProductionOrderViewSet)
+router.register(r'production-plans', ProductionPlanViewSet)
+router.register(r'plans', ProductionPlanViewSet, basename='plans-short')
 router.register(r'lines', ProductionLineViewSet)
+
 
 urlpatterns = router.urls
 urlpatterns += [

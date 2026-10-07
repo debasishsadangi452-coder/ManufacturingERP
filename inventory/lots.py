@@ -10,7 +10,7 @@ Genealogy queries walk these links both directions so a shipped case traces
 back to its production run and the raw lots (and vendor deliveries) behind it.
 """
 
-from django.db import transaction
+from django.db import transaction, models
 from django.utils import timezone
 
 from .models import Batch, LotConsumption
@@ -21,8 +21,8 @@ def _make_lot_code(prefix, item, when=None):
     return f"{prefix}-{item.id}-{when:%Y%m%d}-{when:%H%M%S}"
 
 
-def create_raw_lot(item, warehouse, quantity, goods_receipt, company=None, lot_code=None, expiry_date=None):
-    """Create a raw-material lot at goods receipt."""
+def create_raw_lot(item, warehouse, quantity, goods_receipt, company=None, lot_code=None, expiry_date=None, status="quarantine"):
+    """Create a raw-material lot at goods receipt (starts in quarantine until incoming QC)."""
     return Batch.objects.create(
         item=item,
         batch_number=lot_code or _make_lot_code("RM", item),
@@ -32,6 +32,7 @@ def create_raw_lot(item, warehouse, quantity, goods_receipt, company=None, lot_c
         company=company or getattr(item, "company", None),
         warehouse=warehouse,
         source="received",
+        status=status,
         goods_receipt=goods_receipt,
     )
 
@@ -47,15 +48,19 @@ def create_finished_lot(item, warehouse, quantity, production_order, company=Non
         company=company or getattr(item, "company", None),
         warehouse=warehouse,
         source="produced",
+        status="available",
         production_order=production_order,
     )
 
 
 def _available_lots(item, company=None):
-    """Lots of `item` with stock left, oldest first (FIFO)."""
-    qs = Batch.objects.filter(item=item, remaining_quantity__gt=0)
+    """Lots of `item` with stock left, oldest first (FIFO). Excludes quarantined/held/rejected lots."""
+    qs = Batch.objects.filter(item=item, remaining_quantity__gt=0).exclude(
+        status__in=["quarantine", "rejected", "hold"]
+    )
     if company is not None:
         qs = qs.filter(company=company)
+    qs = qs.filter(models.Q(warehouse__isnull=True) | models.Q(warehouse__is_quarantine=False))
     return qs.order_by("created_at", "id")
 
 

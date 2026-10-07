@@ -192,12 +192,39 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             # materials_reserved is only True when nothing was short; otherwise
             # production must wait for procurement to top the material up.
             fully_reserved = not shortages
+
+            # Look up or create ProductionPlan for this order line
+            from production.models import ProductionPlan
+            plan = ProductionPlan.objects.filter(
+                sales_order=order,
+                sales_order_item=order_item,
+            ).exclude(status='cancelled').first()
+
+            if not plan:
+                plan = ProductionPlan.objects.create(
+                    company=order.customer.company if order.customer else None,
+                    sales_order=order,
+                    sales_order_item=order_item,
+                    customer=order.customer,
+                    item=item,
+                    order_quantity=qty_needed,
+                    planned_quantity=remaining_to_produce,
+                    target_date=order.required_delivery_date,
+                    status="converted",
+                    notes=f"Auto-planned via inventory preparation for SO#{order.id}",
+                    created_by=request.user if request.user.is_authenticated else None,
+                )
+            else:
+                plan.status = "converted"
+                plan.save(update_fields=["status", "updated_at"])
+
             prod_order = ProductionOrder.objects.create(
                 recipe=recipe,
                 quantity=remaining_to_produce,
                 warehouse=warehouse,
                 status='scheduled',
                 sales_order=order,  # so Production's Requests tab can trace the batch back
+                production_plan=plan,
                 materials_reserved=fully_reserved,
             )
             production_orders_created.append(prod_order.id)
@@ -263,7 +290,113 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             "warnings": errors
         })
 
+    @action(detail=True, methods=['post'], permission_classes=[IsSales | IsProduction | IsAdmin | IsStore])
+    def create_production_plan(self, request, pk=None):
+        """
+        Creates Production Plan Order(s) from a Sales Order.
+        If item_id is provided, creates a plan for that specific order line.
+        Otherwise, creates plans for all order lines that do not have active plans yet.
+        """
+        order = self.get_object()
+
+        if order.status in ['cancelled', 'delivered']:
+            return Response(
+                {"error": f"Cannot create production plan for an order with status '{order.status}'."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        from production.models import ProductionPlan
+        from production.serializers import ProductionPlanSerializer
+
+        item_id = request.data.get('item_id')
+        target_date = request.data.get('target_date') or order.required_delivery_date or None
+        notes = request.data.get('notes', '')
+
+        lines_to_plan = order.salesorderitem_set.all()
+        if item_id:
+            lines_to_plan = lines_to_plan.filter(item_id=item_id)
+            if not lines_to_plan.exists():
+                return Response(
+                    {"error": f"Item {item_id} not found in this sales order."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if not lines_to_plan.exists():
+            return Response(
+                {"error": "No order items found to create a production plan for."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        created_plans = []
+        for line in lines_to_plan:
+            existing_plan = ProductionPlan.objects.filter(
+                sales_order=order,
+                sales_order_item=line,
+            ).exclude(status='cancelled').first()
+
+            if existing_plan:
+                if item_id:
+                    return Response(
+                        {"error": f"Production Plan {existing_plan.plan_number} already exists for item '{line.item.name}'."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                continue
+
+            planned_qty = request.data.get('planned_quantity')
+            if planned_qty is not None and item_id:
+                try:
+                    planned_qty = float(planned_qty)
+                    if planned_qty <= 0:
+                        return Response(
+                            {"error": "Planned quantity must be greater than zero."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                except (ValueError, TypeError):
+                    return Response(
+                        {"error": "Invalid planned quantity format."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            else:
+                planned_qty = line.quantity
+
+            plan = ProductionPlan.objects.create(
+                company=order.customer.company if order.customer else None,
+                sales_order=order,
+                sales_order_item=line,
+                customer=order.customer,
+                item=line.item,
+                order_quantity=line.quantity,
+                planned_quantity=planned_qty,
+                target_date=target_date,
+                status="planned",
+                notes=notes,
+                created_by=request.user if request.user.is_authenticated else None,
+            )
+            created_plans.append(plan)
+
+        if not created_plans:
+            return Response(
+                {"error": "All items in this order already have active production plans."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        log_activity(
+            request.user,
+            "Sales",
+            "Create Production Plan",
+            f"Created {len(created_plans)} production plans for SO #{order.id}"
+        )
+
+        return Response(
+            {
+                "message": f"Successfully created {len(created_plans)} production plan(s).",
+                "plans": ProductionPlanSerializer(created_plans, many=True).data,
+            },
+            status=status.HTTP_201_CREATED
+        )
+
     @action(detail=False, methods=['get'])
+
     def production_requests(self, request):
         """Orders Inventory has sent to Production.
 
@@ -298,6 +431,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                         "quantity": b.quantity,
                         "status": b.status,
                         "materials_reserved": b.materials_reserved,
+                        "production_plan_id": b.production_plan_id,
+                        "production_plan_number": b.production_plan.plan_number if b.production_plan else None,
                     }
                     for b in batches
                 ],

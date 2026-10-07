@@ -145,3 +145,162 @@ class EmailToDraftOrderTests(TestCase):
         order.save()
         order.refresh_from_db()
         self.assertEqual(order.status, "pending")
+
+
+from rest_framework.test import APITestCase
+from production.models import ProductionPlan
+from .models import SalesOrderItem
+
+
+class CustomerCustomOrderTA01Tests(APITestCase):
+    def setUp(self):
+        self.company = Company.objects.create(name="Beverage Factory Ltd")
+        self.user = User.objects.create_user(
+            username="orders_manager",
+            password="securepass123",
+            role="sales",
+            company=self.company,
+        )
+        self.client.force_authenticate(user=self.user)
+        self.customer = Customer.objects.create(
+            company=self.company,
+            name="Metro Supermarkets",
+            email="purchasing@metro.com",
+            phone="+1-555-0199",
+        )
+        self.finished_item = Item.objects.create(
+            company=self.company,
+            name="Sparkling Peach Soda 330ml",
+            category="finished_good",
+            unit="case",
+            selling_price="25.00",
+        )
+        self.raw_item = Item.objects.create(
+            company=self.company,
+            name="Peach Flavoring Essence",
+            category="raw_material",
+            unit="liter",
+        )
+
+    def test_create_order_manual_channel_with_reference_and_delivery_date(self):
+        payload = {
+            "customer": self.customer.id,
+            "source": "manual",
+            "customer_order_reference": "PO-METRO-2026-001",
+            "required_delivery_date": "2026-11-20",
+            "items": [{"item": self.finished_item.id, "quantity": 100}],
+        }
+        response = self.client.post("/api/sales/sales-orders/", payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["source"], "manual")
+        self.assertEqual(response.data["customer_order_reference"], "PO-METRO-2026-001")
+        self.assertEqual(str(response.data["required_delivery_date"]), "2026-11-20")
+
+        order = SalesOrder.objects.get(id=response.data["id"])
+        self.assertEqual(order.source, "manual")
+        self.assertEqual(order.customer_order_reference, "PO-METRO-2026-001")
+        self.assertEqual(str(order.required_delivery_date), "2026-11-20")
+        self.assertEqual(order.status, "pending")
+
+    def test_create_order_email_channel(self):
+        payload = {
+            "customer": self.customer.id,
+            "source": "email",
+            "customer_order_reference": "EMAIL-INBOUND-8842",
+            "required_delivery_date": "2026-11-25",
+            "items": [{"item": self.finished_item.id, "quantity": 50}],
+        }
+        response = self.client.post("/api/sales/sales-orders/", payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["source"], "email")
+        self.assertEqual(response.data["customer_order_reference"], "EMAIL-INBOUND-8842")
+
+    def test_create_order_phone_channel(self):
+        payload = {
+            "customer": self.customer.id,
+            "source": "phone",
+            "customer_order_reference": "CALL-VERBAL-304",
+            "required_delivery_date": "2026-12-01",
+            "items": [{"item": self.finished_item.id, "quantity": 40}],
+        }
+        response = self.client.post("/api/sales/sales-orders/", payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["source"], "phone")
+        self.assertEqual(response.data["customer_order_reference"], "CALL-VERBAL-304")
+
+    def test_create_order_other_channel(self):
+        payload = {
+            "customer": self.customer.id,
+            "source": "other",
+            "customer_order_reference": "EDI-GATEWAY-771",
+            "items": [{"item": self.finished_item.id, "quantity": 25}],
+        }
+        response = self.client.post("/api/sales/sales-orders/", payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["source"], "other")
+        self.assertEqual(response.data["customer_order_reference"], "EDI-GATEWAY-771")
+        self.assertIsNone(response.data["required_delivery_date"])
+
+    def test_direct_confirmed_order_bypasses_quotation(self):
+        """Confirmed orders bypass any forced quotation workflow."""
+        payload = {
+            "customer": self.customer.id,
+            "source": "phone",
+            "status": "confirmed",
+            "customer_order_reference": "PO-DIRECT-CONFIRMED",
+            "required_delivery_date": "2026-11-15",
+            "items": [{"item": self.finished_item.id, "quantity": 80}],
+        }
+        response = self.client.post("/api/sales/sales-orders/", payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["status"], "confirmed")
+        order = SalesOrder.objects.get(id=response.data["id"])
+        self.assertEqual(order.status, "confirmed")
+
+    def test_create_production_plan_inherits_order_delivery_date(self):
+        """ProductionPlan created from SalesOrder inherits required_delivery_date as target_date."""
+        order = SalesOrder.objects.create(
+            customer=self.customer,
+            source="manual",
+            customer_order_reference="PO-PLAN-TEST",
+            required_delivery_date="2026-12-10",
+            status="confirmed",
+        )
+        SalesOrderItem.objects.create(
+            sales_order=order,
+            item=self.finished_item,
+            quantity=150,
+        )
+        order.total_amount = 3750.0
+        order.save()
+
+        # Call create_production_plan action without explicit target_date
+        response = self.client.post(f"/api/sales/sales-orders/{order.id}/create_production_plan/", {})
+        self.assertEqual(response.status_code, 201)
+        plan_data = response.data["plans"][0]
+        plan = ProductionPlan.objects.get(id=plan_data["id"])
+        self.assertEqual(str(plan.target_date), "2026-12-10")
+        self.assertEqual(plan.sales_order, order)
+
+    def test_order_rejects_raw_material(self):
+        """Finished good rule remains strictly enforced."""
+        payload = {
+            "customer": self.customer.id,
+            "source": "manual",
+            "items": [{"item": self.raw_item.id, "quantity": 10}],
+        }
+        response = self.client.post("/api/sales/sales-orders/", payload, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_order_company_isolation(self):
+        """Cannot create sales order for customer belonging to another company."""
+        other_company = Company.objects.create(name="Competitor Beverage Co")
+        other_customer = Customer.objects.create(company=other_company, name="Other Customer")
+        payload = {
+            "customer": other_customer.id,
+            "source": "manual",
+            "items": [{"item": self.finished_item.id, "quantity": 10}],
+        }
+        response = self.client.post("/api/sales/sales-orders/", payload, format="json")
+        self.assertEqual(response.status_code, 400)
+

@@ -53,6 +53,8 @@ class SalesOrder(models.Model):
     SOURCE_CHOICES = [
         ("manual", "Manual entry"),
         ("email", "Email inbox"),
+        ("phone", "Phone order"),
+        ("other", "Other external source"),
     ]
 
     status = models.CharField(
@@ -61,6 +63,17 @@ class SalesOrder(models.Model):
         default="pending"
     )
     source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="manual")
+    required_delivery_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Customer required delivery date"
+    )
+    customer_order_reference = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Customer PO / external order reference"
+    )
 
     def __str__(self):
         return f"SO-{self.id}"
