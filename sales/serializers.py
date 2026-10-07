@@ -19,14 +19,31 @@ class SalesOrderSerializer(serializers.ModelSerializer):
     items = SalesOrderItemSerializer(source="salesorderitem_set", many=True, read_only=True)
     customer_name = serializers.CharField(source="customer.name", read_only=True)
     production_status = serializers.SerializerMethodField()
+    production_plans = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesOrder
         fields = [
             "id", "customer", "customer_name", "created_at", "total_amount",
-            "status", "items", "quickbooks_id", "production_status",
+            "status", "source", "required_delivery_date", "customer_order_reference",
+            "items", "quickbooks_id", "production_status", "production_plans",
         ]
         read_only_fields = ["quickbooks_id"]
+
+    def get_production_plans(self, order):
+        return [
+            {
+                "id": p.id,
+                "plan_number": p.plan_number,
+                "item_id": p.item_id,
+                "item_name": p.item.name,
+                "planned_quantity": p.planned_quantity,
+                "status": p.status,
+                "production_order_ids": list(p.production_orders.values_list("id", flat=True)),
+            }
+            for p in order.production_plans.all()
+        ]
+
 
     def get_production_status(self, order):
         """Where this order sits in the Inventory → Production → Shipment handoff.

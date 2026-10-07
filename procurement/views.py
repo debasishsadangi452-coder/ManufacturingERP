@@ -1,4 +1,6 @@
 from datetime import date
+from decimal import Decimal
+from django.db import transaction
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -10,16 +12,19 @@ from django.utils import timezone
 from .models import (
     Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt,
     Bill, BillLine, VendorEmail, ScheduledPurchaseOrder,
+    Bill, BillLine, VendorEmail, PurchaseRequisition, PurchaseRequisitionItem,
 )
 from .serializers import (
     VendorSerializer, VendorPriceListSerializer,
     PurchaseOrderSerializer, PurchaseOrderItemSerializer, GoodsReceiptSerializer,
     BillSerializer, VendorEmailSerializer, ScheduledPurchaseOrderSerializer,
+    BillSerializer, VendorEmailSerializer,
+    PurchaseRequisitionSerializer, PurchaseRequisitionItemSerializer,
 )
-from inventory.models import Item
+from inventory.models import Item, Warehouse
 from inventory.serializers import ItemSerializer
 from inventory.services import increase_stock
-from accounts.permission import IsStore, IsAdmin, IsFinance, IsQuality
+from accounts.permission import IsStore, IsAdmin, IsFinance, IsQuality, IsProduction
 from core.utils import log_activity
 from core.tenancy import CompanyScopedMixin
 
@@ -474,6 +479,7 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     # which is where the SQF lot chain starts.
     permission_classes = [IsStore | IsAdmin | IsQuality]
 
+    @transaction.atomic
     def perform_create(self, serializer):
         po = serializer.validated_data["purchase_order"]
         if po.status not in ["approved", "ordered"]:
@@ -527,14 +533,9 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         from .billing import on_goods_received
         on_goods_received(po, receipt, self.request.user)
 
-        # Close the loop back to production. Material was procured because a
-        # production order was short of it; now that it has landed, the people
-        # waiting on it have to be told, or the batch sits blocked indefinitely.
-        self._notify_waiting_production(po, receipt)
-
         log_activity(
             self.request.user, "Procurement", "Goods Receipt",
-            f"Received goods for PO #{po.id} into '{receipt.warehouse.name}': {', '.join(items_received)}"
+            f"Received goods for PO #{po.id} at '{receipt.warehouse.name}': {', '.join(items_received)}"
         )
 
     @staticmethod
@@ -679,3 +680,260 @@ class ScheduledPurchaseOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                             status=status.HTTP_400_BAD_REQUEST)
         schedule = place_scheduled_order(ScheduledPurchaseOrder.objects.get(pk=schedule.id))
         return Response(self.get_serializer(schedule).data)
+
+
+class PurchaseRequisitionViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
+    queryset = (
+        PurchaseRequisition.objects
+        .select_related("company", "warehouse", "production_plan", "sales_order", "created_by")
+        .prefetch_related("items__item", "purchase_orders")
+        .all()
+    )
+    serializer_class = PurchaseRequisitionSerializer
+    permission_classes = [IsStore | IsAdmin | IsProduction]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["status", "production_plan", "sales_order"]
+
+    @action(detail=False, methods=["post"])
+    def create_from_mrp(self, request):
+        """
+        Creates or retrieves a persistent PurchaseRequisition from an MRP shortage result.
+        Idempotent: If an active requisition already exists for this production plan,
+        it returns the existing requisition without creating duplicates.
+        """
+        data = request.data
+        plan_id = data.get("production_plan_id") or data.get("production_plan")
+        if not plan_id:
+            return Response({"error": "production_plan_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        from production.models import ProductionPlan
+        plan = ProductionPlan.objects.filter(id=plan_id).first()
+        if not plan:
+            return Response({"error": f"Production plan #{plan_id} not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        user_company = getattr(request.user, "company", None)
+        if user_company and plan.company and plan.company != user_company and not getattr(request.user, "is_superuser", False):
+            return Response({"error": "You do not have permission to access a production plan from another company."}, status=status.HTTP_403_FORBIDDEN)
+
+        company = plan.company or request.user.company
+
+        # 🔒 Idempotency: verify no existing non-cancelled requirement for this plan
+        existing_req = (
+            PurchaseRequisition.objects
+            .filter(production_plan=plan, status__in=["draft", "submitted", "approved", "converted"])
+            .first()
+        )
+        if existing_req:
+            return Response(
+                {
+                    "message": f"Purchase Requisition {existing_req.requisition_number} already exists for plan {plan.plan_number}.",
+                    "requisition": PurchaseRequisitionSerializer(existing_req).data,
+                    "created": False,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        warehouse_id = data.get("warehouse_id") or data.get("warehouse")
+        warehouse = None
+        if warehouse_id:
+            warehouse = Warehouse.objects.filter(id=warehouse_id).first()
+        if not warehouse and company:
+            warehouse = Warehouse.objects.filter(company=company, is_quarantine=False).first()
+
+        raw_items = data.get("items") or []
+        if not raw_items:
+            # GAP 3: Automatically compute shortages from ProductionPlan using the MRP calculation engine
+            try:
+                from production.mrp import calculate_mrp_for_plan
+                mrp_res = calculate_mrp_for_plan(plan, warehouse=warehouse)
+            except Exception as e:
+                return Response({"error": f"Failed to calculate MRP for plan: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Extract shortage candidates from raw_materials list
+            raw_candidates = mrp_res.get("raw_materials") or []
+            if not raw_candidates:
+                raw_candidates = [
+                    c for c in mrp_res.get("consolidated", [])
+                    if c.get("category") != "intermediate"
+                ]
+
+            shortage_candidates = [
+                r for r in raw_candidates
+                if float(r.get("shortage_quantity", 0)) > 0
+            ]
+
+            if not shortage_candidates:
+                return Response(
+                    {
+                        "message": f"No material shortages detected for production plan {plan.plan_number}. No purchase requisition required.",
+                        "created": False,
+                        "has_shortage": False,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            raw_items = [
+                {
+                    "item_id": item_res["item_id"],
+                    "required_quantity": item_res["required_quantity"],
+                    "available_quantity": item_res["available_quantity"],
+                    "shortage_quantity": item_res["shortage_quantity"],
+                    "uom": item_res.get("unit") or "unit",
+                }
+                for item_res in shortage_candidates
+            ]
+        else:
+            shortage_items = [it for it in raw_items if float(it.get("shortage_quantity", 0)) > 0]
+            if not shortage_items:
+                return Response(
+                    {
+                        "message": f"No material shortages detected for production plan {plan.plan_number}. No purchase requisition required.",
+                        "created": False,
+                        "has_shortage": False,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+            raw_items = shortage_items
+
+        with transaction.atomic():
+            req = PurchaseRequisition.objects.create(
+                company=company,
+                warehouse=warehouse,
+                production_plan=plan,
+                sales_order=plan.sales_order,
+                status="approved",
+                notes=data.get("notes", f"Generated from MRP shortage on {plan.plan_number}"),
+                created_by=request.user,
+            )
+
+            created_items = []
+            for item_data in raw_items:
+                item_id = item_data.get("item_id") or item_data.get("item")
+                item = Item.objects.filter(id=item_id).first()
+                if not item:
+                    continue
+                req_qty = float(item_data.get("required_quantity", 0))
+                avail_qty = float(item_data.get("available_quantity", 0))
+                shortage_qty = float(item_data.get("shortage_quantity", req_qty))
+                uom = item_data.get(
+                    "uom",
+                    getattr(item.base_uom, "code", "unit") if hasattr(item, "base_uom") and item.base_uom else (item.unit or "unit")
+                )
+
+                v_price = VendorPriceList.objects.filter(item=item, is_active=True).first()
+                est_price = v_price.unit_price if v_price else (item.purchase_cost or Decimal("0.00"))
+
+                PurchaseRequisitionItem.objects.create(
+                    requisition=req,
+                    item=item,
+                    required_quantity=req_qty,
+                    available_quantity=avail_qty,
+                    shortage_quantity=shortage_qty,
+                    uom=uom,
+                    estimated_unit_price=est_price,
+                )
+                created_items.append(f"{shortage_qty} {uom} of {item.name}")
+
+            log_activity(
+                request.user, "Procurement", "Create Purchase Requirement",
+                f"Created {req.requisition_number} from MRP for {plan.plan_number}: {', '.join(created_items)}"
+            )
+
+        return Response(
+            {
+                "message": f"Successfully created Purchase Requisition {req.requisition_number}",
+                "requisition": PurchaseRequisitionSerializer(req).data,
+                "created": True,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        req = self.get_object()
+        if req.status in ["approved", "converted"]:
+            return Response({"error": f"Requisition is already {req.status}."}, status=status.HTTP_400_BAD_REQUEST)
+        if req.status == "cancelled":
+            return Response({"error": "Cannot approve a cancelled requisition."}, status=status.HTTP_400_BAD_REQUEST)
+        req.status = "approved"
+        req.save(update_fields=["status", "updated_at"])
+        log_activity(request.user, "Procurement", "Approve Requirement", f"Approved {req.requisition_number}")
+        return Response(PurchaseRequisitionSerializer(req).data)
+
+    @action(detail=True, methods=["post"])
+    def convert_to_po(self, request, pk=None):
+        """
+        Converts an approved Purchase Requisition into a Purchase Order atomically.
+        Retains traceability to PurchaseRequisition and ProductionPlan.
+        """
+        req = self.get_object()
+        if req.status == "converted":
+            return Response({"error": "This requirement has already been converted to a Purchase Order."}, status=status.HTTP_400_BAD_REQUEST)
+        if req.status == "cancelled":
+            return Response({"error": "Cannot convert a cancelled requirement."}, status=status.HTTP_400_BAD_REQUEST)
+        if req.status not in ["approved", "submitted", "draft"]:
+            return Response({"error": f"Requisition must be approved before conversion (current status: {req.status})."}, status=status.HTTP_400_BAD_REQUEST)
+
+        vendor_id = request.data.get("vendor_id") or request.data.get("vendor")
+
+        with transaction.atomic():
+            vendor = None
+            if vendor_id:
+                vendor = Vendor.objects.filter(id=vendor_id).first()
+
+            items_to_procure = list(req.items.select_related("item").all())
+            if not items_to_procure:
+                return Response({"error": "No items found in this requisition."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not vendor:
+                first_item = items_to_procure[0].item
+                vp = VendorPriceList.objects.filter(item=first_item, is_active=True).first()
+                if vp:
+                    vendor = vp.vendor
+                else:
+                    vendor = Vendor.objects.filter(company=req.company).first()
+                if not vendor:
+                    vendor = Vendor.objects.first()
+
+            if not vendor:
+                return Response({"error": "No vendor available to raise Purchase Order. Please configure a vendor first."}, status=status.HTTP_400_BAD_REQUEST)
+
+            po = PurchaseOrder.objects.create(
+                vendor=vendor,
+                requisition=req,
+                status="pending",
+                priority="high",
+                notes=f"Converted from {req.requisition_number} (Plan: {req.production_plan.plan_number if req.production_plan else 'N/A'})",
+            )
+
+            for req_item in items_to_procure:
+                vp = VendorPriceList.objects.filter(vendor=vendor, item=req_item.item, is_active=True).first()
+                unit_price = vp.unit_price if vp else (req_item.estimated_unit_price or req_item.item.purchase_cost or Decimal("0.00"))
+                po_qty = max(float(req_item.shortage_quantity), float(vp.min_order_qty if vp else 0))
+
+                PurchaseOrderItem.objects.create(
+                    purchase_order=po,
+                    item=req_item.item,
+                    quantity=po_qty,
+                    unit_price=unit_price,
+                )
+
+            po.recalculate_total()
+            req.status = "converted"
+            req.save(update_fields=["status", "updated_at"])
+
+            log_activity(
+                request.user, "Procurement", "Convert Requisition to PO",
+                f"Converted {req.requisition_number} into PO #{po.id} with vendor '{vendor.name}'"
+            )
+
+        return Response(
+            {
+                "message": f"Successfully converted {req.requisition_number} to PO #{po.id}",
+                "purchase_order_id": po.id,
+                "purchase_order": PurchaseOrderSerializer(po).data,
+                "requisition": PurchaseRequisitionSerializer(req).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )

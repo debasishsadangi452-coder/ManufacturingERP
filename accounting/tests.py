@@ -8040,6 +8040,384 @@ class RolesPermissionsTestCase(TestCase):
         self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+# ==============================================================================
+# BLUEPRINT SECTION #28: APPROVAL WORKFLOW TESTS
+# ==============================================================================
 
+class ApprovalWorkflowTests(APITestCase):
+    """
+    Exhaustive tests for Blueprint Section #28: Approval Workflow.
+    Covers:
+    - Configurable approval thresholds (Standard vs High-Value tiers).
+    - Dynamic approver routing.
+    - Segregation of duties (4-eyes principle / maker != checker).
+    - Rejection workflows with mandatory audit reasons.
+    - Pre-posting validation controls blocking unapproved transactions.
+    - Emergency manual journal controls with enhanced audit logging.
+    - Multi-module pending approval queue (Journal Entries, Expenses).
+    - Tenant company isolation and permission security.
+    """
 
+    def setUp(self):
+        # 1. Companies
+        self.company = Company.objects.create(name="Approval Test Corp", slug="approval-test-corp")
+        self.company_b = Company.objects.create(name="Competitor B Corp", slug="competitor-b-corp")
 
+        # 2. Users
+        self.admin_user = User.objects.create_user(
+            username="admin@approval.com",
+            email="admin@approval.com",
+            password="password123",
+            company=self.company,
+            role="admin",
+        )
+        self.finance_mgr = User.objects.create_user(
+            username="mgr@approval.com",
+            email="mgr@approval.com",
+            password="password123",
+            company=self.company,
+            role="finance",
+            auto_approve_limit=Decimal("10000.00"),
+        )
+        self.accountant_user = User.objects.create_user(
+            username="accountant@approval.com",
+            email="accountant@approval.com",
+            password="password123",
+            company=self.company,
+            role="finance",
+        )
+        self.operator_user = User.objects.create_user(
+            username="operator@approval.com",
+            email="operator@approval.com",
+            password="password123",
+            company=self.company,
+            role="production",
+        )
+        self.user_b = User.objects.create_user(
+            username="userb@compb.com",
+            email="userb@compb.com",
+            password="password123",
+            company=self.company_b,
+            role="admin",
+        )
+
+        # 3. Fiscal Year & Open Period
+        self.fy = FiscalYear.objects.create(
+            company=self.company,
+            name="FY 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+        self.period = AccountingPeriod.objects.create(
+            company=self.company,
+            fiscal_year=self.fy,
+            period_number=1,
+            name="Jan 2026",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+            status="open",
+        )
+
+        # 4. Chart of Accounts
+        self.at_asset = AccountType.objects.create(name="Current Asset", category="asset", normal_balance="debit")
+        self.at_expense = AccountType.objects.create(name="Operating Expense", category="expense", normal_balance="debit")
+
+        self.acc_bank = Account.objects.create(
+            company=self.company,
+            account_type=self.at_asset,
+            code="1010",
+            name="Main Operating Bank",
+            is_active=True,
+        )
+        self.acc_expense = Account.objects.create(
+            company=self.company,
+            account_type=self.at_expense,
+            code="6010",
+            name="Consulting Expense",
+            is_active=True,
+        )
+
+        # 5. Initialize approval policy ($1,000 standard, $10,000 high-value)
+        from .approval_workflow import get_or_create_threshold_policy
+        self.policy = get_or_create_threshold_policy(self.company, module="journal_entry")
+        self.policy.standard_threshold = Decimal("1000.00")
+        self.policy.high_value_threshold = Decimal("10000.00")
+        self.policy.enforce_segregation_of_duties = True
+        self.policy.allow_emergency_override = True
+        self.policy.is_active = True
+        self.policy.save()
+
+        self.client.force_authenticate(user=self.finance_mgr)
+
+    def _create_journal_entry(self, amount, created_by=None, status="draft"):
+        entry = JournalEntry.objects.create(
+            company=self.company,
+            entry_type="manual",
+            transaction_date=date(2026, 1, 15),
+            accounting_period=self.period,
+            reference=f"REF-{int(amount)}",
+            description=f"Test JE for amount {amount}",
+            status=status,
+            created_by=created_by or self.accountant_user,
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=self.acc_expense,
+            debit=Decimal(str(amount)),
+            credit=Decimal("0.00"),
+            description="Expense debit",
+        )
+        JournalEntryLine.objects.create(
+            company=self.company,
+            journal_entry=entry,
+            account=self.acc_bank,
+            debit=Decimal("0.00"),
+            credit=Decimal(str(amount)),
+            description="Bank credit",
+        )
+        return entry
+
+    def test_approval_policy_configuration_api(self):
+        """Configure approval thresholds via API (Blueprint #28)."""
+        res = self.client.get("/api/accounting/approval-workflow/policies/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(res.data) >= 1)
+
+        # Update policy
+        update_payload = {
+            "module": "journal_entry",
+            "standard_threshold": "2500.00",
+            "high_value_threshold": "15000.00",
+            "approver_role": "finance_manager",
+            "high_value_approver_role": "accounting_admin",
+            "enforce_segregation_of_duties": True,
+            "allow_emergency_override": True,
+            "is_active": True,
+        }
+        res_post = self.client.post("/api/accounting/approval-workflow/policies/", update_payload)
+        self.assertEqual(res_post.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_post.data["standard_threshold"], 2500.00)
+        self.assertEqual(res_post.data["high_value_threshold"], 15000.00)
+
+    def test_journal_entry_submission_workflow(self):
+        """Draft entry submitted for approval transitions to 'submitted' state with audit log."""
+        je = self._create_journal_entry(amount=3000, created_by=self.accountant_user)
+        self.client.force_authenticate(user=self.accountant_user)
+
+        res = self.client.post("/api/accounting/approval-workflow/submit/", {
+            "document_type": "journal_entry",
+            "document_id": je.id,
+            "notes": "Urgent consulting invoice journal entry",
+        })
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["status"], "submitted")
+        self.assertEqual(res.data["routing_tier"], "standard")
+
+        je.refresh_from_db()
+        self.assertEqual(je.status, "submitted")
+        self.assertIsNotNone(je.submitted_at)
+        self.assertEqual(je.submitted_by, self.accountant_user)
+
+        from .models import ApprovalAuditLog
+        audit = ApprovalAuditLog.objects.filter(document_type="journal_entry", document_id=str(je.id), action="SUBMITTED").first()
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit.actor, self.accountant_user)
+
+    def test_segregation_of_duties_violation(self):
+        """Submitter cannot approve their own transaction (maker != checker)."""
+        je = self._create_journal_entry(amount=3000, created_by=self.finance_mgr)
+        je.status = "submitted"
+        je.submitted_by = self.finance_mgr
+        je.submitted_at = timezone.now()
+        je.save()
+
+        self.client.force_authenticate(user=self.finance_mgr)
+        res = self.client.post("/api/accounting/approval-workflow/approve/", {
+            "document_type": "journal_entry",
+            "document_id": je.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Segregation of Duties", str(res.data))
+
+    def test_high_value_transaction_routing(self):
+        """High-value transactions (>= $10,000) require Accounting Admin approval."""
+        je = self._create_journal_entry(amount=12000, created_by=self.accountant_user)
+        je.status = "submitted"
+        je.submitted_by = self.accountant_user
+        je.submitted_at = timezone.now()
+        je.save()
+
+        # Finance manager attempts approval on high-value transaction -> fails
+        self.client.force_authenticate(user=self.finance_mgr)
+        res = self.client.post("/api/accounting/approval-workflow/approve/", {
+            "document_type": "journal_entry",
+            "document_id": je.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("High-Value Approval", str(res.data))
+
+        # Accounting Admin approves -> succeeds
+        self.client.force_authenticate(user=self.admin_user)
+        res_admin = self.client.post("/api/accounting/approval-workflow/approve/", {
+            "document_type": "journal_entry",
+            "document_id": je.id,
+            "notes": "Approved by senior controller",
+        })
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+        je.refresh_from_db()
+        self.assertEqual(je.status, "approved")
+        self.assertEqual(je.approved_by, self.admin_user)
+
+    def test_standard_approval_happy_path(self):
+        """Standard-tier transaction ($1,000 to $10,000) approved by Finance Manager."""
+        je = self._create_journal_entry(amount=4500, created_by=self.accountant_user)
+        je.status = "submitted"
+        je.submitted_by = self.accountant_user
+        je.submitted_at = timezone.now()
+        je.save()
+
+        self.client.force_authenticate(user=self.finance_mgr)
+        res = self.client.post("/api/accounting/approval-workflow/approve/", {
+            "document_type": "journal_entry",
+            "document_id": je.id,
+            "notes": "Verified against receipt",
+        })
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        je.refresh_from_db()
+        self.assertEqual(je.status, "approved")
+        self.assertEqual(je.approved_by, self.finance_mgr)
+        self.assertIsNotNone(je.approved_at)
+
+    def test_rejection_workflow_with_reason(self):
+        """Approver rejects transaction with mandatory reason."""
+        je = self._create_journal_entry(amount=2000, created_by=self.accountant_user)
+        je.status = "submitted"
+        je.submitted_by = self.accountant_user
+        je.submitted_at = timezone.now()
+        je.save()
+
+        # Reject without reason fails
+        self.client.force_authenticate(user=self.finance_mgr)
+        res_fail = self.client.post("/api/accounting/approval-workflow/reject/", {
+            "document_type": "journal_entry",
+            "document_id": je.id,
+            "reason": "",
+        })
+        self.assertEqual(res_fail.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Reject with valid reason succeeds
+        res_ok = self.client.post("/api/accounting/approval-workflow/reject/", {
+            "document_type": "journal_entry",
+            "document_id": je.id,
+            "reason": "Missing supporting consulting deliverables",
+        })
+        self.assertEqual(res_ok.status_code, status.HTTP_200_OK)
+        je.refresh_from_db()
+        self.assertEqual(je.status, "rejected")
+        self.assertEqual(je.rejected_by, self.finance_mgr)
+        self.assertEqual(je.rejection_reason, "Missing supporting consulting deliverables")
+
+    def test_posting_blocked_before_required_approval(self):
+        """Posting to GL is blocked if transaction exceeds threshold and is not approved."""
+        je = self._create_journal_entry(amount=5000, created_by=self.accountant_user)
+        self.client.force_authenticate(user=self.accountant_user)
+
+        # Attempt to post draft entry directly -> blocked
+        res_post = self.client.post(f"/api/accounting/journal-entries/{je.id}/post/")
+        self.assertEqual(res_post.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("exceeds configured approval threshold", str(res_post.data))
+
+        # Once approved by manager, posting succeeds
+        je.status = "approved"
+        je.approved_by = self.finance_mgr
+        je.approved_at = timezone.now()
+        je.save()
+
+        res_post_approved = self.client.post(f"/api/accounting/journal-entries/{je.id}/post/")
+        self.assertEqual(res_post_approved.status_code, status.HTTP_200_OK)
+        je.refresh_from_db()
+        self.assertEqual(je.status, "posted")
+
+    def test_emergency_override_posting(self):
+        """Emergency manual posting bypasses standard approval with documented reason and heightened audit."""
+        je = self._create_journal_entry(amount=8000, created_by=self.accountant_user)
+        self.client.force_authenticate(user=self.admin_user)
+
+        # Emergency override with short reason fails
+        res_fail = self.client.post(f"/api/accounting/journal-entries/{je.id}/post/", {
+            "emergency_override": True,
+            "emergency_reason": "quick",
+        })
+        self.assertEqual(res_fail.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Emergency override with detailed reason succeeds
+        res_ok = self.client.post(f"/api/accounting/journal-entries/{je.id}/post/", {
+            "emergency_override": True,
+            "emergency_reason": "Emergency plant transformer breakdown requiring immediate supplier payment posting",
+        })
+        self.assertEqual(res_ok.status_code, status.HTTP_200_OK)
+        je.refresh_from_db()
+        self.assertEqual(je.status, "posted")
+
+        from .models import JournalEntryAuditLog
+        audit = JournalEntryAuditLog.objects.filter(journal_entry=je, action="EMERGENCY_OVERRIDE").first()
+        self.assertIsNotNone(audit)
+        self.assertTrue(audit.details.get("emergency_override"))
+
+    def test_pending_approval_queue_and_summary_apis(self):
+        """Pending approval queue aggregates items across modules with metrics."""
+        je1 = self._create_journal_entry(amount=2500, created_by=self.accountant_user)
+        je1.status = "submitted"
+        je1.submitted_by = self.accountant_user
+        je1.submitted_at = timezone.now()
+        je1.save()
+
+        je2 = self._create_journal_entry(amount=15000, created_by=self.finance_mgr)
+        je2.status = "submitted"
+        je2.submitted_by = self.finance_mgr
+        je2.submitted_at = timezone.now()
+        je2.save()
+
+        # Check queue
+        self.client.force_authenticate(user=self.finance_mgr)
+        res_queue = self.client.get("/api/accounting/approval-workflow/queue/")
+        self.assertEqual(res_queue.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(res_queue.data) >= 2)
+
+        # Check summary metrics
+        res_summary = self.client.get("/api/accounting/approval-workflow/summary/")
+        self.assertEqual(res_summary.status_code, status.HTTP_200_OK)
+        self.assertTrue(res_summary.data["pending_count"] >= 2)
+        self.assertTrue(res_summary.data["pending_amount"] >= 17500.00)
+        self.assertTrue(res_summary.data["high_value_count"] >= 1)
+
+    def test_company_isolation(self):
+        """Approvals and policies from Company A are not accessible by Company B."""
+        je = self._create_journal_entry(amount=3000, created_by=self.accountant_user)
+        je.status = "submitted"
+        je.submitted_by = self.accountant_user
+        je.save()
+
+        self.client.force_authenticate(user=self.user_b)
+        res_queue = self.client.get("/api/accounting/approval-workflow/queue/")
+        self.assertEqual(res_queue.status_code, status.HTTP_200_OK)
+        # Should be empty for Company B
+        self.assertEqual(len(res_queue.data), 0)
+
+        # Company B cannot approve Company A's entry
+        res_approve = self.client.post("/api/accounting/approval-workflow/approve/", {
+            "document_type": "journal_entry",
+            "document_id": je.id,
+        })
+        self.assertEqual(res_approve.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_permissions(self):
+        """Unauthorized operational users cannot access approval APIs."""
+        self.client.force_authenticate(user=self.operator_user)
+        res_forbidden = self.client.get("/api/accounting/approval-workflow/queue/")
+        self.assertEqual(res_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.logout()
+        res_unauth = self.client.get("/api/accounting/approval-workflow/queue/")
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)

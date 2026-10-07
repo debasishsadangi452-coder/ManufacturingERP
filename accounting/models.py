@@ -1190,6 +1190,7 @@ class JournalEntryAuditLog(models.Model):
         ("REJECTED", "Rejected"),
         ("POSTED", "Posted to Ledger"),
         ("REVERSED", "Reversed"),
+        ("EMERGENCY_OVERRIDE", "Emergency Override Posting"),
         ("ATTACHMENT_ADDED", "Attachment Added"),
         ("ATTACHMENT_REMOVED", "Attachment Removed"),
         ("DELETED", "Draft Deleted"),
@@ -2688,6 +2689,75 @@ class TaxAuditLog(models.Model):
         return f"TaxAudit: {self.action} by {self.actor} at {self.created_at}"
 
 
+class ApprovalThreshold(models.Model):
+    """
+    Blueprint Section #28 — Configurable approval thresholds, routing tiers,
+    segregation of duties (4-eyes principle), and emergency override controls.
+    """
+    MODULE_CHOICES = [
+        ("all", "All Modules"),
+        ("journal_entry", "Journal Entries"),
+        ("expense", "Expenses"),
+        ("bill", "Supplier Bills"),
+        ("payment", "Payments"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="approval_thresholds",
+        help_text="Tenant company context."
+    )
+    module = models.CharField(
+        max_length=50,
+        choices=MODULE_CHOICES,
+        default="all",
+        help_text="Module or transaction category governed by this threshold."
+    )
+    standard_threshold = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("1000.00"),
+        help_text="Transactions exceeding this value strictly require manager approval."
+    )
+    high_value_threshold = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("10000.00"),
+        help_text="Transactions exceeding this value require executive / admin approval."
+    )
+    approver_role = models.CharField(
+        max_length=50,
+        default="finance_manager",
+        help_text="Minimum accounting role required to approve standard-tier transactions."
+    )
+    high_value_approver_role = models.CharField(
+        max_length=50,
+        default="accounting_admin",
+        help_text="Role required to approve high-value transactions."
+    )
+    enforce_segregation_of_duties = models.BooleanField(
+        default=True,
+        help_text="Enforces 4-eyes principle (requester / creator cannot approve their own item)."
+    )
+    allow_emergency_override = models.BooleanField(
+        default=True,
+        help_text="Permits executive emergency posting with documented reason and enhanced audit logging."
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Whether this approval policy is currently enforced."
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [("company", "module")]
+        ordering = ["module"]
+
+    def __str__(self):
+        return f"{self.company.name} - {self.get_module_display()}: Std >= ${self.standard_threshold:.2f}, High >= ${self.high_value_threshold:.2f}"
+
 class AutoPostingLog(models.Model):
     """One row per automatic posting attempt triggered by an operational event
     (see accounting/auto_posting.py). Failed rows can be retried."""
@@ -2727,3 +2797,51 @@ class AutoPostingLog(models.Model):
 
     def __str__(self):
         return f"{self.event} #{self.source_id} ({self.status})"
+
+
+class ApprovalAuditLog(models.Model):
+    """
+    Blueprint Section #28 — Immutable audit log for approval lifecycle events across ERP accounting documents.
+    Captures submitted, approved, rejected, and emergency override actions with timestamps and actors.
+    """
+    ACTION_CHOICES = [
+        ("SUBMITTED", "Submitted for Approval"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+        ("EMERGENCY_OVERRIDE", "Emergency Override Posting"),
+        ("REVERTED_DRAFT", "Reverted to Draft"),
+    ]
+
+    company = models.ForeignKey(
+        "accounts.Company",
+        on_delete=models.CASCADE,
+        related_name="approval_audit_logs"
+    )
+    document_type = models.CharField(
+        max_length=50,
+        db_index=True,
+        help_text="Document type: journal_entry, expense, bill, payment"
+    )
+    document_id = models.CharField(max_length=64, db_index=True)
+    document_number = models.CharField(max_length=64, db_index=True)
+    amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    action = models.CharField(max_length=30, choices=ACTION_CHOICES, db_index=True)
+    actor = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="accounting_approval_actions"
+    )
+    actor_role = models.CharField(max_length=50, blank=True, default="")
+    rejection_reason = models.TextField(blank=True, default="")
+    emergency_reason = models.TextField(blank=True, default="")
+    notes = models.TextField(blank=True, default="")
+    routing_tier = models.CharField(max_length=50, blank=True, default="standard")
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"[{self.action}] {self.document_type} #{self.document_number} by {self.actor} at {self.created_at}"

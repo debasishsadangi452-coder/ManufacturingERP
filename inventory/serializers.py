@@ -123,11 +123,13 @@ class ItemSerializer(serializers.ModelSerializer):
         read_only_fields = ["quickbooks_id", "quickbooks_sync_token", "quickbooks_last_synced_at"]
 
     def get_quickbooks_item_type(self, obj):
-        return "Inventory" if obj.category == "raw_material" else "Inventory/Sales Item"
+        return "Inventory" if obj.category in ("raw_material", "intermediate", "semi_finished") else "Inventory/Sales Item"
 
     def get_procurement_policy(self, obj):
         if obj.category == "raw_material":
             return "Vendor purchase only"
+        elif obj.category in ("intermediate", "semi_finished"):
+            return "Sub-assembly/Manufactured component"
         return "Finished good for sales/production output"
 
     def create(self, validated_data):
@@ -252,10 +254,19 @@ class ProcurementQuickBooksConfigSerializer(serializers.ModelSerializer):
 class BOMLineSerializer(serializers.ModelSerializer):
     raw_material_name = serializers.CharField(source='raw_material.name', read_only=True)
     raw_material_unit = serializers.CharField(source='raw_material.unit', read_only=True)
+    raw_material_category = serializers.CharField(source='raw_material.category', read_only=True)
 
     class Meta:
         model = BOMLine
-        fields = ['id', 'raw_material', 'raw_material_name', 'raw_material_unit', 'quantity', 'unit']
+        fields = [
+            'id', 'raw_material', 'raw_material_name', 'raw_material_unit',
+            'raw_material_category', 'quantity', 'unit', 'unit_of_measure'
+        ]
+
+    def validate_quantity(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError("Quantity must be greater than zero.")
+        return value
 
     def validate_raw_material(self, value):
         if value.category not in ("raw_material", "intermediate"):
@@ -266,8 +277,17 @@ class BOMLineSerializer(serializers.ModelSerializer):
 class BOMSerializer(serializers.ModelSerializer):
     lines = BOMLineSerializer(many=True, read_only=True)
     finished_good_name = serializers.CharField(source='finished_good.name', read_only=True)
+    finished_good_category = serializers.CharField(source='finished_good.category', read_only=True)
 
     class Meta:
         model = BOM
-        fields = ['id', 'finished_good', 'finished_good_name', 'lines', 'created_at', 'updated_at']
+        fields = [
+            'id', 'finished_good', 'finished_good_name', 'finished_good_category',
+            'is_active', 'version', 'status', 'lines', 'created_at', 'updated_at'
+        ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def validate_finished_good(self, value):
+        if value.category not in ("finished_good", "intermediate", "semi_finished"):
+            raise serializers.ValidationError("Only finished goods or semi-finished items can have a BOM.")
+        return value

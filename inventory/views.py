@@ -636,26 +636,53 @@ class BOMViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def add_line(self, request, pk=None):
         """Add a line item to BOM."""
+        from django.core.exceptions import ValidationError
         bom = self.get_object()
         raw_material_id = request.data.get('raw_material_id')
         quantity = request.data.get('quantity')
         unit = request.data.get('unit', 'unit')
+        unit_of_measure_id = request.data.get('unit_of_measure_id')
 
-        if not raw_material_id or not quantity:
+        if not raw_material_id or quantity is None:
             return Response({'error': 'raw_material_id and quantity required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            qty_val = float(quantity)
+            if qty_val <= 0:
+                return Response({'error': 'Quantity must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+        except (ValueError, TypeError):
+            return Response({'error': 'Invalid quantity'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             raw_material = Item.objects.get(
                 id=raw_material_id, company=bom.finished_good.company,
                 category__in=['raw_material', 'intermediate'],
             )
+
+            if bom.finished_good_id == raw_material.id:
+                return Response({'error': 'An item cannot be a component of its own BOM.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            from .models import check_bom_cycle
+            if check_bom_cycle(bom.finished_good, raw_material):
+                return Response(
+                    {'error': f"Circular BOM dependency detected: '{raw_material.name}' would create a cycle with '{bom.finished_good.name}'."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            uom = None
+            if unit_of_measure_id:
+                from .models import UnitOfMeasure
+                uom = UnitOfMeasure.objects.filter(id=unit_of_measure_id).first()
+
             line, created = BOMLine.objects.get_or_create(
                 bom=bom, raw_material=raw_material,
-                defaults={'quantity': quantity, 'unit': unit}
+                defaults={'quantity': qty_val, 'unit': unit, 'unit_of_measure': uom}
             )
             if not created:
-                line.quantity = quantity
+                line.quantity = qty_val
                 line.unit = unit
+                if uom:
+                    line.unit_of_measure = uom
                 line.save()
 
             bom.finished_good.bom_completed = True
@@ -666,7 +693,10 @@ class BOMViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
             return Response(BOMLineSerializer(line).data, status=status.HTTP_201_CREATED)
         except Item.DoesNotExist:
-            return Response({'error': 'Raw material not found or not a raw material'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'error': 'Item not found or not a valid raw material or semi-finished product'}, status=status.HTTP_404_NOT_FOUND)
+        except ValidationError as e:
+            msg = e.message_dict if hasattr(e, 'message_dict') else str(e)
+            return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['delete'])
     def remove_line(self, request, pk=None):
@@ -682,3 +712,15 @@ class BOMViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return Response({'status': 'line removed'})
         except BOMLine.DoesNotExist:
             return Response({'error': 'Line not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=['get'])
+    def explode(self, request, pk=None):
+        """Recursively explode this BOM to view all component requirements."""
+        bom = self.get_object()
+        from production.mrp import explode_bom_tree
+        try:
+            qty = float(request.query_params.get('quantity', 1.0))
+        except (ValueError, TypeError):
+            qty = 1.0
+        tree = explode_bom_tree(bom.finished_good, qty)
+        return Response(tree)

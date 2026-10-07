@@ -12,7 +12,7 @@ from django.utils import timezone
 
 from accounts.permission import IsAdmin, IsProduction, IsQuality, IsSales, IsStore
 from .models import (
-    ManufacturingSettings, ProductionLine, ProductionOperation, ProductionOrder, Recipe,
+    ManufacturingSettings, ProductionLine, ProductionOperation, ProductionOrder, ProductionPlan, Recipe,
     RecipeIngredient, Resource, ResourceUnavailability, RoutingStep, ScrapRecord,
 )
 from .serializers import (
@@ -21,6 +21,7 @@ from .serializers import (
     ProductionMaterialRequirementSerializer,
     ProductionOperationSerializer,
     ProductionOrderSerializer,
+    ProductionPlanSerializer,
     ProductionOutputSerializer,
     RecipeIngredientSerializer,
     RecipeSerializer,
@@ -30,8 +31,11 @@ from .serializers import (
     ScrapRecordSerializer,
 )
 from . import execution
+from inventory.models import Stock, Warehouse
+from inventory.services import increase_stock, decrease_stock
 from core.utils import log_activity
 from core.tenancy import CompanyScopedMixin
+
 
 class ProductionLineViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
@@ -188,7 +192,7 @@ def _company(request):
 class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "recipe__product__company"
     queryset = ProductionOrder.objects.select_related(
-        'recipe__product', 'line', 'warehouse', 'sales_order__customer'
+        'recipe__product', 'line', 'warehouse', 'sales_order__customer', 'production_plan'
     ).all()
     serializer_class = ProductionOrderSerializer
     permission_classes = [IsProduction | IsAdmin]
@@ -468,6 +472,7 @@ class ProductionOperationViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             machine=serializer.validated_data.get("machine"),
             manpower=serializer.validated_data.get("manpower"),
         )
+
         serializer.save()
 
     def _resource(self, request, key):
@@ -625,3 +630,139 @@ class ScheduleAllView(APIView):
             if dry_run:
                 transaction.set_rollback(True)
         return Response({"dry_run": dry_run, "orders": results})
+
+
+# -------------------------------------------------
+# 📋 Production Plan Order ViewSet
+# -------------------------------------------------
+
+class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """
+    Production Plan Order management (Make-to-Order planning bridge).
+    Links Customer Demand (Sales Order) to Manufacturing Execution (Production Order).
+    """
+    company_field = "company"
+    queryset = ProductionPlan.objects.select_related(
+        'company', 'sales_order', 'sales_order_item', 'customer', 'item', 'created_by'
+    ).prefetch_related('production_orders').all()
+    serializer_class = ProductionPlanSerializer
+    permission_classes = [IsProduction | IsAdmin | IsSales | IsStore]
+
+    def perform_create(self, serializer):
+        user = self.request.user if self.request.user.is_authenticated else None
+        plan = serializer.save(created_by=user)
+        log_activity(
+            self.request.user,
+            "Production",
+            "Create Production Plan",
+            f"Created plan {plan.plan_number} for {plan.planned_quantity} x '{plan.item.name}' (SO#{plan.sales_order_id})"
+        )
+
+    def perform_destroy(self, instance):
+        if instance.status == "converted" or instance.production_orders.exists():
+            raise ValidationError("Cannot delete a Production Plan that has already been converted to a Production Order.")
+        log_activity(
+            self.request.user,
+            "Production",
+            "Delete Production Plan",
+            f"Deleted plan {instance.plan_number}"
+        )
+        instance.delete()
+
+    @action(detail=True, methods=['post'], permission_classes=[IsProduction | IsAdmin])
+    def convert(self, request, pk=None):
+        """
+        Converts this Production Plan into a Production Order atomically.
+        """
+        plan = self.get_object()
+        warehouse_id = request.data.get('warehouse')
+        line_id = request.data.get('line')
+        start_time = request.data.get('start_time')
+        end_time = request.data.get('end_time')
+
+        warehouse = None
+        if warehouse_id:
+            warehouse = Warehouse.objects.filter(id=warehouse_id).first()
+        line = None
+        if line_id:
+            line = ProductionLine.objects.filter(id=line_id).first()
+
+        try:
+            prod_order = plan.convert_to_production_order(
+                warehouse=warehouse,
+                line=line,
+                start_time=start_time,
+                end_time=end_time,
+                user=request.user,
+            )
+            log_activity(
+                request.user,
+                "Production",
+                "Convert Plan to Order",
+                f"Converted Plan {plan.plan_number} to PO #{prod_order.id}"
+            )
+            return Response(
+                {
+                    "message": f"Successfully converted plan {plan.plan_number} to Production Order #{prod_order.id}",
+                    "production_order_id": prod_order.id,
+                    "production_order": ProductionOrderSerializer(prod_order).data,
+                    "plan": ProductionPlanSerializer(plan).data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsProduction | IsAdmin])
+    def change_status(self, request, pk=None):
+        plan = self.get_object()
+        new_status = request.data.get('status')
+        valid_statuses = [c[0] for c in ProductionPlan.STATUS_CHOICES]
+        if new_status not in valid_statuses:
+            return Response(
+                {"error": f"Invalid status '{new_status}'. Allowed: {valid_statuses}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if plan.status == 'converted' and new_status != 'converted':
+            return Response(
+                {"error": "Cannot change status of an already converted plan."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        plan.status = new_status
+        plan.save(update_fields=['status', 'updated_at'])
+        log_activity(
+            request.user,
+            "Production",
+            "Change Plan Status",
+            f"Changed status of plan {plan.plan_number} to '{new_status}'"
+        )
+        return Response(ProductionPlanSerializer(plan).data)
+
+    @action(detail=True, methods=['get', 'post'], permission_classes=[IsProduction | IsAdmin | IsSales | IsStore])
+    def mrp(self, request, pk=None):
+        """
+        Calculates Material Requirements Planning (MRP) for this Production Plan.
+        Recursively explodes multi-level BOMs down to raw materials, compares against
+        current available inventory, and identifies net requirements and shortages.
+        Pure calculation operation: does NOT modify stock and does NOT create Purchase Orders.
+        """
+        from .mrp import calculate_mrp_for_plan
+        from inventory.models import Warehouse
+        from django.core.exceptions import ValidationError
+
+        plan = self.get_object()
+        warehouse_id = request.data.get('warehouse') if request.method == 'POST' else request.query_params.get('warehouse')
+        warehouse = None
+        if warehouse_id:
+            warehouse = Warehouse.objects.filter(id=warehouse_id).first()
+
+        try:
+            mrp_result = calculate_mrp_for_plan(plan, warehouse=warehouse)
+            return Response(mrp_result, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            msg = e.message if hasattr(e, 'message') else str(e)
+            if hasattr(e, 'message_dict'):
+                msg = e.message_dict
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)

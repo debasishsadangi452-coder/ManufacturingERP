@@ -95,6 +95,14 @@ class Item(models.Model):
     def is_finished_good(self):
         return self.category == "finished_good"
 
+    @property
+    def is_semi_finished(self):
+        return self.category in ("intermediate", "semi_finished")
+
+    @property
+    def is_raw_material(self):
+        return self.category == "raw_material"
+
     def __str__(self):
         return self.name
 
@@ -105,6 +113,10 @@ class Warehouse(models.Model):
     )
     name = models.CharField(max_length=200)
     location = models.CharField(max_length=200)
+    is_quarantine = models.BooleanField(default=False, help_text="Designates this warehouse as a quarantine isolation location")
+
+    def __str__(self):
+        return self.name
 
 
 class Stock(models.Model):
@@ -135,6 +147,13 @@ class Batch(models.Model):
         ("legacy", "Legacy / manual"),
     ]
 
+    LOT_STATUS_CHOICES = [
+        ("quarantine", "Quarantine"),
+        ("available", "Available"),
+        ("rejected", "Rejected"),
+        ("hold", "Hold"),
+    ]
+
     item = models.ForeignKey(Item, on_delete=models.CASCADE)
     batch_number = models.CharField(max_length=100)  # the lot code
     expiry_date = models.DateField(null=True, blank=True)
@@ -148,6 +167,8 @@ class Batch(models.Model):
         "inventory.Warehouse", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="legacy")
+    status = models.CharField(max_length=20, choices=LOT_STATUS_CHOICES, default="available")
+    quarantine_released_at = models.DateTimeField(null=True, blank=True)
     # Raw lots point at the goods receipt they came in on.
     goods_receipt = models.ForeignKey(
         "procurement.GoodsReceipt", null=True, blank=True, on_delete=models.SET_NULL,
@@ -446,17 +467,52 @@ class ProcurementQuickBooksConfig(models.Model):
         return f"{self.company.name} - Procurement QB Config ({self.purchase_trigger})"
 
 
+def check_bom_cycle(parent_item, component_item, visited=None):
+    """
+    Check if adding component_item to parent_item's BOM would create a circular dependency.
+    Returns True if a cycle is detected, False otherwise.
+    """
+    if not parent_item or not component_item:
+        return False
+    if parent_item.id == component_item.id:
+        return True
+    if visited is None:
+        visited = set()
+    if component_item.id in visited:
+        return False
+    visited.add(component_item.id)
+
+    bom = getattr(component_item, "bom", None)
+    if not bom:
+        bom = BOM.objects.filter(finished_good=component_item).first()
+
+    if bom:
+        for line in bom.lines.select_related("raw_material").all():
+            if line.raw_material_id == parent_item.id:
+                return True
+            if check_bom_cycle(parent_item, line.raw_material, visited.copy()):
+                return True
+    return False
+
+
 class BOM(models.Model):
     """Bill of Materials for a finished good or an intermediate."""
     finished_good = models.OneToOneField(
         Item, on_delete=models.CASCADE, related_name="bom",
         limit_choices_to={"category__in": ["finished_good", "intermediate"]},
     )
+    is_active = models.BooleanField(default=True)
+    version = models.CharField(max_length=20, default="1.0")
+    status = models.CharField(max_length=20, default="active")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    @property
+    def product(self):
+        return self.finished_good
+
     def __str__(self):
-        return f"BOM for {self.finished_good.name}"
+        return f"BOM for {self.finished_good.name} (v{self.version})"
 
 
 class BOMLine(models.Model):
@@ -466,7 +522,7 @@ class BOMLine(models.Model):
     raw_material = models.ForeignKey(
         Item, on_delete=models.CASCADE, limit_choices_to={"category__in": ["raw_material", "intermediate"]}
     )
-    quantity = models.FloatField(help_text="Quantity of raw material per unit of finished good")
+    quantity = models.FloatField(help_text="Quantity of component per unit of parent good")
     unit = models.CharField(max_length=50, default="unit")
     # The unit `quantity` is expressed in. Nullable during backfill; when set,
     # stock deduction converts this into the raw material's base_unit.
@@ -477,6 +533,26 @@ class BOMLine(models.Model):
 
     class Meta:
         unique_together = ("bom", "raw_material")
+
+    @property
+    def component(self):
+        return self.raw_material
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        if self.quantity is not None and self.quantity <= 0:
+            raise ValidationError({"quantity": "Quantity must be greater than zero."})
+        if self.bom_id and self.raw_material_id:
+            if self.bom.finished_good_id == self.raw_material_id:
+                raise ValidationError({"raw_material": "An item cannot be a component of its own BOM."})
+            if check_bom_cycle(self.bom.finished_good, self.raw_material):
+                raise ValidationError({
+                    "raw_material": f"Circular BOM dependency detected: '{self.raw_material.name}' would create a cycle with '{self.bom.finished_good.name}'."
+                })
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
 
     def quantity_in_base_unit(self):
         """The line's quantity expressed in the raw material's base_unit, so it

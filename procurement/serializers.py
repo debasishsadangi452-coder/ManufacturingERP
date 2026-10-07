@@ -2,8 +2,46 @@ from rest_framework import serializers
 from .models import (
     Vendor, VendorPriceList, PurchaseOrder, PurchaseOrderItem, GoodsReceipt,
     Bill, BillLine, VendorEmail, VendorEmailAttachment, ScheduledPurchaseOrder,
+    PurchaseRequisition, PurchaseRequisitionItem,
 )
 from inventory.models import Item
+
+
+class PurchaseRequisitionItemSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source="item.name", read_only=True)
+    item_unit = serializers.CharField(source="item.unit", read_only=True)
+    item_sku = serializers.CharField(source="item.sku", read_only=True)
+
+    class Meta:
+        model = PurchaseRequisitionItem
+        fields = [
+            "id", "requisition", "item", "item_name", "item_unit", "item_sku",
+            "required_quantity", "available_quantity", "shortage_quantity",
+            "uom", "estimated_unit_price", "notes",
+        ]
+
+
+class PurchaseRequisitionSerializer(serializers.ModelSerializer):
+    items = PurchaseRequisitionItemSerializer(many=True, read_only=True)
+    production_plan_number = serializers.CharField(source="production_plan.plan_number", read_only=True)
+    sales_order_number = serializers.CharField(source="sales_order.order_number", read_only=True)
+    created_by_username = serializers.CharField(source="created_by.username", read_only=True)
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+    linked_po_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PurchaseRequisition
+        fields = [
+            "id", "requisition_number", "company", "warehouse", "warehouse_name",
+            "production_plan", "production_plan_number", "sales_order", "sales_order_number",
+            "status", "notes", "created_by", "created_by_username", "created_at",
+            "updated_at", "items", "linked_po_id",
+        ]
+        read_only_fields = ["requisition_number", "created_at", "updated_at"]
+
+    def get_linked_po_id(self, obj):
+        po = obj.purchase_orders.first()
+        return po.id if po else None
 
 
 class VendorSerializer(serializers.ModelSerializer):
@@ -75,6 +113,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     vendor_name = serializers.CharField(source="vendor.name", read_only=True)
     vendor_email = serializers.CharField(source="vendor.email", read_only=True)
     vendor_payment_terms = serializers.CharField(source="vendor.payment_terms", read_only=True)
+    requisition_number = serializers.CharField(source="requisition.requisition_number", read_only=True)
     email_count = serializers.SerializerMethodField()
     billing = serializers.SerializerMethodField()
 
@@ -82,6 +121,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         model = PurchaseOrder
         fields = [
             "id", "vendor", "vendor_name", "vendor_email", "vendor_payment_terms",
+            "requisition", "requisition_number",
             "created_at", "expected_delivery", "priority", "total_amount",
             "status", "notes", "items", "email_count", "quickbooks_id", "billing",
         ]
