@@ -35,12 +35,35 @@ class CustomerViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
 class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "customer__company"
-    queryset = SalesOrder.objects.all().order_by('-created_at')
+    queryset = SalesOrder.objects.all().order_by('-created_at').prefetch_related(
+        "salesorderitem_set__item",
+        "production_plans__production_orders",
+        "production_orders__recipe__product",
+        "production_orders__operations",
+        "purchase_requisitions__purchase_orders",
+    ).select_related("customer")
     serializer_class = SalesOrderSerializer
     # Production is included because the Operations Manager builds the
     # production schedule from confirmed customer orders — the orders are the
     # input to that job, so the role needs to see them.
     permission_classes = [IsSales | IsAdmin | IsStore | IsProduction]
+
+    @action(detail=True, methods=["post"])
+    def confirm_order(self, request, pk=None):
+        """Confirm an entered customer order without requiring a quotation."""
+        order = self.get_object()
+        if order.status not in ("pending", "pending_approval", "draft"):
+            return Response(
+                {"error": f"Order is '{order.status}' and cannot be confirmed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.status = "confirmed"
+        order.save(update_fields=["status"])
+        log_activity(
+            request.user, "Sales", "Confirm Sales Order",
+            f"Confirmed customer order SO-{order.id}",
+        )
+        return Response(SalesOrderSerializer(order, context=self.get_serializer_context()).data)
 
     def perform_create(self, serializer):
         order = serializer.save()
@@ -102,6 +125,16 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
           5. Sets the Sales Order status to 'confirmed'.
         """
         order = self.get_object()
+
+        from production.models import ManufacturingSettings
+        settings = ManufacturingSettings.for_company(order.customer.company)
+        if settings.business_model == "mto":
+            if order.status != "confirmed":
+                return Response(
+                    {"error": "Confirm the customer order first, then create its Production Plan."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            return self.create_production_plan(request, pk=pk)
 
         if order.status != 'pending':
             return Response(
@@ -282,6 +315,14 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        from production.models import ManufacturingSettings
+        settings = ManufacturingSettings.for_company(order.customer.company)
+        if settings.business_model == "mto" and order.status != "confirmed":
+            return Response(
+                {"error": "Confirm the customer order before creating its production plan."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         from production.models import ProductionPlan
         from production.serializers import ProductionPlanSerializer
 
@@ -345,7 +386,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 order_quantity=line.quantity,
                 planned_quantity=planned_qty,
                 target_date=target_date,
-                status="planned",
+                status="pending_approval" if settings.production_plan_approval_required else "planned",
                 notes=notes,
                 created_by=request.user if request.user.is_authenticated else None,
             )
@@ -558,6 +599,12 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         - Remaining quantities trigger a notification to production.
         """
         order = self.get_object()
+        from production.models import ManufacturingSettings
+        if not ManufacturingSettings.for_company(order.customer.company).allow_partial_production_and_dispatch:
+            return Response(
+                {"error": "Partial production and dispatch are disabled in manufacturing settings."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if order.status not in ('confirmed', 'shipped'):
             return Response(

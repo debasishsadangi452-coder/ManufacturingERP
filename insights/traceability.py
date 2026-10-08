@@ -17,12 +17,13 @@ from accounting.models import JournalEntry
 from fulfillment.models import Dispatch, FGAllocation
 from inventory.models import Batch, InventoryRequest, LotConsumption
 from procurement.models import GoodsReceipt, PurchaseOrder
-from production.models import ProductionMaterialRequirement, ProductionOrder
+from production.models import ProductionMaterialRequirement, ProductionOrder, ProductionPlan
 from quality.models import QualityCheck
 from sales.models import CustomerPayment, Invoice, SalesOrder
 
 SEARCH_TYPES = (
     "sales_order", "production_plan", "production_order", "product", "lot", "dispatch", "invoice",
+    "purchase_order", "goods_receipt",
 )
 
 
@@ -38,9 +39,19 @@ def resolve(company, search_type, value):
     if search_type == "sales_order":
         sos |= set(SalesOrder.objects.filter(customer__company=company, pk=_num(value)))
     elif search_type == "production_plan":
-        matches = pos.filter(production_plan_ref__iexact=str(value).strip())
+        raw_value = str(value).strip()
+        plan_obj = ProductionPlan.objects.filter(company=company).filter(
+            Q(plan_number__iexact=raw_value) | Q(pk=_num(raw_value) or 0)
+        ).first()
+        matches = pos.filter(
+            Q(production_plan=plan_obj) | Q(production_plan_ref__iexact=raw_value)
+        ) if plan_obj else pos.filter(production_plan_ref__iexact=raw_value)
         sos |= {p.sales_order for p in matches if p.sales_order_id}
         standalone |= {p for p in matches if not p.sales_order_id}
+        if plan_obj and plan_obj.sales_order_id:
+            sos.add(plan_obj.sales_order)
+        elif plan_obj:
+            standalone |= set(matches)
     elif search_type == "production_order":
         number = str(value).strip()
         matches = pos.filter(Q(order_number__iexact=number) | Q(pk=_num(number) or 0))
@@ -72,6 +83,18 @@ def resolve(company, search_type, value):
     elif search_type == "invoice":
         sos |= {i.sales_order for i in Invoice.objects.filter(company=company, pk=_num(value) or 0)
                 if i.sales_order_id}
+    elif search_type == "purchase_order":
+        po = PurchaseOrder.objects.filter(vendor__company=company, pk=_num(value) or 0).select_related(
+            "requisition__sales_order"
+        ).first()
+        if po and po.requisition_id and po.requisition.sales_order_id:
+            sos.add(po.requisition.sales_order)
+    elif search_type == "goods_receipt":
+        receipt = GoodsReceipt.objects.filter(
+            purchase_order__vendor__company=company, pk=_num(value) or 0
+        ).select_related("purchase_order__requisition__sales_order").first()
+        if receipt and receipt.purchase_order.requisition_id and receipt.purchase_order.requisition.sales_order_id:
+            sos.add(receipt.purchase_order.requisition.sales_order)
     return [s for s in sos if s is not None], list(standalone)
 
 
@@ -106,7 +129,13 @@ def trace_production_orders(company, orders):
     all_orders = orders + [r for r in rework if r not in orders]
     order_ids = [o.id for o in all_orders]
 
-    plan = sorted({o.production_plan_ref for o in all_orders if o.production_plan_ref})
+    plan_refs = {o.production_plan_ref for o in all_orders if o.production_plan_ref}
+    plan = [
+        _rec("production_plan", p.id, p.plan_number, p.get_status_display(),
+             planned_quantity=p.planned_quantity, remaining_quantity=p.remaining_quantity,
+             target_date=p.target_date)
+        for p in ProductionPlan.objects.filter(company=company, plan_number__in=plan_refs)
+    ]
     mrp = []
     for o in all_orders:
         for r in o.material_requirements.select_related("item"):
@@ -190,6 +219,29 @@ def trace_sales_order(company, order):
 
     pos = ProductionOrder.objects.filter(sales_order=order, rework_of__isnull=True).select_related("recipe__product")
     m = trace_production_orders(company, pos)
+    planned_only = order.production_plans.exclude(status="cancelled").exclude(
+        plan_number__in=[r["label"] for r in m["plan"]]
+    )
+    from django.core.exceptions import ValidationError
+    from production.mrp import calculate_mrp_for_plan
+    for plan in planned_only:
+        m["plan"].append(_rec(
+            "production_plan", plan.id, plan.plan_number, plan.get_status_display(),
+            planned_quantity=plan.planned_quantity, remaining_quantity=plan.remaining_quantity,
+            target_date=plan.target_date,
+        ))
+        try:
+            requirements = calculate_mrp_for_plan(plan)["consolidated"]
+        except ValidationError as exc:
+            m["mrp"].append(_rec("production_plan", plan.id, f"MRP for {plan.plan_number}", "unavailable",
+                                 error=str(exc)))
+        else:
+            m["mrp"].extend(
+                _rec("item", row["item_id"], f"{row['item_name']} for {plan.plan_number}", row["status"],
+                     required=row["required_quantity"], available=row["available_quantity"],
+                     on_order=row["on_order_quantity"], shortage=row["shortage_quantity"], unit=row["unit"])
+                for row in requirements
+            )
     allocations = [
         _rec("allocation", a.id, f"ALLOC-{a.id}: {a.quantity:g} {a.item.name}", a.get_status_display(),
              quantity=a.quantity, dispatched=a.dispatched_quantity, date=a.created_at)
@@ -197,7 +249,7 @@ def trace_sales_order(company, order):
     ]
     dispatches = list(Dispatch.objects.filter(sales_order=order).prefetch_related("lines__item"))
     picking = [
-        _rec("dispatch", d.id, f"{d.dispatch_number} pick list", d.get_status_display(),
+        _rec("dispatch_pick", d.id, f"{d.dispatch_number} pick list", d.get_status_display(),
              lines=[{"item": l.item.name, "requested": l.requested_quantity, "picked": l.quantity} for l in d.lines.all()],
              picked_at=d.picked_at, packed_at=d.packed_at, staged_at=d.staged_at)
         for d in dispatches
@@ -242,6 +294,11 @@ def trace_sales_order(company, order):
         "customer_order": {
             "id": order.id, "number": f"SO-{order.id}", "customer": order.customer.name,
             "status": order.status, "source": order.source, "created_at": order.created_at,
+            "priority": order.get_priority_display(),
+            "customer_reference": order.customer_order_reference,
+            "required_delivery_date": order.required_delivery_date,
+            "custom_specifications": order.custom_specifications,
+            "delivery_requirements": order.delivery_requirements,
             "total_amount": float(order.total_amount), "lines": lines,
             "fulfilment_percent": round(dispatched / ordered * 100, 1) if ordered else 0,
         },

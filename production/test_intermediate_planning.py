@@ -4,7 +4,7 @@ from rest_framework.test import APIClient
 
 from accounts.models import Company, User
 from inventory.models import Item, Stock, Warehouse
-from production.models import ProductionLine, ProductionOrder, Recipe, RecipeIngredient
+from production.models import ProductionLine, ProductionOrder, ProductionPlan, Recipe, RecipeIngredient
 from production.planning import default_line_for, material_check
 from sales.models import Customer, SalesOrder, SalesOrderItem
 
@@ -101,16 +101,48 @@ class IntermediatePlanningTests(TestCase):
     def test_creating_an_order_requests_only_short_raw_materials(self):
         from inventory.models import InventoryRequest
 
+        customer = Customer.objects.create(company=self.company, name="MTO Customer")
+
         # Packing 100 bags: cookies short (intermediate). Baking 1,000 cookies: flour short (raw).
-        pack = self.client.post("/api/production/production-orders/", {
-            "recipe": self.pack.id, "quantity": 100, "warehouse": self.plant.id,
-        }, format="json").data
-        self.assertFalse(InventoryRequest.objects.filter(production_order_id=pack["id"]).exists())
+        pack_order = SalesOrder.objects.create(customer=customer, status="confirmed")
+        pack_item = SalesOrderItem.objects.create(sales_order=pack_order, item=self.bag, quantity=100)
+        pack_plan = ProductionPlan.objects.create(
+            company=self.company, sales_order=pack_order, sales_order_item=pack_item,
+            customer=customer, item=self.bag, order_quantity=100,
+            planned_quantity=100, status="approved",
+        )
+        pack_response = self.client.post(f"/api/production/production-plans/{pack_plan.id}/convert/")
+        self.assertEqual(pack_response.status_code, 201, pack_response.data)
+        self.assertFalse(
+            InventoryRequest.objects.filter(
+                production_order_id=pack_response.data["production_order_id"]
+            ).exists()
+        )
 
         # Stock in another warehouse still counts.
         other = Warehouse.objects.create(company=self.company, name="Annex", location="Back")
-        bake = self.client.post("/api/production/production-orders/", {
-            "recipe": self.bake.id, "quantity": 1000, "warehouse": other.id,
-        }, format="json").data
-        [request] = InventoryRequest.objects.filter(production_order_id=bake["id"])
+        bake_order = SalesOrder.objects.create(customer=customer, status="confirmed")
+        bake_item = SalesOrderItem.objects.create(sales_order=bake_order, item=self.cookie, quantity=1000)
+        bake_plan = ProductionPlan.objects.create(
+            company=self.company, sales_order=bake_order, sales_order_item=bake_item,
+            customer=customer, item=self.cookie, order_quantity=1000,
+            planned_quantity=1000, status="approved",
+        )
+        bake_response = self.client.post(
+            f"/api/production/production-plans/{bake_plan.id}/convert/",
+            {"warehouse": other.id},
+            format="json",
+        )
+        self.assertEqual(bake_response.status_code, 201, bake_response.data)
+        bake_id = bake_response.data["production_order_id"]
+        [request] = InventoryRequest.objects.filter(production_order_id=bake_id)
         self.assertEqual((request.item, request.quantity), (self.flour, 7))  # 12 kg needed, 5 on hand
+        self.assertEqual(request.status, "pending")
+        request_data = self.client.get("/api/inventory/requests/").data
+        serialized_request = next(row for row in request_data if row["id"] == request.id)
+        self.assertEqual(serialized_request["production_order"], bake_id)
+        self.assertEqual(serialized_request["production_plan_id"], bake_plan.id)
+        self.assertEqual(serialized_request["production_plan_number"], bake_plan.plan_number)
+        self.assertEqual(serialized_request["item_unit"], "kg")
+        self.assertEqual(serialized_request["status"], "pending")
+        self.assertIsNone(serialized_request["purchase_order_status"])

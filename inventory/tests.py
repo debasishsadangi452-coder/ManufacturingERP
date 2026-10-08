@@ -46,6 +46,11 @@ class InventoryProcurementFlowTests(APITestCase):
         self.assertEqual(request.status, "procuring")
         self.assertEqual(po.status, "pending")
         self.assertEqual(po.items.first().quantity, 25)
+        request_list = self.client.get("/api/inventory/requests/").data
+        serialized_request = next(row for row in request_list if row["id"] == request.id)
+        self.assertEqual(serialized_request["status"], "procuring")
+        self.assertEqual(serialized_request["purchase_order"], po.id)
+        self.assertEqual(serialized_request["purchase_order_status"], "pending")
 
     def test_procurement_rejects_finished_goods(self):
         request = InventoryRequest.objects.create(

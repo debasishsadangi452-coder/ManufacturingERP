@@ -76,17 +76,64 @@ def get_stock_available(item: Item, warehouse: Optional[Warehouse] = None, compa
         qs = qs.filter(warehouse__company=company)
 
     total = qs.aggregate(t=Sum("quantity"))["t"]
-    return float(total or 0.0)
+    on_hand = float(total or 0.0)
+    if item.category == "finished_good":
+        from fulfillment.models import FGAllocation
+        allocations = FGAllocation.objects.filter(item=item, status="active")
+        if company:
+            allocations = allocations.filter(company=company)
+        allocated = allocations.aggregate(total=Sum("quantity"), dispatched=Sum("dispatched_quantity"))
+        reserved = max(
+            float(allocated["total"] or 0) - float(allocated["dispatched"] or 0), 0
+        )
+        on_hand = max(on_hand - reserved, 0)
+    return on_hand
 
 
-def _convert_quantity_if_possible(qty: float, line_uom, item_base_uom) -> tuple[float, str]:
+def _open_purchase_quantity(item: Item, company=None) -> float:
+    from procurement.models import PurchaseOrderItem
+    from django.db.models import Q
+
+    rows = PurchaseOrderItem.objects.filter(
+        item=item, purchase_order__status__in=("pending", "approved", "ordered")
+    )
+    if company:
+        rows = rows.filter(
+            Q(purchase_order__vendor__company=company)
+            | Q(purchase_order__requisition__company=company)
+        )
+    total = 0.0
+    for line in rows.select_related("unit_of_measure", "item__base_unit", "item__purchase_unit"):
+        source_unit = line.unit_of_measure or item.purchase_unit
+        if source_unit and item.base_unit and source_unit.id != item.base_unit_id:
+            try:
+                total += float(convert(line.quantity, source_unit, item.base_unit, item=item))
+            except UomConversionError as exc:
+                raise ValidationError(str(exc))
+        else:
+            total += float(line.quantity)
+    return total
+
+
+def _minimum_order_quantity_in_base(item: Item) -> float:
+    minimum = float(item.minimum_order_quantity or 0)
+    source_unit, target_unit = item.purchase_unit, item.base_unit
+    if minimum > 0 and source_unit and target_unit and source_unit.id != target_unit.id:
+        try:
+            return float(convert(minimum, source_unit, target_unit, item=item))
+        except UomConversionError as exc:
+            raise ValidationError(str(exc))
+    return minimum
+
+
+def _convert_quantity_if_possible(qty: float, line_uom, item_base_uom, item=None) -> tuple[float, str]:
     """
     Converts line quantity to component item's base unit if possible.
     Returns (converted_quantity, uom_code_or_str).
     """
     if line_uom and item_base_uom and line_uom.id != item_base_uom.id:
         try:
-            converted = float(convert(qty, line_uom, item_base_uom))
+            converted = float(convert(qty, line_uom, item_base_uom, item=item))
             return converted, item_base_uom.code
         except UomConversionError as e:
             raise ValidationError(str(e))
@@ -118,7 +165,19 @@ def explode_bom_tree(
     current_visited = visited_ids.copy()
     current_visited.add(item.id)
 
-    bom = get_active_bom(item)
+    bom = BOM.objects.filter(finished_good=item, is_active=True).first()
+    formula = None
+    if bom:
+        bom = get_active_bom(item)
+    elif BOM.objects.filter(finished_good=item).exists():
+        get_active_bom(item)
+    else:
+        from .models import Recipe
+
+        formula = Recipe.objects.filter(product=item).first()
+        if formula is None:
+            get_active_bom(item)
+
     available_stock = get_stock_available(item, warehouse=warehouse, company=company)
 
     node = {
@@ -127,30 +186,47 @@ def explode_bom_tree(
         "category": item.category,
         "sku": item.sku,
         "level": level,
-        "bom_id": bom.id,
-        "bom_version": bom.version,
+        "bom_id": bom.id if bom else None,
+        "bom_version": bom.version if bom else None,
+        "formula_id": formula.id if formula else None,
+        "formula_version": str(formula.id) if formula else None,
+        "source": "bom" if bom else "formula",
         "required_quantity": quantity,
         "unit": item.base_unit.code if item.base_unit else item.unit,
         "available_stock": available_stock,
         "components": []
     }
 
-    for line in bom.lines.select_related("raw_material", "unit_of_measure", "raw_material__base_unit").all():
-        comp = line.raw_material
-        comp_uom = line.unit_of_measure or comp.base_unit
+    if bom:
+        components = []
+        for line in bom.lines.select_related("raw_material", "unit_of_measure", "raw_material__base_unit").all():
+            comp = line.raw_material
+            converted_line_qty, uom_str = _convert_quantity_if_possible(
+                line.quantity, line.unit_of_measure, comp.base_unit, item=comp
+            )
+            if not uom_str or uom_str == "unit":
+                uom_str = line.unit or comp.unit or "unit"
+            components.append((line, comp, converted_line_qty, uom_str, quantity * converted_line_qty))
+    else:
+        components = []
+        for ingredient, required_quantity in formula.material_requirements(quantity):
+            comp = ingredient.item
+            required_quantity = float(required_quantity)
+            components.append((
+                ingredient,
+                comp,
+                required_quantity / quantity,
+                comp.base_unit.code if comp.base_unit else comp.unit or "unit",
+                required_quantity,
+            ))
 
-        converted_line_qty, uom_str = _convert_quantity_if_possible(
-            line.quantity, line.unit_of_measure, comp.base_unit
-        )
-        if not uom_str or uom_str == "unit":
-            uom_str = line.unit or comp.unit or "unit"
-
-        component_required = quantity * converted_line_qty
+    for line, comp, converted_line_qty, uom_str, component_required in components:
         comp_available = get_stock_available(comp, warehouse=warehouse, company=company)
         shortage = max(0.0, component_required - comp_available)
 
         component_data = {
-            "bom_line_id": line.id,
+            "bom_line_id": line.id if bom else None,
+            "formula_line_id": line.id if formula else None,
             "item_id": comp.id,
             "item_name": comp.name,
             "category": comp.category,
@@ -168,11 +244,11 @@ def explode_bom_tree(
         }
 
         # If component is semi-finished, explode recursively
-        if comp.is_semi_finished:
+        if comp.is_semi_finished and shortage > 0:
             try:
                 sub_tree = explode_bom_tree(
                     item=comp,
-                    quantity=component_required,
+                    quantity=shortage,
                     level=level + 1,
                     parent_item=item,
                     visited_ids=current_visited,
@@ -259,6 +335,10 @@ def calculate_mrp_for_plan(plan, warehouse: Optional[Warehouse] = None) -> Dict[
                 "unit": line["unit"],
                 "required_quantity": 0.0,
                 "available_quantity": available,
+                "on_order_quantity": _open_purchase_quantity(item_obj, company=company),
+                "safety_stock": float(item_obj.safety_stock or 0),
+                "minimum_order_quantity": _minimum_order_quantity_in_base(item_obj),
+                "lead_time_days": item_obj.lead_time_days,
                 "parents": set(),
                 "levels": set(),
             }
@@ -275,9 +355,27 @@ def calculate_mrp_for_plan(plan, warehouse: Optional[Warehouse] = None) -> Dict[
     for item_id, data in consolidated_map.items():
         req_qty = round(data["required_quantity"], 4)
         avail_qty = round(data["available_quantity"], 4)
-        net_req = round(max(0.0, req_qty - avail_qty), 4)
+        from .models import ManufacturingSettings
+        settings = ManufacturingSettings.for_company(company)
+        on_order_qty = round(data["on_order_quantity"], 4) if settings.include_open_purchase_orders_in_mrp else 0.0
+        safety_stock = round(data["safety_stock"], 4) if settings.protect_safety_stock_in_mrp else 0.0
+        net_req = round(max(0.0, req_qty + safety_stock - avail_qty - on_order_qty), 4)
         shortage = net_req
-        status = "shortage" if shortage > 0 else "available"
+        recommended_purchase_quantity = (
+            max(shortage, data["minimum_order_quantity"]) if shortage > 0 else 0.0
+        )
+        purchase_by_date = None
+        if plan.target_date and data["lead_time_days"]:
+            from datetime import timedelta
+            purchase_by_date = (
+                plan.target_date - timedelta(days=data["lead_time_days"])
+            ).isoformat()
+        if shortage > 0:
+            status = "shortage"
+        elif req_qty > 0 and avail_qty < req_qty + safety_stock:
+            status = "incoming"
+        else:
+            status = "available"
 
         item_result = {
             "item_id": data["item_id"],
@@ -287,8 +385,13 @@ def calculate_mrp_for_plan(plan, warehouse: Optional[Warehouse] = None) -> Dict[
             "required_quantity": req_qty,
             "unit": data["unit"],
             "available_quantity": avail_qty,
+            "on_order_quantity": on_order_qty,
+            "safety_stock": safety_stock,
             "net_requirement": net_req,
             "shortage_quantity": shortage,
+            "recommended_purchase_quantity": round(recommended_purchase_quantity, 4),
+            "lead_time_days": data["lead_time_days"],
+            "purchase_by_date": purchase_by_date,
             "status": status,
             "used_by": sorted(list(data["parents"])),
             "levels": sorted(list(data["levels"])),
@@ -319,10 +422,15 @@ def calculate_mrp_for_plan(plan, warehouse: Optional[Warehouse] = None) -> Dict[
             "unit": plan.item.unit
         },
         "planned_quantity": float(plan.planned_quantity),
-        "bom": {
-            "id": tree["bom_id"],
-            "version": tree["bom_version"]
-        },
+        "bom": (
+            {"id": tree["bom_id"], "version": tree["bom_version"]}
+            if tree["source"] == "bom" else None
+        ),
+        "formula": (
+            {"id": tree["formula_id"], "version": tree["formula_version"]}
+            if tree["source"] == "formula" else None
+        ),
+        "source": tree["source"],
         "warehouse_id": warehouse.id if warehouse else None,
         "warehouse_name": warehouse.name if warehouse else ("All Warehouses" if not company else "Company Warehouses"),
         "has_shortage": has_shortage,

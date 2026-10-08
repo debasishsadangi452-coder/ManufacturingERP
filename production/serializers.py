@@ -208,6 +208,7 @@ class ProductionPlanSerializer(serializers.ModelSerializer):
     created_by_name = serializers.ReadOnlyField(source='created_by.username')
     production_orders = serializers.SerializerMethodField()
     recipe_id = serializers.SerializerMethodField()
+    remaining_quantity = serializers.ReadOnlyField()
 
     class Meta:
         model = ProductionPlan
@@ -225,6 +226,7 @@ class ProductionPlanSerializer(serializers.ModelSerializer):
             "item_unit",
             "order_quantity",
             "planned_quantity",
+            "remaining_quantity",
             "target_date",
             "status",
             "notes",
@@ -235,7 +237,7 @@ class ProductionPlanSerializer(serializers.ModelSerializer):
             "production_orders",
             "recipe_id",
         ]
-        read_only_fields = ["plan_number", "created_at", "updated_at"]
+        read_only_fields = ["plan_number", "status", "created_at", "updated_at"]
 
     def get_sales_order_number(self, obj):
         return f"SO-{obj.sales_order_id}" if obj.sales_order_id else None
@@ -253,6 +255,8 @@ class ProductionPlanSerializer(serializers.ModelSerializer):
                 "warehouse_id": po.warehouse_id,
                 "line_id": po.line_id,
                 "line_name": po.line.name if po.line else "Unassigned",
+                "planned_start": po.planned_start,
+                "planned_end": po.planned_end,
                 "start_time": po.start_time,
                 "end_time": po.end_time,
             }

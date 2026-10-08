@@ -28,7 +28,7 @@ STANDARD_UNITS = [
 ]
 
 
-def convert(qty, from_uom, to_uom):
+def convert(qty, from_uom, to_uom, item=None):
     """Convert `qty` from one UnitOfMeasure to another within the same dimension.
 
     `from_uom`/`to_uom` are UnitOfMeasure instances. Returns a Decimal.
@@ -39,10 +39,27 @@ def convert(qty, from_uom, to_uom):
         raise UomConversionError("Both source and target units are required to convert.")
     if from_uom.pk == to_uom.pk:
         return Decimal(str(qty))
+    if item is not None:
+        from .models import ItemUOMConversion
+        conversion = ItemUOMConversion.objects.filter(
+            item=item, from_unit=from_uom, to_unit=to_uom
+        ).first()
+        if conversion:
+            return Decimal(str(qty)) * conversion.factor
+        reverse = ItemUOMConversion.objects.filter(
+            item=item, from_unit=to_uom, to_unit=from_uom
+        ).first()
+        if reverse:
+            return Decimal(str(qty)) / reverse.factor
     if from_uom.dimension != to_uom.dimension:
+        if item is None:
+            raise UomConversionError(
+                f"Cannot convert {from_uom.code} ({from_uom.dimension}) to "
+                f"{to_uom.code} ({to_uom.dimension}) without an item-specific conversion."
+            )
         raise UomConversionError(
-            f"Cannot convert {from_uom.code} ({from_uom.dimension}) to "
-            f"{to_uom.code} ({to_uom.dimension}) — different dimensions."
+            f"No item-specific conversion exists for {item.name}: "
+            f"{from_uom.code} to {to_uom.code}."
         )
     base = Decimal(str(qty)) * Decimal(str(from_uom.to_base_factor))
     return base / Decimal(str(to_uom.to_base_factor))

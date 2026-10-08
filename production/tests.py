@@ -119,6 +119,8 @@ class ProductionPlanWorkflowTests(TestCase):
 
     def test_customer_order_to_production_plan_creation(self):
         """C. Customer Order -> Production Plan creation via sales action"""
+        self.sales_order.status = "confirmed"
+        self.sales_order.save(update_fields=["status"])
         self.client.force_authenticate(user=self.sales_user)
         res = self.client.post(
             f"/api/sales/sales-orders/{self.sales_order.id}/create_production_plan/",
@@ -151,6 +153,8 @@ class ProductionPlanWorkflowTests(TestCase):
 
     def test_duplicate_plan_creation_prevention(self):
         """Prevent duplicate active plan creation for same order line"""
+        self.sales_order.status = "confirmed"
+        self.sales_order.save(update_fields=["status"])
         ProductionPlan.objects.create(
             company=self.company,
             sales_order=self.sales_order,
@@ -220,6 +224,8 @@ class ProductionPlanWorkflowTests(TestCase):
 
     def test_convert_to_production_order_success_and_traceability(self):
         """H, I, J. Production Plan -> Production Order conversion & complete traceability"""
+        self.sales_order.status = "confirmed"
+        self.sales_order.save(update_fields=["status"])
         plan = ProductionPlan.objects.create(
             company=self.company,
             sales_order=self.sales_order,
@@ -263,6 +269,8 @@ class ProductionPlanWorkflowTests(TestCase):
 
     def test_prevent_duplicate_conversion(self):
         """K. Prevent duplicate conversion"""
+        self.sales_order.status = "confirmed"
+        self.sales_order.save(update_fields=["status"])
         plan = ProductionPlan.objects.create(
             company=self.company,
             sales_order=self.sales_order,
@@ -475,6 +483,11 @@ class Phase2MRPTests(TestCase):
             calculate_mrp_for_plan(plan)
         self.assertIn("Active BOM not found", str(ctx.exception))
 
+        self.client.force_authenticate(user=self.admin_user)
+        response = self.client.get(f"/api/production/production-plans/{plan.id}/mrp/")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Active BOM not found", str(response.data["error"]))
+
     def test_single_level_mrp_calculation(self):
         """L: Single-level MRP calculation with gross, available, net requirement and shortage"""
         from inventory.models import BOM, BOMLine
@@ -508,6 +521,30 @@ class Phase2MRPTests(TestCase):
         self.assertEqual(flour_res["available_quantity"], 40.0)
         self.assertEqual(flour_res["shortage_quantity"], 10.0)
         self.assertEqual(flour_res["status"], "shortage")
+
+    def test_mrp_uses_existing_formula_when_bom_is_not_configured(self):
+        from production.models import Recipe, RecipeIngredient
+        from production.mrp import calculate_mrp_for_plan
+
+        fg = Item.objects.create(name="Formula-backed Product", category="finished_good", company=self.company)
+        flour = Item.objects.create(name="Formula Flour", category="raw_material", unit="kg", company=self.company)
+        recipe = Recipe.objects.create(product=fg, batch_size=10)
+        RecipeIngredient.objects.create(recipe=recipe, item=flour, quantity=4)
+        plan = ProductionPlan.objects.create(
+            sales_order=self.sales_order,
+            customer=self.customer,
+            item=fg,
+            order_quantity=25,
+            planned_quantity=25,
+            company=self.company,
+        )
+
+        result = calculate_mrp_for_plan(plan, warehouse=self.warehouse)
+
+        self.assertEqual(result["source"], "formula")
+        self.assertEqual(result["formula"]["id"], recipe.id)
+        self.assertIsNone(result["bom"])
+        self.assertEqual(result["raw_materials"][0]["required_quantity"], 12)
 
     def test_uom_conversion_in_mrp(self):
         """P: UOM conversion handles kg to g properly"""
@@ -546,8 +583,8 @@ class Phase2MRPTests(TestCase):
         Inventory: RAW-A = 1000 kg, RAW-B = 800 kg, SEMI-FINISHED-X = 100 kg
         Expected MRP:
         SEMI-FINISHED-X: Required = 300 kg, Available = 100 kg, Shortage = 200 kg
-        RAW-A: Required = 1500 kg, Available = 1000 kg, Shortage = 500 kg
-        RAW-B: Required = 700 kg, Available = 800 kg, Shortage = 0
+        RAW-A: Required = 1000 kg, Available = 1000 kg, Shortage = 0
+        RAW-B: Required = 500 kg, Available = 800 kg, Shortage = 0
         """
         from inventory.models import BOM, BOMLine
         from production.mrp import calculate_mrp_for_plan
@@ -597,17 +634,18 @@ class Phase2MRPTests(TestCase):
         self.assertEqual(sf_res["shortage_quantity"], 200.0)
         self.assertEqual(sf_res["status"], "shortage")
 
-        # 2. RAW-A: Required = 1500 kg, Available = 1000 kg, Shortage = 500 kg
+        # Only the 200 kg semi-finished shortage is produced; stocked
+        # semi-finished goods are not exploded into additional raw demand.
         raw_a_res = next(item for item in result["raw_materials"] if item["item_name"] == "RAW-A")
-        self.assertEqual(raw_a_res["required_quantity"], 1500.0)
+        self.assertEqual(raw_a_res["required_quantity"], 1000.0)
         self.assertEqual(raw_a_res["available_quantity"], 1000.0)
-        self.assertEqual(raw_a_res["net_requirement"], 500.0)
-        self.assertEqual(raw_a_res["shortage_quantity"], 500.0)
-        self.assertEqual(raw_a_res["status"], "shortage")
+        self.assertEqual(raw_a_res["net_requirement"], 0.0)
+        self.assertEqual(raw_a_res["shortage_quantity"], 0.0)
+        self.assertEqual(raw_a_res["status"], "available")
 
-        # 3. RAW-B: Required = 700 kg (600 + 100), Available = 800 kg, Shortage = 0
+        # 3. RAW-B: Required = 500 kg (400 + 100), Available = 800 kg, Shortage = 0
         raw_b_res = next(item for item in result["raw_materials"] if item["item_name"] == "RAW-B")
-        self.assertEqual(raw_b_res["required_quantity"], 700.0)
+        self.assertEqual(raw_b_res["required_quantity"], 500.0)
         self.assertEqual(raw_b_res["available_quantity"], 800.0)
         self.assertEqual(raw_b_res["net_requirement"], 0.0)
         self.assertEqual(raw_b_res["shortage_quantity"], 0.0)

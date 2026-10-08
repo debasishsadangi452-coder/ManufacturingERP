@@ -52,7 +52,7 @@ class VendorSerializer(serializers.ModelSerializer):
 
 class VendorPriceListSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.name", read_only=True)
-    item_unit = serializers.CharField(source="item.unit", read_only=True)
+    item_unit = serializers.SerializerMethodField()
     vendor_name = serializers.CharField(source="vendor.name", read_only=True)
 
     class Meta:
@@ -64,10 +64,14 @@ class VendorPriceListSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["effective_date", "updated_at"]
 
+    def get_item_unit(self, obj):
+        unit = obj.item.purchase_unit or obj.item.base_unit
+        return unit.code if unit else obj.item.unit
+
     def validate_item(self, item):
-        if item.category != "raw_material":
+        if item.category not in ("raw_material", "packaging"):
             raise serializers.ValidationError(
-                "Only raw materials can be assigned to vendors for purchasing."
+                "Only raw materials and packaging materials can be assigned to vendors for purchasing."
             )
         return item
 
@@ -87,25 +91,43 @@ class VendorPriceListSerializer(serializers.ModelSerializer):
 
 class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.name", read_only=True)
-    item_unit = serializers.CharField(source="item.unit", read_only=True)
+    item_unit = serializers.SerializerMethodField()
     item_sku = serializers.CharField(source="item.sku", read_only=True)
     total_price = serializers.DecimalField(
         max_digits=12, decimal_places=2, read_only=True
     )
+    unit_of_measure_code = serializers.CharField(source="unit_of_measure.code", read_only=True)
 
     class Meta:
         model = PurchaseOrderItem
         fields = [
             "id", "purchase_order", "item", "item_name", "item_unit", "item_sku",
-            "quantity", "unit_price", "total_price",
+            "quantity", "unit_of_measure", "unit_of_measure_code", "unit_price", "total_price",
         ]
 
+    def get_item_unit(self, obj):
+        unit = obj.unit_of_measure or obj.item.purchase_unit or obj.item.base_unit
+        return unit.code if unit else obj.item.unit
+
     def validate_item(self, item):
-        if item.category != "raw_material":
+        if item.category not in ("raw_material", "packaging"):
             raise serializers.ValidationError(
-                "Only raw materials can be purchased from vendors."
+                "Only raw materials and packaging materials can be purchased from vendors."
             )
         return item
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        company = getattr(getattr(request, "user", None), "company", None)
+        item = attrs.get("item", getattr(self.instance, "item", None))
+        unit = attrs.get("unit_of_measure", getattr(self.instance, "unit_of_measure", None))
+        if unit is None and item is not None:
+            unit = item.purchase_unit or item.base_unit
+        if company and unit and unit.company_id not in (None, company.id):
+            raise serializers.ValidationError({"unit_of_measure": "Pick a shared unit or one belonging to your company."})
+        if item and unit and unit.company_id not in (None, getattr(item.company, "id", None)):
+            raise serializers.ValidationError({"unit_of_measure": "The unit must be shared or belong to the item's company."})
+        return attrs
 
 
 class PurchaseOrderSerializer(serializers.ModelSerializer):

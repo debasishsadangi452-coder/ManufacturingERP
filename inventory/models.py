@@ -44,15 +44,23 @@ class Item(models.Model):
     # a baked cookie that is then packed); never bought or sold directly.
     CATEGORY_CHOICES = [
         ("raw_material", "Raw Material"),
+        ("packaging", "Packaging / Other Material"),
         ("intermediate", "Intermediate (semi-finished)"),
         ("finished_good", "Finished Good"),
     ]
 
     ERP_CLASSIFICATION_CHOICES = [
         ("raw_material", "Raw Material"),
+        ("packaging", "Packaging / Other Material"),
         ("intermediate", "Intermediate (semi-finished)"),
         ("finished_good", "Finished Good"),
         ("out_of_scope", "Out of Scope"),
+    ]
+    COSTING_RULE_CHOICES = [
+        ("purchase_cost", "Item purchase cost"),
+        ("latest_po", "Latest purchase price"),
+        ("weighted_average", "Weighted average"),
+        ("standard", "Standard cost"),
     ]
 
     company = models.ForeignKey(
@@ -72,6 +80,10 @@ class Item(models.Model):
         "inventory.UnitOfMeasure", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="+",
     )
+    default_warehouse = models.ForeignKey(
+        "inventory.Warehouse", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="default_items",
+    )
     # Sale price per unit for finished goods; drives sales order totals
     # and the revenue figures on the finance dashboard.
     selling_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -81,6 +93,10 @@ class Item(models.Model):
     sku = models.CharField(max_length=100, blank=True, default="")
     purchase_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     reorder_point = models.FloatField(null=True, blank=True)
+    safety_stock = models.FloatField(default=0)
+    minimum_order_quantity = models.FloatField(default=0)
+    lead_time_days = models.PositiveIntegerField(default=0)
+    costing_rule = models.CharField(max_length=24, choices=COSTING_RULE_CHOICES, default="purchase_cost")
     # Onboarding fields
     erp_classification = models.CharField(max_length=20, choices=ERP_CLASSIFICATION_CHOICES, null=True, blank=True)
     classification_completed_at = models.DateTimeField(null=True, blank=True)
@@ -108,11 +124,21 @@ class Item(models.Model):
 
 
 class Warehouse(models.Model):
+    TYPE_CHOICES = [
+        ("general", "General"),
+        ("raw_material", "Raw Material / Purchasing"),
+        ("production", "Production / Shop Floor"),
+        ("finished_goods", "Finished Goods"),
+        ("virtual", "Virtual"),
+    ]
+
     company = models.ForeignKey(
         "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
     )
     name = models.CharField(max_length=200)
     location = models.CharField(max_length=200)
+    warehouse_type = models.CharField(max_length=24, choices=TYPE_CHOICES, default="general")
+    is_virtual = models.BooleanField(default=False)
     is_quarantine = models.BooleanField(default=False, help_text="Designates this warehouse as a quarantine isolation location")
 
     def __str__(self):
@@ -126,6 +152,27 @@ class Stock(models.Model):
 
     class Meta:
         unique_together = ("item", "warehouse")
+
+
+class ItemUOMConversion(models.Model):
+    """Per-item conversion, for pack sizes or dimension-changing factors."""
+
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name="uom_conversions")
+    from_unit = models.ForeignKey(UnitOfMeasure, on_delete=models.CASCADE, related_name="+")
+    to_unit = models.ForeignKey(UnitOfMeasure, on_delete=models.CASCADE, related_name="+")
+    factor = models.DecimalField(
+        max_digits=20, decimal_places=8,
+        help_text="Quantity in target units for one source unit (e.g. 1 case = 12 each).",
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["item", "from_unit", "to_unit"], name="uniq_item_uom_conversion"),
+            models.CheckConstraint(condition=models.Q(factor__gt=0), name="item_uom_conversion_factor_positive"),
+        ]
+
+    def __str__(self):
+        return f"1 {self.from_unit.code} {self.item.name} = {self.factor} {self.to_unit.code}"
 
 
 
@@ -263,6 +310,13 @@ class InventoryRequest(models.Model):
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE)
     quantity = models.FloatField()
     production_order = models.ForeignKey("production.ProductionOrder", on_delete=models.CASCADE, null=True, blank=True)
+    production_plan = models.ForeignKey(
+        "production.ProductionPlan",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="inventory_requests",
+    )
     # The PO raised to fill this request. Without it, goods receipt has no way
     # back to the production order that is waiting on the material, so nobody
     # tells production the delivery has landed.
@@ -274,7 +328,8 @@ class InventoryRequest(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"Request: {self.item.name} ({self.quantity}) for {self.production_order}"
+        source = self.production_order or self.production_plan or "Manual request"
+        return f"Request: {self.item.name} ({self.quantity}) for {source}"
 
 
 class StockTransfer(models.Model):
@@ -520,7 +575,8 @@ class BOMLine(models.Model):
     bom = models.ForeignKey(BOM, on_delete=models.CASCADE, related_name="lines")
     # A raw material, or an intermediate made by its own BOM (multi-level BOM).
     raw_material = models.ForeignKey(
-        Item, on_delete=models.CASCADE, limit_choices_to={"category__in": ["raw_material", "intermediate"]}
+        Item, on_delete=models.CASCADE,
+        limit_choices_to={"category__in": ["raw_material", "packaging", "intermediate", "semi_finished"]}
     )
     quantity = models.FloatField(help_text="Quantity of component per unit of parent good")
     unit = models.CharField(max_length=50, default="unit")
@@ -570,7 +626,7 @@ class BOMLine(models.Model):
         if not line_uom or not base_uom:
             return Decimal(str(self.quantity))
         try:
-            return convert(self.quantity, line_uom, base_uom)
+            return convert(self.quantity, line_uom, base_uom, item=self.raw_material)
         except UomConversionError:
             # Misconfigured units (e.g. count vs mass): don't silently corrupt
             # stock — surface the raw quantity and let validation catch it.
@@ -578,3 +634,7 @@ class BOMLine(models.Model):
 
     def __str__(self):
         return f"{self.quantity} x {self.raw_material.name} → {self.bom.finished_good.name}"
+
+    @property
+    def item(self):
+        return self.raw_material

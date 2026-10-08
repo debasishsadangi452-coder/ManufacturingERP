@@ -175,6 +175,15 @@ def on_production_order_change(sender, instance, created, **kwargs):
 
             shortages = []
             to_make = []
+            plan_id = None
+            if instance.production_plan_id:
+                plan_id = instance.production_plan_id
+            elif instance.production_plan_ref:
+                from production.models import ProductionPlan
+                plan_id = ProductionPlan.objects.filter(
+                    plan_number=instance.production_plan_ref
+                ).values_list('id', flat=True).first()
+
             # Ingredient quantities are per batch — scale by whole batches.
             for ing, required in instance.recipe.material_requirements(instance.quantity):
                 # Stock anywhere counts: completion draws from every warehouse.
@@ -187,12 +196,31 @@ def on_production_order_change(sender, instance, created, **kwargs):
                     to_make.append(f'{ing.item.name} ({required - current_qty:g})')
                     continue
                 shortages.append(ing.item.name)
-                InventoryRequest.objects.get_or_create(
-                    item=ing.item,
-                    warehouse=instance.warehouse,
-                    production_order=instance,
-                    defaults={'quantity': required - current_qty, 'status': 'pending'},
-                )
+                request = None
+                if plan_id:
+                    request = InventoryRequest.objects.filter(
+                        item=ing.item,
+                        production_plan_id=plan_id,
+                        status__in=['pending', 'procuring'],
+                    ).first()
+                if request:
+                    request.production_order = instance
+                    update_fields = ['production_order']
+                    if request.status == 'pending':
+                        request.quantity = required - current_qty
+                        update_fields.append('quantity')
+                    request.save(update_fields=update_fields)
+                else:
+                    InventoryRequest.objects.get_or_create(
+                        item=ing.item,
+                        warehouse=instance.warehouse,
+                        production_order=instance,
+                        defaults={
+                            'production_plan_id': plan_id,
+                            'quantity': required - current_qty,
+                            'status': 'pending',
+                        },
+                    )
 
             if to_make:
                 _notify('production', f'Production #{instance.id} needs intermediates produced first: {", ".join(to_make)}.', instance.id, 'ProductionOrder', company, 'production')

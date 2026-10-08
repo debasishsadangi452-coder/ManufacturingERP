@@ -495,15 +495,27 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         # QA-pending lot and only becomes usable stock when quality accepts it.
         hold_for_qc = ManufacturingSettings.for_company(po.vendor.company).incoming_qc_required
         for poi in po.items.all():
+            received_base_quantity = poi.quantity
+            if poi.unit_of_measure_id and poi.item.base_unit_id:
+                from inventory.uom import UomConversionError, convert
+                try:
+                    received_base_quantity = float(convert(
+                        poi.quantity, poi.unit_of_measure, poi.item.base_unit, item=poi.item
+                    ))
+                except UomConversionError as exc:
+                    raise ValidationError({
+                        "items": f"Cannot receive {poi.item.name} from {poi.unit_of_measure.code} "
+                                 f"into stock unit {poi.item.base_unit.code}: {exc}"
+                    })
             if not hold_for_qc:
                 increase_stock(
-                    poi.item, receipt.warehouse, poi.quantity,
+                    poi.item, receipt.warehouse, received_base_quantity,
                     user=self.request.user, reference=f"GRN PO#{po.id}",
                 )
             # 🔗 SQF traceability: every received line becomes a raw lot tied to
             # this goods receipt (and thus the vendor delivery).
             lot = create_raw_lot(
-                poi.item, receipt.warehouse, poi.quantity, receipt,
+                poi.item, receipt.warehouse, received_base_quantity, receipt,
                 company=getattr(poi.item, "company", None),
             )
             if hold_for_qc:
@@ -513,10 +525,12 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 QualityCheck.objects.create(
                     inspection_type="incoming", goods_receipt=receipt, vendor=po.vendor,
                     item=poi.item, warehouse=receipt.warehouse, lot=lot,
-                    received_quantity=poi.quantity, status="pending",
+                    received_quantity=received_base_quantity, status="pending",
                     test_type="Incoming Inspection",
                 )
-            items_received.append(f"{poi.quantity} x {poi.item.name}")
+            items_received.append(
+                f"{poi.quantity} {poi.unit_of_measure.code if poi.unit_of_measure_id else poi.item.unit} x {poi.item.name}"
+            )
         if hold_for_qc:
             from core.utils import send_notification
             send_notification(
@@ -910,12 +924,32 @@ class PurchaseRequisitionViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             for req_item in items_to_procure:
                 vp = VendorPriceList.objects.filter(vendor=vendor, item=req_item.item, is_active=True).first()
                 unit_price = vp.unit_price if vp else (req_item.estimated_unit_price or req_item.item.purchase_cost or Decimal("0.00"))
-                po_qty = max(float(req_item.shortage_quantity), float(vp.min_order_qty if vp else 0))
+                item = req_item.item
+                purchase_unit = item.purchase_unit or item.base_unit
+                shortage_purchase_quantity = float(req_item.shortage_quantity)
+                if item.base_unit and purchase_unit and item.base_unit_id != purchase_unit.id:
+                    if req_item.uom == item.base_unit.code:
+                        from inventory.uom import UomConversionError, convert
+                        try:
+                            shortage_purchase_quantity = float(convert(
+                                req_item.shortage_quantity, item.base_unit, purchase_unit, item=item
+                            ))
+                        except UomConversionError as exc:
+                            raise ValidationError({"unit_of_measure": str(exc)})
+                    elif req_item.uom != purchase_unit.code:
+                        raise ValidationError({
+                            "uom": f"Requisition unit '{req_item.uom}' cannot be reconciled with "
+                                   f"{item.base_unit.code} or {purchase_unit.code} for {item.name}."
+                        })
+                item_moq = float(item.minimum_order_quantity or 0)
+                vendor_moq = float(vp.min_order_qty if vp else 0)
+                po_qty = max(shortage_purchase_quantity, item_moq, vendor_moq)
 
                 PurchaseOrderItem.objects.create(
                     purchase_order=po,
-                    item=req_item.item,
+                    item=item,
                     quantity=po_qty,
+                    unit_of_measure=purchase_unit,
                     unit_price=unit_price,
                 )
 

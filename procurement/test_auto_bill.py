@@ -7,7 +7,7 @@ from rest_framework import status
 from accounting.models import AccountingSettings, JournalEntry
 from accounting.test_auto_posting import AutoPostingTestBase, lines_of
 from accounts.models import Company, User
-from inventory.models import Item, Warehouse
+from inventory.models import Batch, Item, Stock, UnitOfMeasure, Warehouse
 from procurement.billing import payment_terms_days
 from procurement.models import Bill, PurchaseOrder, PurchaseOrderItem, Vendor
 from django.utils import timezone
@@ -59,6 +59,28 @@ class AutoBillOnReceiptTests(AutoPostingTestBase):
                             bill_date=timezone.localdate(), total_amount=Decimal("200.00"))
         self.receive(po)
         self.assertEqual(Bill.objects.filter(purchase_order=po).count(), 1)
+
+    def test_receipt_converts_purchase_quantity_to_stock_unit(self):
+        gram = UnitOfMeasure.objects.create(
+            company=self.company, code="g", name="Gram", dimension="mass",
+            to_base_factor=Decimal("1"), is_base=True,
+        )
+        kilogram = UnitOfMeasure.objects.create(
+            company=self.company, code="kg", name="Kilogram", dimension="mass",
+            to_base_factor=Decimal("1000"),
+        )
+        self.sugar.base_unit = gram
+        self.sugar.purchase_unit = kilogram
+        self.sugar.save(update_fields=["base_unit", "purchase_unit"])
+        po = PurchaseOrder.objects.create(vendor=self.vendor, status="ordered")
+        PurchaseOrderItem.objects.create(
+            purchase_order=po, item=self.sugar, quantity=2, unit_price=Decimal("2.00")
+        )
+
+        self.receive(po)
+
+        self.assertEqual(Stock.objects.get(item=self.sugar, warehouse=self.warehouse).quantity, 2000)
+        self.assertEqual(Batch.objects.get(goods_receipt__purchase_order=po).quantity, 2000)
 
     def test_companies_not_using_accounting_keep_the_old_behaviour(self):
         other = Company.objects.create(name="No Books Ltd", slug="nobooks")

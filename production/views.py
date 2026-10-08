@@ -7,6 +7,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.views import APIView
 from django.utils import timezone
 
@@ -198,6 +199,11 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     permission_classes = [IsProduction | IsAdmin]
 
     def perform_create(self, serializer):
+        settings = ManufacturingSettings.for_company(_company(self.request))
+        if settings.business_model == "mto":
+            raise ValidationError({
+                "production_plan": "In MTO mode, create a confirmed customer order and production plan, then convert the plan."
+            })
         line = serializer.validated_data.get('line')
         if line is None:
             # No line chosen: use the recipe's predefined line.
@@ -266,6 +272,11 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         from inventory.models import Warehouse
         from sales.models import SalesOrder
         company = _company(request)
+        if ManufacturingSettings.for_company(company).business_model == "mto":
+            return Response(
+                {"error": "In MTO mode, convert a confirmed customer order through its Production Plan."},
+                status=400,
+            )
         data = request.data
         recipe = Recipe.objects.filter(pk=data.get("recipe"), product__company=company).first()
         warehouse = Warehouse.objects.filter(pk=data.get("warehouse"), company=company).first() or \
@@ -650,7 +661,15 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
-        plan = serializer.save(created_by=user)
+        company = serializer.validated_data.get("company")
+        sales_order = serializer.validated_data.get("sales_order")
+        if company is None and sales_order:
+            company = sales_order.customer.company
+        settings = ManufacturingSettings.for_company(company)
+        if settings.production_plan_approval_required:
+            plan = serializer.save(created_by=user, status="pending_approval")
+        else:
+            plan = serializer.save(created_by=user)
         log_activity(
             self.request.user,
             "Production",
@@ -677,8 +696,10 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         plan = self.get_object()
         warehouse_id = request.data.get('warehouse')
         line_id = request.data.get('line')
-        start_time = request.data.get('start_time')
-        end_time = request.data.get('end_time')
+        from django.utils.dateparse import parse_datetime
+        start_time = parse_datetime(request.data["start_time"]) if request.data.get("start_time") else None
+        end_time = parse_datetime(request.data["end_time"]) if request.data.get("end_time") else None
+        quantity = request.data.get("quantity")
 
         warehouse = None
         if warehouse_id:
@@ -694,6 +715,7 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 start_time=start_time,
                 end_time=end_time,
                 user=request.user,
+                quantity=quantity,
             )
             log_activity(
                 request.user,
@@ -710,14 +732,15 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 },
                 status=status.HTTP_201_CREATED,
             )
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except (DjangoValidationError, ValidationError) as e:
+            detail = getattr(e, "detail", str(e))
+            return Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], permission_classes=[IsProduction | IsAdmin])
     def change_status(self, request, pk=None):
         plan = self.get_object()
         new_status = request.data.get('status')
-        valid_statuses = [c[0] for c in ProductionPlan.STATUS_CHOICES]
+        valid_statuses = ["draft", "planned", "cancelled"]
         if new_status not in valid_statuses:
             return Response(
                 {"error": f"Invalid status '{new_status}'. Allowed: {valid_statuses}"},
@@ -738,26 +761,108 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         )
         return Response(ProductionPlanSerializer(plan).data)
 
+    @action(detail=True, methods=["post"], permission_classes=[IsProduction | IsAdmin])
+    def approve(self, request, pk=None):
+        plan = self.get_object()
+        if plan.status != "pending_approval":
+            return Response(
+                {"error": "Only plans awaiting approval can be approved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        plan.status = "approved"
+        plan.save(update_fields=["status", "updated_at"])
+        log_activity(
+            request.user, "Production", "Approve Production Plan",
+            f"Approved plan {plan.plan_number}",
+        )
+        return Response(ProductionPlanSerializer(plan).data)
+
     @action(detail=True, methods=['get', 'post'], permission_classes=[IsProduction | IsAdmin | IsSales | IsStore])
     def mrp(self, request, pk=None):
         """
         Calculates Material Requirements Planning (MRP) for this Production Plan.
         Recursively explodes multi-level BOMs down to raw materials, compares against
         current available inventory, and identifies net requirements and shortages.
-        Pure calculation operation: does NOT modify stock and does NOT create Purchase Orders.
+        Production, store, and admin MRP runs also create or refresh linked Inventory
+        Requests for raw-material shortages. They never adjust stock or create POs.
         """
         from .mrp import calculate_mrp_for_plan
-        from inventory.models import Warehouse
+        from inventory.models import InventoryRequest, Warehouse
         from django.core.exceptions import ValidationError
 
         plan = self.get_object()
         warehouse_id = request.data.get('warehouse') if request.method == 'POST' else request.query_params.get('warehouse')
         warehouse = None
         if warehouse_id:
-            warehouse = Warehouse.objects.filter(id=warehouse_id).first()
+            warehouse = Warehouse.objects.filter(
+                id=warehouse_id, company=plan.company
+            ).first()
+            if warehouse is None:
+                warehouse = Warehouse.objects.filter(
+                    id=warehouse_id, company__isnull=True
+                ).first()
+            if warehouse is None:
+                return Response(
+                    {"error": "Select a warehouse belonging to your company."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         try:
             mrp_result = calculate_mrp_for_plan(plan, warehouse=warehouse)
+            if request.user.role in ('production', 'admin', 'store'):
+                request_warehouse = warehouse
+                if request_warehouse is None:
+                    request_warehouse = Warehouse.objects.filter(
+                        company=plan.company, warehouse_type="raw_material"
+                    ).first()
+                if request_warehouse is None:
+                    request_warehouse = Warehouse.objects.filter(
+                        company=plan.company, warehouse_type="production"
+                    ).first()
+                if request_warehouse is None:
+                    request_warehouse = Warehouse.objects.filter(company=plan.company).first()
+                if request_warehouse is None:
+                    request_warehouse = Warehouse.objects.filter(company__isnull=True).first()
+
+                shortages_by_item = {
+                    row["item_id"]: row
+                    for row in mrp_result["raw_materials"]
+                    if row["category"] == "raw_material" and row["shortage_quantity"] > 0
+                }
+                with transaction.atomic():
+                    ProductionPlan.objects.select_for_update().get(pk=plan.pk)
+                    pending_requests = InventoryRequest.objects.filter(
+                        production_plan=plan, status="pending"
+                    )
+                    for inventory_request in pending_requests:
+                        shortage = shortages_by_item.get(inventory_request.item_id)
+                        if not shortage:
+                            inventory_request.status = "cancelled"
+                            inventory_request.save(update_fields=["status"])
+                        elif inventory_request.quantity != shortage["shortage_quantity"]:
+                            inventory_request.quantity = shortage["shortage_quantity"]
+                            inventory_request.save(update_fields=["quantity"])
+
+                    if shortages_by_item and request_warehouse is None:
+                        raise ValidationError(
+                            "Configure a warehouse before sending material shortages to Inventory."
+                        )
+
+                    for item_id, shortage in shortages_by_item.items():
+                        existing = InventoryRequest.objects.filter(
+                            production_plan=plan,
+                            item_id=item_id,
+                            status__in=("pending", "procuring"),
+                        ).first()
+                        if existing:
+                            continue
+                        InventoryRequest.objects.create(
+                            production_plan=plan,
+                            item_id=item_id,
+                            warehouse=request_warehouse,
+                            quantity=shortage["shortage_quantity"],
+                            status="pending",
+                        )
             return Response(mrp_result, status=status.HTTP_200_OK)
         except ValidationError as e:
             msg = e.message if hasattr(e, 'message') else str(e)

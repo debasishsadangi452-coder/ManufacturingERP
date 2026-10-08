@@ -73,7 +73,7 @@ def conversion_checks(recipe, quantity, *, plan_approved=True):
         qty = 0
     add("quantity", qty > 0, "Quantity is valid." if qty > 0 else "Quantity must be greater than zero.")
 
-    ingredients = list(recipe.recipeingredient_set.select_related("item")) if recipe else []
+    ingredients = [ingredient for ingredient, _ in recipe.material_requirements(qty)] if recipe and qty > 0 else []
     add("bom", bool(ingredients),
         "Bill of materials found." if ingredients else "Product has no bill of materials / recipe ingredients.")
     bad_lines = [ing.item.name for ing in ingredients if not ing.quantity or ing.quantity <= 0]

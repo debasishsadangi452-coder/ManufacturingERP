@@ -1,6 +1,7 @@
 from django.http import HttpResponse
 from django.template.loader import render_to_string
 from django.utils import timezone
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -27,7 +28,7 @@ class DocumentView(APIView):
             return Response({"error": "Document source not found."}, status=404)
         try:
             doc = DOCUMENTS[doc_type][3](obj)
-        except ValueError as e:
+        except (ValueError, DjangoValidationError) as e:
             return Response({"error": str(e)}, status=400)
         html = render_to_string("documents/document.html", {"doc": doc, "printed_at": timezone.localtime()})
         return HttpResponse(html, content_type="text/html; charset=utf-8")

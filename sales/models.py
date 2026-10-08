@@ -31,6 +31,13 @@ class Customer(models.Model):
 # -------------------------------------------------
 
 class SalesOrder(models.Model):
+    PRIORITY_CHOICES = [
+        ("low", "Low"),
+        ("normal", "Normal"),
+        ("high", "High"),
+        ("urgent", "Urgent"),
+    ]
+
     customer = models.ForeignKey(Customer, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0.0)
@@ -44,6 +51,7 @@ class SalesOrder(models.Model):
         # Draft orders are excluded from the QuickBooks push until confirmed.
         ("draft", "Draft"),
         ("pending", "Pending"),
+        ("pending_approval", "Pending Approval"),
         ("confirmed", "Confirmed"),
         ("shipped", "Shipped"),
         ("delivered", "Delivered"),
@@ -74,6 +82,9 @@ class SalesOrder(models.Model):
         default="",
         help_text="Customer PO / external order reference"
     )
+    priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default="normal")
+    custom_specifications = models.TextField(blank=True, default="")
+    delivery_requirements = models.TextField(blank=True, default="")
 
     def __str__(self):
         return f"SO-{self.id}"

@@ -50,6 +50,14 @@ class Recipe(models.Model):
 
         Returns [(ingredient, required_qty), ...].
         """
+        from inventory.models import BOM
+        bom = BOM.objects.filter(finished_good=self.product, is_active=True).first()
+        if bom:
+            return [
+                (line, float(line.quantity_in_base_unit()) * units)
+                for line in bom.lines.select_related("raw_material").all()
+            ]
+
         batches = self.batches_for(units)["batches"]
         return [
             (ing, ing.quantity * batches)
@@ -231,15 +239,29 @@ class ManufacturingSettings(models.Model):
         ("per_machine_hour", "Rate per machine hour"),
         ("per_labour_hour", "Rate per labour hour"),
     ]
+    BUSINESS_MODEL_CHOICES = [
+        ("mto", "Make to Order"),
+        ("mts", "Make to Stock"),
+        ("hybrid", "Make to Order and Make to Stock"),
+    ]
 
     company = models.OneToOneField(
         "accounts.Company", on_delete=models.CASCADE, related_name="manufacturing_settings"
     )
+    business_model = models.CharField(max_length=10, choices=BUSINESS_MODEL_CHOICES, default="mto")
+    customer_order_approval_required = models.BooleanField(default=False)
+    production_plan_approval_required = models.BooleanField(default=False)
+    require_materials_available_for_conversion = models.BooleanField(default=False)
+    include_open_purchase_orders_in_mrp = models.BooleanField(default=True)
+    protect_safety_stock_in_mrp = models.BooleanField(default=True)
+    allow_partial_production_and_dispatch = models.BooleanField(default=True)
     # Operations must be completed in sequence unless a step allows otherwise.
     enforce_operation_sequence = models.BooleanField(default=True)
     # Incoming raw material is held for inspection before it becomes usable
     # stock. Off by default until the client confirms the RM QC trigger point.
     incoming_qc_required = models.BooleanField(default=False)
+    business_rules_confirmed = models.BooleanField(default=False)
+    business_rules_notes = models.TextField(blank=True, default="")
     # Create the invoice automatically when a dispatch is confirmed.
     auto_invoice_on_dispatch = models.BooleanField(default=True)
     overhead_method = models.CharField(max_length=30, choices=OVERHEAD_METHOD_CHOICES, default="none")
@@ -495,7 +517,10 @@ class ScrapRecord(models.Model):
 class ProductionPlan(models.Model):
     STATUS_CHOICES = [
         ("draft", "Draft"),
+        ("pending_approval", "Pending Approval"),
+        ("approved", "Approved"),
         ("planned", "Planned"),
+        ("partially_converted", "Partially Converted"),
         ("converted", "Converted to Production"),
         ("cancelled", "Cancelled"),
     ]
@@ -550,9 +575,16 @@ class ProductionPlan(models.Model):
 
     @property
     def is_converted(self):
-        return self.status == "converted" or self.production_orders.exists()
+        return self.status == "converted"
 
-    def convert_to_production_order(self, warehouse=None, line=None, start_time=None, end_time=None, user=None):
+    @property
+    def remaining_quantity(self):
+        from django.db.models import Sum
+        scheduled = self.production_orders.exclude(status="cancelled").aggregate(total=Sum("quantity"))["total"] or 0
+        return max(float(self.planned_quantity) - float(scheduled), 0)
+
+    def convert_to_production_order(self, warehouse=None, line=None, start_time=None, end_time=None, user=None,
+                                    quantity=None):
         """
         Converts this Production Plan into a Production Order atomically.
         Validates that it has not already been converted and that a recipe exists.
@@ -562,11 +594,20 @@ class ProductionPlan(models.Model):
 
         with transaction.atomic():
             locked_plan = ProductionPlan.objects.select_for_update().get(pk=self.pk)
-            if locked_plan.status == "converted" or locked_plan.production_orders.exists():
-                raise ValidationError("This Production Plan has already been converted to a Production Order.")
-
             if locked_plan.status == "cancelled":
                 raise ValidationError("Cannot convert a cancelled Production Plan.")
+            if locked_plan.status == "converted":
+                raise ValidationError("This Production Plan has already been converted to a Production Order.")
+
+            settings = ManufacturingSettings.for_company(locked_plan.company)
+            if (
+                settings.business_model == "mto"
+                and locked_plan.sales_order
+                and locked_plan.sales_order.status != "confirmed"
+            ):
+                raise ValidationError("Confirm the customer order before converting its production plan.")
+            if settings.production_plan_approval_required and locked_plan.status != "approved":
+                raise ValidationError("Production Plan must be approved before conversion.")
 
             recipe = Recipe.objects.filter(product=locked_plan.item).first()
             if not recipe:
@@ -574,27 +615,63 @@ class ProductionPlan(models.Model):
 
             if not warehouse:
                 if locked_plan.company:
+                    warehouse = Warehouse.objects.filter(
+                        company=locked_plan.company, warehouse_type="production"
+                    ).first()
+                default_warehouse = locked_plan.item.default_warehouse
+                if (
+                    not warehouse
+                    and default_warehouse
+                    and default_warehouse.company_id in (None, locked_plan.company_id)
+                ):
+                    warehouse = default_warehouse
+                if not warehouse:
                     warehouse = Warehouse.objects.filter(company=locked_plan.company).first()
                 if not warehouse:
                     warehouse = Warehouse.objects.first()
                 if not warehouse:
                     raise ValidationError("No warehouse available for production.")
 
-            prod_order = ProductionOrder.objects.create(
-                recipe=recipe,
-                quantity=locked_plan.planned_quantity,
-                warehouse=warehouse,
-                line=line,
-                sales_order=locked_plan.sales_order,
-                production_plan=locked_plan,
-                start_time=start_time,
-                end_time=end_time,
-                status="scheduled",
-            )
+            remaining = locked_plan.remaining_quantity
+            conversion_quantity = float(quantity if quantity is not None else remaining)
+            if conversion_quantity <= 0 or conversion_quantity > remaining:
+                raise ValidationError(
+                    f"Conversion quantity must be greater than zero and no more than {remaining:g}."
+                )
+            if not settings.allow_partial_production_and_dispatch and conversion_quantity < remaining - 1e-6:
+                raise ValidationError("Partial production is disabled in manufacturing settings.")
+            if settings.require_materials_available_for_conversion:
+                from .planning import material_check
+                material_status = material_check(recipe, conversion_quantity)
+                if not material_status["can_produce"]:
+                    raise ValidationError({"materials": material_status["warnings"]})
 
-            locked_plan.status = "converted"
+            from .execution import create_production_order, reserve_materials
+            prod_order, _checks = create_production_order(
+                recipe, conversion_quantity, warehouse,
+                sales_order=locked_plan.sales_order,
+                plan_ref=locked_plan.plan_number,
+                line=line,
+                planned_start=start_time,
+                planned_end=end_time,
+                plan_approved=(
+                    locked_plan.status == "approved"
+                    or not settings.production_plan_approval_required
+                ),
+            )
+            prod_order.production_plan = locked_plan
+            prod_order.save(update_fields=["production_plan"])
+            shortages = reserve_materials(prod_order, user)
+            if shortages:
+                prod_order.status = "material_pending"
+                prod_order.save(update_fields=["status"])
+
+            from .scheduling import schedule_order
+            schedule_order(prod_order, start=start_time)
+
+            locked_plan.status = "converted" if locked_plan.remaining_quantity <= 1e-6 else "partially_converted"
             locked_plan.save(update_fields=["status", "updated_at"])
-            self.status = "converted"
+            self.status = locked_plan.status
             return prod_order
 
     def __str__(self):

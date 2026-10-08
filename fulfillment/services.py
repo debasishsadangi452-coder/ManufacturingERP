@@ -31,6 +31,11 @@ def _company(order):
     return order.customer.company
 
 
+def _allow_partial(order):
+    from production.models import ManufacturingSettings
+    return ManufacturingSettings.for_company(_company(order)).allow_partial_production_and_dispatch
+
+
 # ---------------------------------------------------------------------------
 # Availability
 # ---------------------------------------------------------------------------
@@ -140,6 +145,11 @@ def allocate(order, user=None, lines=None):
             continue
         free = free_fg(order_item.item, company)
         take = min(need, free)
+        if not _allow_partial(order) and take + EPS < need:
+            raise ValidationError(
+                f"{order_item.item.name}: partial allocation is disabled; "
+                f"{_fmt(need)} is required and only {_fmt(free)} is available."
+            )
         if take <= EPS:
             messages.append(f"{order_item.item.name}: no QA-approved stock free to allocate (needs {_fmt(need)}).")
             continue
@@ -220,6 +230,16 @@ def create_dispatch(order, user=None, lines=None, warehouse=None):
         qty = wanted.get(order_item.id, can) if wanted else can
         if wanted and order_item.id not in wanted:
             continue
+        if not _allow_partial(order):
+            remaining = max(
+                order_item.quantity - order_item.shipped_quantity - _on_open_dispatches(order_item),
+                0,
+            )
+            if qty + EPS < remaining:
+                raise ValidationError(
+                    f"{order_item.item.name}: partial dispatch is disabled; "
+                    f"{_fmt(remaining)} remains to dispatch."
+                )
         if qty > can + EPS:
             raise ValidationError(
                 f"Cannot pick {_fmt(qty)} of {order_item.item.name}: only {_fmt(can)} allocated and not yet on a pick list."

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine, UnitOfMeasure, StockTransfer, CycleCount, CycleCountLine
+from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine, UnitOfMeasure, ItemUOMConversion, StockTransfer, CycleCount, CycleCountLine
 
 
 class StockTransferSerializer(serializers.ModelSerializer):
@@ -44,19 +44,42 @@ class UnitOfMeasureSerializer(serializers.ModelSerializer):
         model = UnitOfMeasure
         fields = ["id", "code", "name", "dimension", "to_base_factor", "is_base"]
 
+
+class ItemUOMConversionSerializer(serializers.ModelSerializer):
+    from_unit_code = serializers.CharField(source="from_unit.code", read_only=True)
+    to_unit_code = serializers.CharField(source="to_unit.code", read_only=True)
+
+    class Meta:
+        model = ItemUOMConversion
+        fields = ["id", "item", "from_unit", "from_unit_code", "to_unit", "to_unit_code", "factor"]
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        company = getattr(getattr(request, "user", None), "company", None)
+        item = attrs.get("item", getattr(self.instance, "item", None))
+        if company and item and item.company_id not in (None, company.id):
+            raise serializers.ValidationError({"item": "Pick an item belonging to your company."})
+        for field in ("from_unit", "to_unit"):
+            unit = attrs.get(field, getattr(self.instance, field, None))
+            if company and unit and unit.company_id not in (None, company.id):
+                raise serializers.ValidationError({field: "Pick a shared unit or one belonging to your company."})
+        return attrs
+
 class InventoryRequestSerializer(serializers.ModelSerializer):
     item_name = serializers.ReadOnlyField(source='item.name')
     item_category = serializers.ReadOnlyField(source='item.category')
+    item_unit = serializers.ReadOnlyField(source='item.unit')
     warehouse_name = serializers.ReadOnlyField(source='warehouse.name')
 
-    # Why this material is needed. A request is raised against a production
-    # order, which may itself exist to fill a customer order — store needs to
-    # see that customer order to judge urgency, not just an internal PO number.
+    # Why this material is needed. Requests may originate from a plan before
+    # its production order exists, or from a production order directly.
     product_name = serializers.SerializerMethodField()
     production_quantity = serializers.SerializerMethodField()
     sales_order_id = serializers.SerializerMethodField()
     customer_name = serializers.SerializerMethodField()
     origin_label = serializers.SerializerMethodField()
+    production_plan_id = serializers.SerializerMethodField()
+    production_plan_number = serializers.SerializerMethodField()
 
     class Meta:
         model = InventoryRequest
@@ -64,16 +87,26 @@ class InventoryRequestSerializer(serializers.ModelSerializer):
 
     def get_product_name(self, obj):
         po = obj.production_order
-        return getattr(getattr(getattr(po, 'recipe', None), 'product', None), 'name', None)
+        product = getattr(getattr(po, 'recipe', None), 'product', None)
+        return getattr(product, 'name', None) or getattr(getattr(obj.production_plan, 'item', None), 'name', None)
 
     def get_production_quantity(self, obj):
-        return getattr(obj.production_order, 'quantity', None)
+        return getattr(obj.production_order, 'quantity', None) or getattr(obj.production_plan, 'planned_quantity', None)
+
+    def get_production_plan_id(self, obj):
+        return getattr(obj.production_order, 'production_plan_id', None) or obj.production_plan_id
+
+    def get_production_plan_number(self, obj):
+        plan = getattr(obj.production_order, 'production_plan', None) or obj.production_plan
+        return getattr(plan, 'plan_number', None)
 
     def get_sales_order_id(self, obj):
-        return getattr(obj.production_order, 'sales_order_id', None)
+        return getattr(obj.production_order, 'sales_order_id', None) or getattr(obj.production_plan, 'sales_order_id', None)
 
     def get_customer_name(self, obj):
         so = getattr(obj.production_order, 'sales_order', None)
+        if so is None:
+            so = getattr(obj.production_plan, 'sales_order', None)
         return getattr(getattr(so, 'customer', None), 'name', None)
 
     purchase_order_status = serializers.SerializerMethodField()
@@ -84,13 +117,10 @@ class InventoryRequestSerializer(serializers.ModelSerializer):
     def get_origin_label(self, obj):
         """Short human phrase naming what this material is for.
 
-        Falls back down the chain: customer order → product being made →
-        production order number → a manual request with no production behind it.
+        Falls back down the chain: customer order → plan/product → production
+        order number → a manual request with no production behind it.
         """
         po = obj.production_order
-        if po is None:
-            return "Manual request"
-
         product = self.get_product_name(obj)
         so_id = self.get_sales_order_id(obj)
         customer = self.get_customer_name(obj)
@@ -101,6 +131,10 @@ class InventoryRequestSerializer(serializers.ModelSerializer):
             return f"Sales Order #{so_id}{who}{made}"
         if product:
             return f"Production of {product} (stock)"
+        if po is None and obj.production_plan:
+            return f"Production Plan {obj.production_plan.plan_number}"
+        if po is None:
+            return "Manual request"
         return f"Production Order #{po.id}"
 
 
@@ -117,7 +151,8 @@ class ItemSerializer(serializers.ModelSerializer):
             "id", "name", "category", "erp_classification", "is_finished_good", "unit", "selling_price",
             "quickbooks_id", "quickbooks_sync_token", "quickbooks_last_synced_at",
             "quickbooks_item_type", "procurement_policy", "sku", "purchase_cost",
-            "reorder_point", "warehouse_id", "initial_quantity",
+            "reorder_point", "safety_stock", "minimum_order_quantity", "lead_time_days",
+            "costing_rule", "default_warehouse", "warehouse_id", "initial_quantity",
             "base_unit", "purchase_unit",
         ]
         read_only_fields = ["quickbooks_id", "quickbooks_sync_token", "quickbooks_last_synced_at"]
@@ -131,6 +166,25 @@ class ItemSerializer(serializers.ModelSerializer):
         elif obj.category in ("intermediate", "semi_finished"):
             return "Sub-assembly/Manufactured component"
         return "Finished good for sales/production output"
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        company = getattr(getattr(request, "user", None), "company", None)
+        warehouse = attrs.get("default_warehouse", getattr(self.instance, "default_warehouse", None))
+        if company and warehouse and warehouse.company_id not in (None, company.id):
+            raise serializers.ValidationError({"default_warehouse": "Pick a warehouse belonging to your company."})
+        for field in ("base_unit", "purchase_unit"):
+            unit = attrs.get(field, getattr(self.instance, field, None))
+            if company and unit and unit.company_id not in (None, company.id):
+                raise serializers.ValidationError({field: "Pick a shared unit or one belonging to your company."})
+        initial_warehouse_id = attrs.get("warehouse_id")
+        if company and initial_warehouse_id:
+            from django.db.models import Q
+            if not Warehouse.objects.filter(
+                Q(company=company) | Q(company__isnull=True), pk=initial_warehouse_id
+            ).exists():
+                raise serializers.ValidationError({"warehouse_id": "Pick a warehouse belonging to your company."})
+        return attrs
 
     def create(self, validated_data):
         # Pop these fields so they don't get passed to Item.objects.create()
@@ -150,7 +204,7 @@ class WarehouseSerializer(serializers.ModelSerializer):
     items = StockEntrySerializer(source='stock_set', many=True, read_only=True)
     class Meta:
         model = Warehouse
-        fields = ["id", "name", "location", "items"]
+        fields = ["id", "name", "location", "warehouse_type", "is_virtual", "is_quarantine", "items"]
 
 
 class BatchSerializer(serializers.ModelSerializer):
@@ -269,8 +323,8 @@ class BOMLineSerializer(serializers.ModelSerializer):
         return value
 
     def validate_raw_material(self, value):
-        if value.category not in ("raw_material", "intermediate"):
-            raise serializers.ValidationError("Only raw materials and intermediates can be used in a BOM.")
+        if value.category not in ("raw_material", "packaging", "intermediate", "semi_finished"):
+            raise serializers.ValidationError("Only materials and semi-finished goods can be used in a BOM.")
         return value
 
 

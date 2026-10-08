@@ -1,6 +1,6 @@
 from django.db import models
 from django.utils import timezone
-from inventory.models import Item, Warehouse
+from inventory.models import Item, UnitOfMeasure, Warehouse
 from decimal import Decimal
 
 
@@ -158,6 +158,9 @@ class PurchaseOrderItem(models.Model):
     purchase_order = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE, related_name="items")
     item = models.ForeignKey(Item, on_delete=models.CASCADE)
     quantity = models.FloatField()
+    unit_of_measure = models.ForeignKey(
+        UnitOfMeasure, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
 
     @property
@@ -165,6 +168,8 @@ class PurchaseOrderItem(models.Model):
         return self.unit_price * Decimal(str(self.quantity))
 
     def save(self, *args, **kwargs):
+        if self.unit_of_measure_id is None:
+            self.unit_of_measure = self.item.purchase_unit or self.item.base_unit
         super().save(*args, **kwargs)
         # Recalculate PO total whenever a line item changes
         self.purchase_order.recalculate_total()

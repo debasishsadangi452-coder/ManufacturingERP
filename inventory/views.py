@@ -1,7 +1,9 @@
 from rest_framework import viewsets, status
-from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine, UnitOfMeasure, StockTransfer, CycleCount, CycleCountLine
+from django.db.models import Q
+from .models import Item, Warehouse, Stock, Batch, InventoryRequest, StockMovement, QuickBooksOnboarding, SalesQuickBooksConfig, ProcurementQuickBooksConfig, BOM, BOMLine, UnitOfMeasure, ItemUOMConversion, StockTransfer, CycleCount, CycleCountLine
 from .serializers import (
     UnitOfMeasureSerializer,
+    ItemUOMConversionSerializer,
     StockTransferSerializer,
     CycleCountSerializer,
     CycleCountLineSerializer,
@@ -56,6 +58,21 @@ class UnitOfMeasureViewSet(viewsets.ModelViewSet):
         ])
 
 
+class ItemUOMConversionViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "item__company"
+    queryset = ItemUOMConversion.objects.select_related("item", "from_unit", "to_unit")
+    serializer_class = ItemUOMConversionSerializer
+    permission_classes = [IsStore | IsAdmin | IsProduction]
+
+    def perform_create(self, serializer):
+        item = serializer.validated_data["item"]
+        company = getattr(self.request.user, "company", None)
+        if company and item.company_id not in (None, company.id):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({"item": "Item belongs to another company."})
+        serializer.save()
+
+
 class ItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
     queryset = Item.objects.all()
@@ -77,11 +94,22 @@ class ItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         warehouse_id = serializer.validated_data.get('warehouse_id')
         initial_qty = serializer.validated_data.get('initial_quantity', 0)
-        
-        item = serializer.save(company=self.request.user.company)
-        
+        warehouse = None
         if warehouse_id:
-            warehouse = Warehouse.objects.get(id=warehouse_id)
+            from django.db.models import Q
+            warehouse = Warehouse.objects.filter(
+                Q(company=self.request.user.company) | Q(company__isnull=True),
+                id=warehouse_id,
+            ).first()
+            if warehouse is None:
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({"warehouse_id": "Warehouse not found for this company."})
+        item = serializer.save(
+            company=self.request.user.company,
+            default_warehouse=serializer.validated_data.get("default_warehouse") or warehouse,
+        )
+
+        if warehouse_id and warehouse is not None:
             # Use increase_stock to handle logs and stuff
             from .services import increase_stock
             increase_stock(item, warehouse, initial_qty, user=self.request.user, reference="Initial Stock Registration")
@@ -300,13 +328,19 @@ class InventoryRequestViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             .select_related(
                 'item', 'warehouse',
                 'production_order__recipe__product',
+                'production_order__production_plan',
                 'production_order__sales_order__customer',
+                'production_plan__item',
+                'production_plan__sales_order__customer',
             )
             .order_by('-created_at')
         )
         # Production users only see requests tied to their own production orders
         if getattr(user, 'role', None) == 'production':
-            qs = qs.filter(production_order__isnull=False)
+            qs = qs.filter(
+                Q(production_order__isnull=False)
+                | Q(production_plan__isnull=False)
+            )
         return qs
 
     def perform_create(self, serializer):
@@ -343,16 +377,23 @@ class InventoryRequestViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             }, status=400)
 
         try:
+            source = (
+                f"Production Order #{req.production_order_id}"
+                if req.production_order_id
+                else f"Production Plan {req.production_plan.plan_number}"
+                if req.production_plan_id
+                else "Manual request"
+            )
             decrease_stock(
                 req.item,
                 req.warehouse,
                 req.quantity,
                 user=request.user,
-                reference=f"Fulfilling Request #{req.id} for Production Order #{req.production_order_id}"
+                reference=f"Fulfilling Inventory Request #{req.id} for {source}"
             )
             req.status = 'supplied'
             req.save()
-            log_activity(request.user, "Inventory", "Supply Materials", f"Supplied {req.quantity} of '{req.item.name}' for Production Order #{req.production_order_id}")
+            log_activity(request.user, "Inventory", "Supply Materials", f"Supplied {req.quantity} of '{req.item.name}' for {source}")
             return Response({"status": "Materials supplied successfully"})
         except ValueError as e:
             return Response({"error": str(e)}, status=400)

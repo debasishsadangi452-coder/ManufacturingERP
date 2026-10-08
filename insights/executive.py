@@ -214,6 +214,8 @@ def _capacity(company):
 
 
 def executive_dashboard(company, start=None, end=None):
+    from production.models import ManufacturingSettings
+    settings = ManufacturingSettings.for_company(company)
     period = Period(start, end)
     return {
         "generated_at": timezone.now(),
@@ -224,6 +226,16 @@ def executive_dashboard(company, start=None, end=None):
         "fulfilment": _fulfilment(company, period),
         "finance": _finance(company, period),
         "capacity": _capacity(company),
+        "business_rules": {
+            "confirmed": settings.business_rules_confirmed,
+            "notes": settings.business_rules_notes,
+            "incoming_qc_required": settings.incoming_qc_required,
+            "overhead_method": settings.overhead_method,
+            "overhead_rate": float(settings.overhead_rate),
+            "include_open_purchase_orders_in_mrp": settings.include_open_purchase_orders_in_mrp,
+            "protect_safety_stock_in_mrp": settings.protect_safety_stock_in_mrp,
+            "allow_partial_production_and_dispatch": settings.allow_partial_production_and_dispatch,
+        },
         "pipeline": pipeline(company, period),
     }
 

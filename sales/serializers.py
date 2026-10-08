@@ -20,13 +20,18 @@ class SalesOrderSerializer(serializers.ModelSerializer):
     customer_name = serializers.CharField(source="customer.name", read_only=True)
     production_status = serializers.SerializerMethodField()
     production_plans = serializers.SerializerMethodField()
+    production_orders = serializers.SerializerMethodField()
+    purchase_requisitions = serializers.SerializerMethodField()
+    fulfillment = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesOrder
         fields = [
             "id", "customer", "customer_name", "created_at", "total_amount",
             "status", "source", "required_delivery_date", "customer_order_reference",
+            "priority", "custom_specifications", "delivery_requirements",
             "items", "quickbooks_id", "production_status", "production_plans",
+            "production_orders", "purchase_requisitions", "fulfillment",
         ]
         read_only_fields = ["quickbooks_id"]
 
@@ -43,6 +48,47 @@ class SalesOrderSerializer(serializers.ModelSerializer):
             }
             for p in order.production_plans.all()
         ]
+
+    def get_production_orders(self, order):
+        production_orders = order.production_orders.select_related("recipe__product").prefetch_related("operations")
+        summaries = []
+        for production_order in production_orders:
+            operations = list(production_order.operations.all())
+            current_operation = next(
+                (operation for operation in operations if operation.status in ("in_progress", "ready")),
+                next((operation for operation in operations if operation.status == "not_started"), None),
+            )
+            summaries.append({
+                "id": production_order.id,
+                "order_number": production_order.order_number,
+                "product_id": production_order.recipe.product_id,
+                "product_name": production_order.recipe.product.name,
+                "quantity": production_order.quantity,
+                "produced_quantity": production_order.produced_quantity,
+                "status": production_order.status,
+                "qa_status": production_order.qa_status,
+                "current_operation": current_operation.name if current_operation else None,
+            })
+        return summaries
+
+    def get_purchase_requisitions(self, order):
+        return [
+            {
+                "id": requisition.id,
+                "requisition_number": requisition.requisition_number,
+                "status": requisition.status,
+                "created_at": requisition.created_at,
+                "purchase_orders": [
+                    {"id": purchase_order.id, "status": purchase_order.status}
+                    for purchase_order in requisition.purchase_orders.all()
+                ],
+            }
+            for requisition in order.purchase_requisitions.prefetch_related("purchase_orders")
+        ]
+
+    def get_fulfillment(self, order):
+        from fulfillment.services import order_fulfilment
+        return order_fulfilment(order)
 
 
     def get_production_status(self, order):
@@ -76,6 +122,11 @@ class SalesOrderSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         items_data = request.data.get('items', []) if request else []
         
+        customer = validated_data.get("customer")
+        from production.models import ManufacturingSettings
+        settings = ManufacturingSettings.for_company(customer.company)
+        if settings.customer_order_approval_required:
+            validated_data["status"] = "pending_approval"
         order = SalesOrder.objects.create(**validated_data)
         company = order.customer.company
 

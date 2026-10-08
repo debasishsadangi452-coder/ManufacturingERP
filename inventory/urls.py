@@ -3,6 +3,7 @@ from .views import *
 
 router = DefaultRouter()
 router.register("units", UnitOfMeasureViewSet, basename="units")
+router.register("item-uom-conversions", ItemUOMConversionViewSet, basename="item-uom-conversions")
 router.register("transfers", StockTransferViewSet, basename="transfers")
 router.register("cycle-counts", CycleCountViewSet, basename="cycle-counts")
 router.register("items", ItemViewSet)

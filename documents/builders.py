@@ -6,12 +6,14 @@ data and print the upstream references (customer order, production order,
 lot, dispatch, invoice) so a paper copy can be traced back.
 """
 from django.db.models import Sum
+from decimal import Decimal
 
 from fulfillment.models import Dispatch
 from inventory.models import Batch, StockTransfer
-from production.models import ProductionOrder
+from production.models import ProductionOrder, ProductionPlan
+from procurement.models import GoodsReceipt, PurchaseOrder
 from quality.models import QualityCheck
-from sales.models import Invoice
+from sales.models import Invoice, SalesOrder
 
 
 def _n(value, places=4):
@@ -162,6 +164,26 @@ def pick_list_doc(order):
     doc["tables"] = [_table("Pick", ["Material", "Unit", ("Quantity to pick", True), "Suggested lots (FIFO)", "Picked"], rows)]
     doc["signatures"] = ["Picked by (Store)", "Received by (Production)"]
     doc["references"] = _order_refs(order)
+    return doc
+
+
+def dispatch_pick_list_doc(dispatch):
+    doc = _base(dispatch.company, "Finished Goods Picking List", dispatch.dispatch_number, dispatch.get_status_display())
+    doc["meta"] = [
+        ("Customer order", f"SO-{dispatch.sales_order_id}"),
+        ("Customer", dispatch.sales_order.customer.name),
+        ("Warehouse", dispatch.warehouse.name if dispatch.warehouse_id else None),
+        ("Ship to", dispatch.ship_to_name or None),
+        ("Address", dispatch.ship_to_address or None),
+    ]
+    doc["tables"] = [_table(
+        "Pick and stage",
+        ["Item", "Unit", ("Requested", True), ("Picked", True), "Picked / verified by"],
+        [[_c(line.item.name), _c(line.item.unit), _c(_n(line.requested_quantity), True),
+          _c(_n(line.quantity), True), _c("")] for line in dispatch.lines.select_related("item")],
+    )]
+    doc["signatures"] = ["Picked by (Warehouse)", "Packed by", "Dispatch verification"]
+    doc["references"] = f"{dispatch.dispatch_number} · SO-{dispatch.sales_order_id}"
     return doc
 
 
@@ -352,6 +374,123 @@ def invoice_doc(inv):
     return doc
 
 
+def customer_order_confirmation_doc(order):
+    customer = order.customer
+    doc = _base(
+        customer.company,
+        "Customer Order Confirmation",
+        f"SO-{order.id}",
+        order.get_status_display(),
+    )
+    doc["subtitle"] = "Confirmation of the customer order and requested delivery."
+    doc["meta"] = [
+        ("Customer", customer.name),
+        ("Customer email", customer.email or None),
+        ("Customer phone", customer.phone or None),
+        ("Order date", order.created_at.strftime("%Y-%m-%d") if order.created_at else None),
+        ("Requested delivery", str(order.required_delivery_date) if order.required_delivery_date else None),
+        ("Customer reference", order.customer_order_reference or None),
+        ("Order source", order.get_source_display()),
+        ("Priority", order.get_priority_display()),
+        ("Delivery requirements", order.delivery_requirements or None),
+    ]
+    rows = [
+        [
+            _c(line.item.sku or ""),
+            _c(line.item.name),
+            _c(line.item.unit),
+            _c(_n(line.quantity), True),
+            _c(_money(line.unit_price), True),
+            _c(_money(Decimal(str(line.quantity)) * line.unit_price), True),
+        ]
+        for line in order.salesorderitem_set.select_related("item").all()
+    ]
+    doc["tables"] = [_table(
+        "Confirmed items",
+        ["Item code", "Description", "Unit", ("Quantity", True), ("Unit price", True), ("Amount", True)],
+        rows,
+    )]
+    doc["totals"] = [("Order total", _money(order.total_amount))]
+    if order.custom_specifications:
+        doc["notes"].append(f"Custom specifications: {order.custom_specifications}")
+    doc["references"] = f"SO-{order.id}"
+    return doc
+
+
+def production_plan_doc(plan):
+    doc = _base(plan.company, "Production Plan", plan.plan_number, plan.get_status_display())
+    doc["meta"] = [
+        ("Customer order", f"SO-{plan.sales_order_id}"),
+        ("Customer", plan.customer.name if plan.customer_id else None),
+        ("Product", plan.item.name),
+        ("Order quantity", _n(plan.order_quantity)),
+        ("Planned quantity", _n(plan.planned_quantity)),
+        ("Target delivery", str(plan.target_date) if plan.target_date else None),
+        ("Remaining quantity", _n(plan.remaining_quantity)),
+    ]
+    from production.mrp import calculate_mrp_for_plan
+    mrp = calculate_mrp_for_plan(plan)
+    doc["tables"] = [_table(
+        "Material plan",
+        ["Material", "Category", ("Required", True), ("Available", True), ("On order", True),
+         ("Shortage", True), "Unit"],
+        [[_c(row["item_name"]), _c(row["category"]), _c(_n(row["required_quantity"]), True),
+          _c(_n(row["available_quantity"]), True), _c(_n(row["on_order_quantity"]), True),
+          _c(_n(row["shortage_quantity"]), True), _c(row["unit"])]
+         for row in mrp["consolidated"]],
+    )]
+    if plan.notes:
+        doc["notes"].append(plan.notes)
+    doc["references"] = f"{plan.plan_number} · SO-{plan.sales_order_id}"
+    return doc
+
+
+def purchase_order_doc(po):
+    doc = _base(po.vendor.company, "Purchase Order", f"PO-{po.id}", po.get_status_display())
+    doc["meta"] = [
+        ("Supplier", po.vendor.name),
+        ("Supplier address", po.vendor.address or None),
+        ("Expected delivery", str(po.expected_delivery) if po.expected_delivery else None),
+        ("Customer order", f"SO-{po.requisition.sales_order_id}" if po.requisition and po.requisition.sales_order_id else None),
+        ("Production plan", po.requisition.production_plan.plan_number if po.requisition and po.requisition.production_plan_id else None),
+    ]
+    rows = [[_c(line.item.sku or ""), _c(line.item.name),
+             _c(line.unit_of_measure.code if line.unit_of_measure_id else line.item.unit),
+             _c(_n(line.quantity), True), _c(_money(line.unit_price), True), _c(_money(line.total_price), True)]
+            for line in po.items.select_related("item", "unit_of_measure")]
+    doc["tables"] = [_table("Order lines", ["Item code", "Description", "Unit", ("Quantity", True),
+                                               ("Unit price", True), ("Amount", True)], rows)]
+    doc["totals"] = [("Total", _money(po.total_amount))]
+    if po.notes:
+        doc["notes"].append(po.notes)
+    doc["signatures"] = ["Prepared by", "Approved by", "Supplier acknowledgement"]
+    doc["references"] = f"PO-{po.id}"
+    return doc
+
+
+def goods_receipt_doc(receipt):
+    po = receipt.purchase_order
+    doc = _base(po.vendor.company, "Goods Receipt / Material Handover", f"GRN-{receipt.id}", po.get_status_display())
+    doc["meta"] = [
+        ("Supplier", po.vendor.name),
+        ("Purchase order", f"PO-{po.id}"),
+        ("Received at", _dt(receipt.received_at)),
+        ("Warehouse", receipt.warehouse.name),
+        ("Customer order", f"SO-{po.requisition.sales_order_id}" if po.requisition and po.requisition.sales_order_id else None),
+    ]
+    doc["tables"] = [_table(
+        "Received materials",
+        ["Material", "Unit", ("Ordered quantity", True), "Incoming QC"],
+        [[_c(line.item.name), _c(line.unit_of_measure.code if line.unit_of_measure_id else line.item.unit),
+          _c(_n(line.quantity), True),
+          _c(", ".join(q.get_status_display() for q in receipt.quality_checks.filter(item=line.item)) or "Not required")]
+         for line in po.items.select_related("item", "unit_of_measure")],
+    )]
+    doc["signatures"] = ["Received by (Store)", "Inspected by (Quality)", "Issued to Production"]
+    doc["references"] = f"GRN-{receipt.id} · PO-{po.id}"
+    return doc
+
+
 def stock_transfer_doc(t):
     doc = _base(t.company, "Stock Transfer Voucher", f"STV-{t.id:05d}", t.get_status_display())
     doc["meta"] = [
@@ -369,9 +508,16 @@ def stock_transfer_doc(t):
 
 DOCUMENTS = {
     # type: (label, model, company lookup, builder)
+    "customer_order_confirmation": (
+        "Customer Order Confirmation", SalesOrder, "customer__company", customer_order_confirmation_doc
+    ),
+    "production_plan": ("Production Plan", ProductionPlan, "company", production_plan_doc),
+    "purchase_order": ("Purchase Order", PurchaseOrder, "vendor__company", purchase_order_doc),
+    "goods_receipt": ("Goods Receipt / Material Handover", GoodsReceipt, "purchase_order__vendor__company", goods_receipt_doc),
     "production_order": ("Production Order", ProductionOrder, "recipe__product__company", production_order_doc),
     "traveler": ("Production Traveler / Work Ticket", ProductionOrder, "recipe__product__company", traveler_doc),
     "pick_list": ("Material Pick List", ProductionOrder, "recipe__product__company", pick_list_doc),
+    "dispatch_pick_list": ("Finished Goods Picking List", Dispatch, "company", dispatch_pick_list_doc),
     "material_requisition": ("Material Requisition", ProductionOrder, "recipe__product__company", material_requisition_doc),
     "qa_inspection": ("QA Inspection Record", QualityCheck, None, qa_inspection_doc),
     "qa_certificate": ("QA Clearance Certificate", QualityCheck, None, qa_certificate_doc),
