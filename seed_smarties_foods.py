@@ -85,7 +85,7 @@ def get_or_create_company():
         co.save(update_fields=["name"])
     return co
 
-def get_or_create_user(username, email, first_name, last_name, company):
+def get_or_create_user(username, email, first_name, last_name, company, role):
     user, created = User.objects.get_or_create(
         username=username,
         defaults={
@@ -93,9 +93,14 @@ def get_or_create_user(username, email, first_name, last_name, company):
             "first_name": first_name,
             "last_name": last_name,
             "company": company,
+            "role": role,
             "is_staff": True,
         }
     )
+    # Role gates the whole UI (sidebar + dashboards), so make sure it is set
+    # even on users created by an earlier version of this seeder.
+    if user.role != role:
+        user.role = role
     user.set_password(PASSWORD)
     user.save()
     return user, created
@@ -213,19 +218,19 @@ def seed():
     # ── 3. Users ───────────────────────────────────────────────────────────────
     admin_user, _ = get_or_create_user(
         f"admin@{COMPANY_SLUG}", "admin@smartiesfoods.com",
-        "Sunita", "Sharma", co
+        "Sunita", "Sharma", co, "admin"
     )
     prod_user, _ = get_or_create_user(
         f"production@{COMPANY_SLUG}", "production@smartiesfoods.com",
-        "Vijay", "Patel", co
+        "Vijay", "Patel", co, "production"
     )
     qual_user, _ = get_or_create_user(
         f"quality@{COMPANY_SLUG}", "quality@smartiesfoods.com",
-        "Meera", "Iyer", co
+        "Meera", "Iyer", co, "quality"
     )
     store_user, _ = get_or_create_user(
         f"store@{COMPANY_SLUG}", "store@smartiesfoods.com",
-        "Arjun", "Nair", co
+        "Arjun", "Nair", co, "store"
     )
     log(f"Users: admin / production / quality / store  (password: {PASSWORD})")
 
