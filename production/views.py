@@ -737,6 +737,90 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], permission_classes=[IsProduction | IsAdmin])
+    def start_semi_finished(self, request, pk=None):
+        """Start a Semi-Finished (intermediate) production run needed by this plan.
+
+        Two-level BOM: a Finished Good's plan may be short of its Semi-Finished
+        component, which must be produced in-house first. This creates a separate
+        Production Order for that component's own recipe, links it to the same
+        customer order and parent plan, reserves its materials, and schedules it
+        so the user can run it on the shop floor before the finished good.
+
+        Payload: item (the semi-finished Item id) and optional quantity
+        (defaults to the component's MRP shortage; falls back to the plan qty).
+        """
+        from inventory.models import Item
+        plan = self.get_object()
+        company = plan.company
+
+        item_id = request.data.get("item")
+        sfg_item = Item.objects.filter(pk=item_id, company=company).first()
+        if sfg_item is None:
+            return Response({"error": "Semi-finished item not found for this company."}, status=400)
+        if sfg_item.category not in ("intermediate", "semi_finished"):
+            return Response({"error": f"'{sfg_item.name}' is not a semi-finished item."}, status=400)
+
+        recipe = Recipe.objects.filter(product=sfg_item).first()
+        if recipe is None:
+            return Response(
+                {"error": f"No recipe/BOM found for semi-finished item '{sfg_item.name}'. "
+                          "Define its recipe before producing it."},
+                status=400,
+            )
+
+        try:
+            quantity = float(request.data.get("quantity") or plan.planned_quantity)
+        except (TypeError, ValueError):
+            return Response({"error": "Quantity must be a number."}, status=400)
+        if quantity <= 0:
+            return Response({"error": "Quantity must be greater than zero."}, status=400)
+
+        # Produce into the company's production warehouse (same default the
+        # finished-good conversion uses).
+        warehouse = Warehouse.objects.filter(
+            company=company, warehouse_type="production"
+        ).first() or Warehouse.objects.filter(company=company).first()
+        if warehouse is None:
+            return Response({"error": "No warehouse available for production."}, status=400)
+
+        settings = ManufacturingSettings.for_company(company)
+        try:
+            order, _checks = execution.create_production_order(
+                recipe, quantity, warehouse,
+                sales_order=plan.sales_order,
+                plan_ref=f"{plan.plan_number} · SFG {sfg_item.name}",
+                status="scheduled",
+                plan_approved=(
+                    plan.status in ("approved", "planned", "converted", "partially_converted")
+                    or not settings.production_plan_approval_required
+                ),
+                notes=f"Semi-finished sub-production for plan {plan.plan_number} "
+                      f"(parent product: {plan.item.name}).",
+            )
+            shortages = execution.reserve_materials(order, request.user)
+            if shortages:
+                order.status = "material_pending"
+                order.save(update_fields=["status"])
+        except (DjangoValidationError, ValidationError) as e:
+            return Response({"error": getattr(e, "detail", str(e))}, status=400)
+
+        log_activity(
+            request.user, "Production", "Start Semi-Finished Production",
+            f"Started {order.order_number} for semi-finished '{sfg_item.name}' "
+            f"({quantity:g}) under plan {plan.plan_number}",
+        )
+        return Response(
+            {
+                "message": f"Started semi-finished production of {quantity:g} × "
+                           f"'{sfg_item.name}' (Work Order {order.order_number}).",
+                "production_order_id": order.id,
+                "production_order": ProductionOrderSerializer(order).data,
+                "shortages": [{"item": it.name, "quantity": q} for it, q in shortages],
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=['post'], permission_classes=[IsProduction | IsAdmin])
     def change_status(self, request, pk=None):
         plan = self.get_object()
         new_status = request.data.get('status')
