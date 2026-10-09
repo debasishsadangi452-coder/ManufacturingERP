@@ -42,17 +42,23 @@ class UnitOfMeasure(models.Model):
 class Item(models.Model):
     # intermediate: made in-house by one recipe and consumed by another (e.g.
     # a baked cookie that is then packed); never bought or sold directly.
+    # "intermediate" is the single stored value for semi-finished goods: made
+    # in-house by one recipe and consumed by another (e.g. a baked cookie that
+    # is then packed), never bought or sold directly. It is labelled
+    # "Semi-Finished" throughout the UI. The legacy "semi_finished" string is
+    # still accepted as an equivalent alias where it appears, but new records
+    # use "intermediate".
     CATEGORY_CHOICES = [
         ("raw_material", "Raw Material"),
         ("packaging", "Packaging / Other Material"),
-        ("intermediate", "Intermediate (semi-finished)"),
+        ("intermediate", "Semi-Finished"),
         ("finished_good", "Finished Good"),
     ]
 
     ERP_CLASSIFICATION_CHOICES = [
         ("raw_material", "Raw Material"),
         ("packaging", "Packaging / Other Material"),
-        ("intermediate", "Intermediate (semi-finished)"),
+        ("intermediate", "Semi-Finished"),
         ("finished_good", "Finished Good"),
         ("out_of_scope", "Out of Scope"),
     ]
