@@ -32,12 +32,17 @@
 
 ### Login accounts (password `SmartiesDemo@2026`)
 
-| Role | Email | Use for |
-|------|-------|---------|
-| Admin | `admin@smartiesfoods.com` | Full tour, settings, dashboards |
-| Production | `production@smartiesfoods.com` | Planning, shop floor, WIP |
-| Quality | `quality@smartiesfoods.com` | Incoming & final QA |
-| Store | `store@smartiesfoods.com` | Inventory, allocation, dispatch |
+> **Log in with the username, not the email** — e.g. `admin@smartiesfoods`
+> (the email `admin@smartiesfoods.com` is shown on the profile, but the login
+> field takes the username). Each user has a role, which drives what the sidebar
+> and dashboards show.
+
+| Role | Username | Use for |
+|------|----------|---------|
+| Admin | `admin@smartiesfoods` | Full tour, settings, dashboards, BOM, auto-complete |
+| Production | `production@smartiesfoods` | Planning, shop floor, WIP |
+| Quality | `quality@smartiesfoods` | Incoming & final QA |
+| Store | `store@smartiesfoods` | Inventory, allocation, dispatch |
 
 ---
 
@@ -122,37 +127,44 @@
 
 **Client takeaway:** One master order book; orders can originate from multiple channels.
 
-**Transition:** "Before we plan it, let's look at what this product is made of." → Items & BOM.
+**Transition:** "Before we plan it, let's look at what this product is made of." → the item master, then the BOM.
 
 ---
 
 ## Step 3 — Product structure and manufacturing resources  ·  2 min  ·  (req #7–#10, #20)
 
-**Screen:** Inventory → Items & BOM (`/inventory`); Unit Setup (`/unit-setup`); Resources.
+**Screen:** Inventory (`/inventory`) for items; **Production → Bill of Materials** tab for the BOM; Unit Setup (`/unit-setup`); Production → Lines & Capacity / Routing for resources.
+
+> **Note on where BOM lives:** the Bill of Materials is managed in **one place —
+> Production → "Bill of Materials" tab** (it is the single BOM for the whole ERP,
+> used by MRP, costing and the shop floor). The Inventory screen holds the item
+> master and stock only.
 
 **Actions:**
-1. Show the three item categories: **Raw Materials, Semi-Finished Goods,
-   Finished Goods**.
-2. Open the **two-level BOM**:
-   - **Level 1 — make the Cookie (semi-finished):** White Flour, Brown Flour,
+1. In **Inventory**, show the item categories: **Raw Materials, Semi-Finished,
+   Finished Goods** (Semi-Finished is a single category).
+2. In **Production → Bill of Materials**, open the **two-level BOM**:
+   - **Level 1 — make the Cookie (Semi-Finished):** White Flour, Brown Flour,
      Sugar, Coconut, Dates, Almonds, Flavoring, Artificial Colors → **Cookie**.
-   - **Level 2 — make Smarties Cookies (finished):** Cookie + Smarties + Label +
-     Bag + Carton → **Smarties Cookies**.
+   - **Level 2 — make Smarties Cookies (Finished):** Cookie + Smarties + Label +
+     Bag + Carton → **Smarties Cookies**. Use **Explode** to show the multi-level tree.
 3. Show a **UOM conversion** example (material bought in kg, handled in other units).
-4. Show the **Resources**: machines (Mixer-01, Oven-01, Cooling-Rack-01,
-   Packing-Machine-01) and operators (Rahul, Priya, Ankit, Neha).
+4. Show the **Resources / Routing**: machines (Mixer-01, Oven-01, Cooling-Rack-01,
+   Packing-Machine-01) and operators (Rahul, Priya, Ankit, Neha). The **Routing**
+   tab holds the manufacturing steps; the **Bill of Materials** tab holds the
+   components — two clear, separate things.
 
 **Say:**
 > "This product is manufactured in two stages. First we make the Cookie
-> intermediate; then we combine that semi-finished item with Smarties and
-> packaging to make the sellable finished product. That two-level structure
-> matters because the ERP has to track both the materials consumed *and* the
-> intermediate stock produced. We also hold the production resources and units of
-> measure the system needs for planning and costing."
+> semi-finished item; then we combine it with Smarties and packaging to make the
+> sellable finished product. The ERP keeps one Bill of Materials — the components
+> — and a separate Routing — the steps. That two-level structure matters because
+> the system tracks both the materials consumed *and* the semi-finished stock
+> produced."
 
-**Show:** A real UOM conversion and the actual resource records.
+**Show:** A real UOM conversion, the BOM explosion, and the resource/routing records.
 
-**Client takeaway:** Multi-level product structures, units and resources are modelled properly.
+**Client takeaway:** One Bill of Materials and one Routing, multi-level structures, units and resources — all modelled properly.
 
 ---
 
@@ -171,7 +183,7 @@
 **Say:**
 > "Once the order is confirmed, planning turns that demand into a manufacturing
 > plan. The BOM explosion works out everything needed to produce 1,000 finished
-> units — including the materials for the intermediate Cookie stage. This plan is
+> units — including the materials for the semi-finished Cookie stage. This plan is
 > the basis for checking stock, purchasing shortfalls, assessing capacity and
 > deciding when production can start."
 
@@ -200,7 +212,18 @@
 **⚠ Verify first:** Only call the requisition "automatically generated" if you've
 confirmed that behaviour in this build. Otherwise say "raised from the shortage."
 
-**Client takeaway:** Shortages are caught before production and turned into purchasing action.
+**Semi-finished shortages (two-level BOM):** in the same MRP view, the
+**Semi-Finished Requirements** table lists sub-assemblies like the **Cookie**.
+When a semi-finished item is short, its row shows a **"Start SFG Production"**
+button — click it to raise a *separate* work order that produces the Cookie
+first, linked to the same customer order. After starting, the row flips to
+**"In Production"** so it can't be started twice.
+
+> "A finished good often depends on a semi-finished one. The system spots that,
+> and lets us kick off the semi-finished production run in one click before the
+> finished good — the standard two-stage make-to-order flow."
+
+**Client takeaway:** Shortages — raw *and* semi-finished — are caught before production and turned into action (purchasing or a sub-production run).
 
 ---
 
@@ -227,30 +250,43 @@ confirmed that behaviour in this build. Otherwise say "raised from the shortage.
 
 ---
 
-## Step 7 — Production order, scheduling and WIP  ·  4 min  ·  (req #15–#19)
+## Step 7 — Work order, shop floor and WIP  ·  4 min  ·  (req #15–#19)
 
-**Screen:** Production → Shop Floor / Production Order.
+**Screen:** Production → **Shop Floor** tab.
+
+> **Production tabs (left→right, the MTO flow):** Production Plans → Schedule →
+> **Shop Floor** → Material Requisitions → **Bill of Materials** → **Routing** →
+> Lines & Capacity. The plan converts into a **Work Order** that runs on the
+> Shop Floor.
 
 **Actions:**
-1. Open **PRD-2026-001**.
+1. Open the **Work Order** for the order (PRD-2026-001).
 2. Show its **links to the production plan and the customer order**.
 3. Review the operations: **Mixing → Baking → Cooling → Smarties Addition →
-   Packing → Final Inspection**.
+   Packing → Final Inspection** — each with Start / Report / Pause controls.
 4. Show assigned **machines and operators** per operation.
 5. Show planned **capacity / scheduling** (machine run-rates, manpower).
-6. Open the **live WIP quantities**.
+6. Open the **live WIP quantities** on the WIP board (completed/planned, current
+   operation, bottleneck, operations done e.g. "4/6").
 
 **Say:**
-> "Once material readiness is established, the plan is converted into a production
-> order. The shop-floor view shows the sequence of operations and the resources
-> assigned to each. Instead of a single status, we see progress *by operation* —
-> where the order is waiting or being worked. In this demo, 300 units have
-> completed production and passed final inspection, while the remaining 700 are
-> still in production, currently at the Cooling stage."
+> "Once material readiness is established, the plan is converted into a work
+> order that runs here on the shop floor. We see progress *by operation* — not a
+> single status — so we know exactly where the order is and where it's stuck. A
+> user advances each operation (Start → Report output), and reported output goes
+> to QA before it becomes sellable stock."
 
 **Demonstrate:** Click from a WIP record **back to CO-2026-001**.
 
-**Client takeaway:** Work in progress is tied to customer demand — not reported as an unconnected factory total.
+**Admin shortcut (optional):** logged in as **Admin**, the Operations panel shows
+an **"Auto-complete all operations"** button — it drives every remaining
+operation to full quantity in sequence and sends the output to QA in one action.
+
+> "Admins can run the whole routing in one step when appropriate, while operators
+> use the step-by-step controls — the system lets you choose how much to automate."
+
+**Client takeaway:** Work in progress is tied to customer demand, advanced
+operation by operation, with an admin option to automate the whole run.
 
 ---
 
@@ -271,7 +307,15 @@ confirmed that behaviour in this build. Otherwise say "raised from the shortage.
 > 300 inspected units are now available for the customer, while the balance stays
 > under production."
 
-**Client takeaway:** A mandatory QA gate stands between production and sellable stock.
+**Optional live completion:** the demo is seeded so the order *can* be finished
+end to end — the semi-finished Cookie is in stock. As Admin, use **Shop Floor →
+Auto-complete all operations** on the work order to drive the remaining 700
+units through the routing; they land as a QA-pending lot, which you then pass in
+Quality to see them reach Finished Goods. (Skip this if you want to leave the
+order in its partial state.)
+
+**Client takeaway:** A mandatory QA gate stands between production and sellable
+stock — and the full run can be demonstrated completing, not just in progress.
 
 ---
 
@@ -431,14 +475,15 @@ payment). If a tested rejected-material or rework scenario exists, show it brief
 
 ## Final checklist — run once before the client meeting
 
-- [ ] All four demo accounts can log in (`SmartiesDemo@2026`).
+- [ ] All four demo accounts can log in with the **username** (e.g. `admin@smartiesfoods`), password `SmartiesDemo@2026`, and the correct **role** shows the right sidebar.
 - [ ] The demo dataset is loaded and internally consistent.
 - [ ] **CO-2026-001** is linked to **PP-2026-001** and **PRD-2026-001**.
-- [ ] The two-level BOM explosion shows correct quantities and units.
-- [ ] MRP displays the **20 kg Dates** shortage.
+- [ ] The BOM lives under **Production → Bill of Materials** (and is gone from Inventory); its two-level **Explode** shows correct quantities and units.
+- [ ] MRP displays the **20 kg Dates** shortage, and the **Cookie** semi-finished row shows a **Start SFG Production** action.
 - [ ] The requisition, PO, goods receipt and incoming QC records reconcile.
 - [ ] The **300 completed** and **700 remaining** units reconcile across production and fulfilment.
 - [ ] The invoice **₹2,10,000**, payment **₹1,00,000** and receivable **₹1,10,000** reconcile.
+- [ ] (If showing live completion) Admin **Auto-complete all operations** runs the work order to completion and the output reaches QA.
 - [ ] Costing and dashboard values match their source records (⚠ don't quote a figure you haven't seen the system compute).
 - [ ] The Delivery Note and other documents open correctly.
 - [ ] At least one exception is demonstrated using a verified workflow.
