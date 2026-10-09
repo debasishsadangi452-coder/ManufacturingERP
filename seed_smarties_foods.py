@@ -287,9 +287,12 @@ def seed():
     set_stock(rm_label,        wh_rm, 1000)  # Available
     set_stock(rm_bag,          wh_rm, 1000)  # Available
     set_stock(rm_carton,       wh_rm,  100)  # Available
-    set_stock(sfg_cookie,      wh_rm,    0)  # produced, starts at 0
-    set_stock(fg_smarties,     wh_fg,    0)  # to be filled after production
-    log("Stock set: 11 materials available, Dates=30kg (short 20 kg intentionally)")
+    # The Cookie SFG has already been produced (its own sub-production run), so
+    # 1,000 units are on hand in the Production warehouse — this lets the finished
+    # Smarties Cookies order consume its two-level components and complete fully.
+    set_stock(sfg_cookie,      wh_prod, 1000)  # produced SFG, ready for FG assembly
+    set_stock(fg_smarties,     wh_fg,      0)  # to be filled after production
+    log("Stock set: 11 materials available, Dates=30kg (short 20 kg intentionally), Cookie SFG=1000 produced")
 
     # ── 9. BOMs ────────────────────────────────────────────────────────────────
     # BOM-1: per 1 Cookie unit → proportional from 100-batch spec
