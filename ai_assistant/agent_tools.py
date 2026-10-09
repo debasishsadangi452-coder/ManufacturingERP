@@ -1,7 +1,7 @@
 """
 Advanced analytics & prediction tools that power the named AI agents
 (AI Plant Manager, AI Procurement, AI Finance, AI Maintenance,
-AI Production Planner, AI Sales Assistant, AI Quality).
+AI Production Planner, Orderbook, AI Quality).
 
 These follow the same conventions as tools.py: every tool takes the
 requesting user as its first argument and returns a JSON string.
@@ -412,7 +412,7 @@ def analyze_quality_performance(user, days=30):
 
 
 # ---------------------------------------------------------------------------
-# AI SALES ASSISTANT — dormant customers
+# ORDERBOOK — dormant customers
 # ---------------------------------------------------------------------------
 
 def find_dormant_customers(user, days=90):
