@@ -646,9 +646,19 @@ def report_output(order, quantity, user=None):
     issue_materials(order, cumulative, user)
 
     product = order.recipe.product
+    # Sub-products (semi-finished goods) are consumed in-house by the finished
+    # good, so they skip QA: the output is booked straight into inventory and is
+    # immediately available to the finished-good work order. Finished goods (and
+    # rework) still go through the QA gate before stock is released.
+    skip_qa = product.is_semi_finished and not order.is_rework
+
     lot = create_finished_lot(product, order.warehouse, quantity, order, company=getattr(product, "company", None))
-    lot.remaining_quantity = 0
-    lot.qa_status = "pending"
+    if skip_qa:
+        lot.remaining_quantity = quantity
+        lot.qa_status = "not_required"
+    else:
+        lot.remaining_quantity = 0
+        lot.qa_status = "pending"
     if order.rework_source_lot_id:
         lot.parent_id = order.rework_source_lot_id
     lot.save(update_fields=["remaining_quantity", "qa_status", "parent"])
@@ -657,18 +667,22 @@ def report_output(order, quantity, user=None):
         production_order=order, quantity=quantity, lot=lot,
         reported_by=user if getattr(user, "is_authenticated", False) else None,
     )
-    QualityCheck.objects.create(
-        inspection_type="production",
-        production_order=order,
-        output=output,
-        lot=lot,
-        item=product,
-        warehouse=order.warehouse,
-        received_quantity=quantity,
-        status="pending",
-        test_type="Rework Inspection" if order.is_rework else "Post-Production",
-        parameter="Visual & Weight",
-    )
+    if skip_qa:
+        increase_stock(product, order.warehouse, quantity, user=user,
+                       reference=f"Sub-product output, Production #{order.id} (no QA)")
+    else:
+        QualityCheck.objects.create(
+            inspection_type="production",
+            production_order=order,
+            output=output,
+            lot=lot,
+            item=product,
+            warehouse=order.warehouse,
+            received_quantity=quantity,
+            status="pending",
+            test_type="Rework Inspection" if order.is_rework else "Post-Production",
+            parameter="Visual & Weight",
+        )
 
     order.produced_quantity = cumulative
     if order.remaining_quantity <= EPS:
@@ -677,15 +691,31 @@ def report_output(order, quantity, user=None):
     else:
         order.status = "partially_completed"
     order.save()
-    refresh_order_qa_status(order)
+    if skip_qa:
+        # No QA for sub-products: mark the order as passing so it isn't left
+        # waiting on an inspection that will never be raised.
+        if order.qa_status != "passed":
+            order.qa_status = "passed"
+            type(order).objects.filter(pk=order.pk).update(qa_status="passed")
+    else:
+        refresh_order_qa_status(order)
 
     from core.utils import send_notification
-    send_notification(
-        "quality",
-        f"{order}: {_fmt(quantity)} {product.unit} of {product.name} reported and awaiting QA (lot {lot.batch_number}).",
-        related_id=order.id, related_type="ProductionOrder",
-        company=getattr(product, "company", None), module="quality",
-    )
+    if skip_qa:
+        send_notification(
+            "production",
+            f"{order}: {_fmt(quantity)} {product.unit} of sub-product {product.name} added to inventory "
+            f"(lot {lot.batch_number}) — ready for the finished product.",
+            related_id=order.id, related_type="ProductionOrder",
+            company=getattr(product, "company", None), module="production",
+        )
+    else:
+        send_notification(
+            "quality",
+            f"{order}: {_fmt(quantity)} {product.unit} of {product.name} reported and awaiting QA (lot {lot.batch_number}).",
+            related_id=order.id, related_type="ProductionOrder",
+            company=getattr(product, "company", None), module="quality",
+        )
     return output
 
 

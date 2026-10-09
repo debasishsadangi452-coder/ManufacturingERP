@@ -597,6 +597,51 @@ class ProductionOperationViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return _bad(e)
         return Response(ProductionOperationSerializer(op).data)
 
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        """One-click: finish this operation with every unit available to it.
+
+        Reports as good all units that have reached this step (bounded by the
+        previous operation's output and the planned quantity) and marks the step
+        completed; the routing sequence is still enforced. When this is the LAST
+        operation, the work order's output is reported too — a finished good goes
+        to QA, a sub-product goes straight into inventory.
+        """
+        op = self.get_object()
+        order = op.production_order
+        output_note = ""
+        try:
+            with transaction.atomic():
+                available = max(min(execution._input_quantity(op), float(op.planned_quantity))
+                                - execution._processed(op), 0)
+                op = execution.report_operation(
+                    op, request.user, good=available, complete=True,
+                    notes="Completed from shop floor.",
+                )
+        except ValidationError as e:
+            return _bad(e)
+
+        is_last = not order.operations.filter(sequence__gt=op.sequence).exists()
+        if is_last:
+            order.refresh_from_db()
+            to_report = float(op.completed_quantity) - float(order.produced_quantity)
+            if to_report > 1e-6:
+                try:
+                    execution.report_output(order, to_report, request.user)
+                except ValidationError as e:
+                    msgs = getattr(e, "detail", None) or [str(e)]
+                    if not isinstance(msgs, (list, tuple)):
+                        msgs = [msgs]
+                    output_note = "Step completed, but output could not be reported yet: " + "; ".join(str(m) for m in msgs)
+        log_activity(request.user, "Production", "Complete Operation",
+                     f"{order.order_number}: completed Op {op.sequence} ({op.name})")
+        order.refresh_from_db()
+        return Response({
+            "operation": ProductionOperationSerializer(op).data,
+            "order_status": order.status,
+            "output_note": output_note,
+        })
+
     def _status(self, request, new_status):
         try:
             op = execution.set_operation_status(self.get_object(), new_status, request.user, request.data.get("notes", ""))

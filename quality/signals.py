@@ -8,6 +8,10 @@ def create_quality_check(sender, instance, created, **kwargs):
     # Only create quality check when the production order status is updated to 'completed'
     # And if a quality check doesn't already exist for it
     if instance.status == "completed":
+        # Sub-products (semi-finished goods) skip QA — their output goes straight
+        # into inventory for the finished product (see execution.report_output).
+        if instance.recipe.product.is_semi_finished and not instance.is_rework:
+            return
         # An order can have several checks (one per test); only auto-create
         # the first one. get_or_create would crash on multiple existing rows.
         if not QualityCheck.objects.filter(production_order=instance).exists():

@@ -69,6 +69,10 @@ def wip_row(order):
         "production_plan_ref": order.production_plan_ref,
         "product_id": order.recipe.product_id,
         "product": order.recipe.product.name,
+        # Sub-products (semi-finished) are shown separately on the shop floor
+        # and skip QA; finished goods go through the QA gate.
+        "product_category": order.recipe.product.category,
+        "is_sub_product": order.recipe.product.is_semi_finished,
         "unit": order.recipe.product.unit,
         "planned_quantity": order.quantity,
         "completed_quantity": order.produced_quantity,

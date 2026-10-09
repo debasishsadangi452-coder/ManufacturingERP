@@ -242,6 +242,11 @@ def on_production_order_change(sender, instance, created, **kwargs):
                 production_order=instance, status__in=['pending', 'procuring']
             ).update(status='cancelled')
 
+            # Sub-products (semi-finished goods) skip QA: their output is already
+            # in inventory for the finished product, so no check or QA notice.
+            if instance.recipe.product.is_semi_finished and not instance.is_rework:
+                return
+
             # quality/signals.py also listens for completion and creates the
             # check. Whichever handler runs first wins the create; the loser
             # must still notify, so the notification is deliberately NOT nested
