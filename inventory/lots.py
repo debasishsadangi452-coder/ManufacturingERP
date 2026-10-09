@@ -77,7 +77,11 @@ def consume_lots_fifo(production_order, item, quantity, company=None):
     """
     remaining = quantity
     consumptions = []
-    for lot in _available_lots(item, company).select_for_update():
+    # `of=("self",)` locks only the Batch rows. _available_lots filters on
+    # warehouse__is_quarantine, which LEFT-joins the nullable warehouse; Postgres
+    # rejects FOR UPDATE on the nullable side of an outer join, so scope the lock
+    # to the lot table itself.
+    for lot in _available_lots(item, company).select_for_update(of=("self",)):
         if remaining <= 0:
             break
         take = min(lot.remaining_quantity, remaining)
@@ -100,7 +104,7 @@ def ship_lots_fifo(shipment, item, quantity, company=None):
 
     remaining = quantity
     shipped = []
-    for lot in _available_lots(item, company).filter(source="produced").select_for_update():
+    for lot in _available_lots(item, company).filter(source="produced").select_for_update(of=("self",)):
         if remaining <= 0:
             break
         take = min(lot.remaining_quantity, remaining)

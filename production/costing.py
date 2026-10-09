@@ -29,6 +29,21 @@ CENT = Decimal("0.01")
 ZERO = Decimal("0")
 
 
+def _component_item(req):
+    """The component Item of a material requirement row.
+
+    Recipe.material_requirements() yields BOMLine objects (component is
+    ``raw_material``) when the product has a BOM, and RecipeIngredient objects
+    (component is ``item``) otherwise. Resolve either shape to its Item.
+    """
+    return getattr(req, "raw_material", None) or req.item
+
+
+def _component_item_id(req):
+    rid = getattr(req, "raw_material_id", None)
+    return rid if rid is not None else req.item_id
+
+
 def _d(value):
     return Decimal(str(value or 0))
 
@@ -72,14 +87,18 @@ def _side(order, settings, company, *, actual):
     if not order.is_rework:
         ledgers = {l.item_id: l for l in order.material_requirements.all()}
         for ing, required in order.recipe.material_requirements(order.quantity):
-            qty = ledgers[ing.item_id].consumed_quantity if actual and ing.item_id in ledgers else (
+            # `ing` is a BOMLine (component = raw_material) or a RecipeIngredient
+            # (component = item); resolve both to the same Item / id.
+            comp_item = _component_item(ing)
+            comp_item_id = _component_item_id(ing)
+            qty = ledgers[comp_item_id].consumed_quantity if actual and comp_item_id in ledgers else (
                 0 if actual else required
             )
-            unit = _material_unit_cost(ing.item, company)
+            unit = _material_unit_cost(comp_item, company)
             amount = _d(qty) * unit
             material_total += amount
             materials.append({
-                "item_id": ing.item_id, "item": ing.item.name, "quantity": round(float(qty), 6),
+                "item_id": comp_item_id, "item": comp_item.name, "quantity": round(float(qty), 6),
                 "unit_cost": float(unit), "amount": float(_money(amount)),
             })
     if actual:
