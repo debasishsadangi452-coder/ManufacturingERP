@@ -30,7 +30,8 @@ After this script the DB will contain:
   * Purchase Order  : PO-2026-001  for 20 kg Dates
   * Goods Receipt   : GRN received into Raw Material WH
   * Production Order: PRD-xxxxx (running / WIP)
-  * Operations      : Mixing ✓, Baking ✓, Cooling 70%, Packing 0%, Inspection 0%
+  * Operations      : (final product) Smarties Addition ✓, Packing 70%, Inspection 0%
+                      — the Cookie sub-product is already made and in stock
   * Invoice         : INV-2026-001 at ₹700/unit
   * Resources       : Mixer-01, Oven-01, Cooling-Rack-01, Packing-Machine-01
   * Operators       : Rahul, Priya, Ankit, Neha
@@ -585,29 +586,27 @@ def seed():
     plan.status = "converted"
     plan.save(update_fields=["status"])
 
-    # ── 21. Production Operations (WIP state: Mixing ✓, Baking ✓, Cooling 70%) ─
+    # ── 21. Production Operations — the FINAL product's own routing only ───────
+    # Mixing / Baking / Cooling belong to the Cookie sub-product (its own work
+    # order; the Cookie is already in stock). The Smarties Cookies work order runs
+    # just its three steps. WIP: Smarties Addition ✓, Packing 70%, Inspection ○.
     ops_data = [
         # (seq, name, machine, manpower, planned_qty, completed_qty, status,
         #  planned_start, planned_end, actual_start, actual_end)
-        (1, "Mixing",           mixer,   rahul,  1000, 1000, "completed",
-         datetime(2026, 11, 16,  8, 0), datetime(2026, 11, 16, 17, 0),
-         datetime(2026, 11, 16,  8, 0), datetime(2026, 11, 16, 16, 30)),
-        (2, "Baking",           oven,    priya,  1000, 1000, "completed",
-         datetime(2026, 11, 17,  8, 0), datetime(2026, 11, 17, 17, 0),
-         datetime(2026, 11, 17,  8, 0), datetime(2026, 11, 17, 16, 45)),
-        (3, "Cooling",          cooling, ankit,  1000,  700, "in_progress",
-         datetime(2026, 11, 18,  8, 0), datetime(2026, 11, 18, 17, 0),
-         datetime(2026, 11, 18,  8, 0), None),
-        (4, "Smarties Addition",None,    neha,   1000,    0, "not_started",
-         datetime(2026, 11, 19,  8, 0), datetime(2026, 11, 19, 14, 0), None, None),
-        (5, "Packing",          packer,  neha,   1000,    0, "not_started",
-         datetime(2026, 11, 20,  8, 0), datetime(2026, 11, 20, 17, 0), None, None),
-        (6, "Final Inspection", None,    neha,   1000,    0, "not_started",
+        (1, "Smarties Addition", None,   neha,   1000, 1000, "completed",
+         datetime(2026, 11, 19,  8, 0), datetime(2026, 11, 19, 14, 0),
+         datetime(2026, 11, 19,  8, 0), datetime(2026, 11, 19, 13, 40)),
+        (2, "Packing",           packer, neha,   1000,  700, "in_progress",
+         datetime(2026, 11, 20,  8, 0), datetime(2026, 11, 20, 17, 0),
+         datetime(2026, 11, 20,  8, 0), None),
+        (3, "Final Inspection",  None,   neha,   1000,    0, "not_started",
          datetime(2026, 11, 21,  8, 0), datetime(2026, 11, 21, 12, 0), None, None),
     ]
 
+    # Drop steps from older seeds (the six-step version mixed in Cookie steps).
+    ProductionOperation.objects.filter(production_order=prod, sequence__gt=len(ops_data)).delete()
     for seq, name, machine, manpower, pq, cq, status, ps, pe, as_, ae in ops_data:
-        op, _ = ProductionOperation.objects.get_or_create(
+        ProductionOperation.objects.update_or_create(
             production_order=prod, sequence=seq,
             defaults={
                 "name": name,
@@ -617,6 +616,9 @@ def seed():
                 "planned_quantity": pq,
                 "started_quantity": cq,
                 "completed_quantity": cq,
+                "rejected_quantity": 0,
+                "scrap_quantity": 0,
+                "rework_quantity": 0,
                 "status": status,
                 "planned_start": timezone.make_aware(ps),
                 "planned_end": timezone.make_aware(pe),
@@ -628,8 +630,8 @@ def seed():
     prod.produced_quantity = 0  # WIP – not yet completed
     prod.status = "running"
     prod.save(update_fields=["produced_quantity", "status"])
-    log("Operations: Mixing 1000/1000 ✓ | Baking 1000/1000 ✓ | Cooling 700/1000 ● | Packing 0/1000 ○ | Inspection 0/1000 ○")
-    log("WIP = 300 units in cooling (in_progress)")
+    log("Operations (final product): Smarties Addition 1000/1000 ✓ | Packing 700/1000 ● | Final Inspection 0/1000 ○")
+    log("WIP = 300 units waiting at Packing (in_progress)")
 
     # An earlier sub-batch of 300 units has already finished the full routing,
     # passed FG QA and been moved into the Finished Goods warehouse. This lets
@@ -798,12 +800,10 @@ def seed():
     print(f"  Invoice         : INV-{inv.id}  ₹{inv.total_amount:,.0f}  status={inv.status}")
     print(f"  AR Payment      : ₹{inv.amount_paid:,.0f} received, balance ₹{inv.balance_due:,.0f}")
     print(f"  {'─'*60}")
-    print(f"  WIP STATUS (remaining 700 units in production)")
-    print(f"  Mixing     1000/1000  ✓ Completed")
-    print(f"  Baking     1000/1000  ✓ Completed")
-    print(f"  Cooling     700/1000  ● In Progress (WIP=300)")
-    print(f"  Packing       0/1000  ○ Not Started")
-    print(f"  Inspection    0/1000  ○ Not Started")
+    print(f"  WIP STATUS — final product work order (Cookie sub-product already in stock)")
+    print(f"  Smarties Addition 1000/1000  ✓ Completed")
+    print(f"  Packing            700/1000  ● In Progress (WIP=300)")
+    print(f"  Final Inspection     0/1000  ○ Not Started")
     print(f"  {'─'*60}")
     print(f"  PARTIAL FULFILMENT: 300 of 1,000 units completed → QA → FG →")
     print(f"  allocated → dispatched (Delivery Note) → invoiced → part-paid.")

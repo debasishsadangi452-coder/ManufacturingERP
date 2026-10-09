@@ -22,7 +22,7 @@
 | Selling price | ₹700 / unit → **order value ₹7,00,000** |
 | Promised delivery | 30 November 2026 |
 | Completed & shipped so far | **300 units** (QA passed, dispatched, invoiced, part-paid) |
-| Still in production | **700 units** (currently at the Cooling stage) |
+| Still in production | **700 units** (final-product work order, currently at the Packing step; the Cookie sub-product is already in stock) |
 | Partial invoice | 300 × ₹700 = **₹2,10,000** |
 | Payment received | **₹1,00,000** → receivable balance **₹1,10,000** |
 
@@ -115,13 +115,15 @@
    30 Nov 2026, priority High**, and the **custom specification**
    ("retail packing, halal certified").
 5. Point out the **order status** and the actions available on it.
+6. Click **Send to Production**. Sales stays on this screen — the order is handed
+   to the production team and the button changes to **"Sent to Production"**.
 
 **Say:**
 > "This order arrived by email and was entered directly as a *confirmed* customer
 > order — there's no forced quotation stage. The Order Book gives sales,
 > production, procurement and management one shared view of demand and its live
-> status. The quantity is 1,000 units, due 30 November. We'll follow this exact
-> order for the rest of the demo."
+> status. When sales is ready, one click sends it to production for planning —
+> sales doesn't have to do the planning themselves."
 
 **Optional:** Open **Orders from Email** (`/orders-from-email`) to show multi-channel intake.
 
@@ -133,59 +135,55 @@
 
 ## Step 3 — Product structure and manufacturing resources  ·  2 min  ·  (req #7–#10, #20)
 
-**Screen:** Inventory (`/inventory`) for items; **Production → Bill of Materials** tab for the BOM; Unit Setup (`/unit-setup`); Production → Lines & Capacity / Routing for resources.
+**Screen:** Inventory (`/inventory`) for items; **Production → BOM & Routing** tab for the product recipe; Unit Setup (`/unit-setup`).
 
-> **Note on where BOM lives:** the Bill of Materials is managed in **one place —
-> Production → "Bill of Materials" tab** (it is the single BOM for the whole ERP,
-> used by MRP, costing and the shop floor). The Inventory screen holds the item
-> master and stock only.
+> **One place for the product recipe:** **Production → "BOM & Routing"** shows one
+> card per product with **both** its components (Bill of Materials) **and** its
+> production steps (Routing). It's the single definition used by MRP, costing and
+> the shop floor. Inventory holds the item master and stock only.
 
 **Actions:**
 1. In **Inventory**, show the item categories: **Raw Materials, Semi-Finished,
    Finished Goods** (Semi-Finished is a single category).
-2. In **Production → Bill of Materials**, open the **two-level BOM**:
-   - **Level 1 — make the Cookie (Semi-Finished):** White Flour, Brown Flour,
-     Sugar, Coconut, Dates, Almonds, Flavoring, Artificial Colors → **Cookie**.
-   - **Level 2 — make Smarties Cookies (Finished):** Cookie + Smarties + Label +
-     Bag + Carton → **Smarties Cookies**. Use **Explode** to show the multi-level tree.
-3. Show a **UOM conversion** example (material bought in kg, handled in other units).
-4. Show the **Resources / Routing**: machines (Mixer-01, Oven-01, Cooling-Rack-01,
-   Packing-Machine-01) and operators (Rahul, Priya, Ankit, Neha). The **Routing**
-   tab holds the manufacturing steps; the **Bill of Materials** tab holds the
-   components — two clear, separate things.
+2. In **Production → BOM & Routing**, open the two product cards:
+   - **Cookie (sub-product):** components White Flour, Brown Flour, Sugar,
+     Coconut, Dates, Almonds, Flavoring, Artificial Colors — steps Mixing →
+     Baking → Cooling.
+   - **Smarties Cookies (final product):** components Cookie + Smarties + Label +
+     Bag + Carton — steps Smarties Addition → Packing → Final Inspection. Use
+     **Explode** to show the multi-level tree.
+3. Show adding a step (name, machine, operator, minutes) and the default line on a card.
+4. Show a **UOM conversion** example (material bought in kg, handled in other units).
 
 **Say:**
-> "This product is manufactured in two stages. First we make the Cookie
-> semi-finished item; then we combine it with Smarties and packaging to make the
-> sellable finished product. The ERP keeps one Bill of Materials — the components
-> — and a separate Routing — the steps. That two-level structure matters because
-> the system tracks both the materials consumed *and* the semi-finished stock
-> produced."
+> "This product is made in two stages: first the Cookie, then the finished
+> Smarties Cookies. Each product has one card that says what goes into it and
+> the steps to make it — so there's never a mismatch between the recipe and the
+> process."
 
-**Show:** A real UOM conversion, the BOM explosion, and the resource/routing records.
+**Show:** The two product cards (components + steps), the BOM explosion, a UOM conversion.
 
-**Client takeaway:** One Bill of Materials and one Routing, multi-level structures, units and resources — all modelled properly.
+**Client takeaway:** One product recipe per item — components and steps together — with multi-level structures handled properly.
 
 ---
 
 ## Step 4 — Production planning and material requirements  ·  3 min  ·  (req #11, #12)
 
-**Screen:** Production → Production Plan (`/production`).
+**Screen:** Log in as **Production** → Production opens on **Production Plan Orders** (the production team's inbox).
 
 **Actions:**
-1. Open **PP-2026-001**.
-2. Show its **link to CO-2026-001**.
-3. Show the requested finished quantity (1,000).
-4. Expand the **two-level BOM explosion**.
-5. Review the calculated material requirements (e.g. White Flour 500 kg,
-   Dates 50 kg, …).
+1. Show the plan sent from Sales at the top, tagged **New** ("awaiting production").
+2. Click the plan (**PP-2026-001**) — it opens the **all-materials view**.
+3. Show its **link to CO-2026-001** and the finished quantity (1,000).
+4. Point out the two sections on one screen: **Sub-Products** (the Cookie) and
+   **Raw Materials — all levels combined** (White Flour 500 kg, Dates 50 kg, …,
+   plus the packaging).
+5. When ready, press **Create Work Order** (in the plan view or the list).
 
 **Say:**
-> "Once the order is confirmed, planning turns that demand into a manufacturing
-> plan. The BOM explosion works out everything needed to produce 1,000 finished
-> units — including the materials for the semi-finished Cookie stage. This plan is
-> the basis for checking stock, purchasing shortfalls, assessing capacity and
-> deciding when production can start."
+> "Production picks up what Sales sent from one inbox. Opening the plan shows
+> everything needed — the sub-products and every raw material across all levels —
+> on one screen, so the planner sees the full picture before committing."
 
 **Client takeaway:** Planning connects customer demand to actual manufacturing requirements.
 
@@ -212,12 +210,12 @@
 **⚠ Verify first:** Only call the requisition "automatically generated" if you've
 confirmed that behaviour in this build. Otherwise say "raised from the shortage."
 
-**Semi-finished shortages (two-level BOM):** in the same MRP view, the
-**Semi-Finished Requirements** table lists sub-assemblies like the **Cookie**.
-When a semi-finished item is short, its row shows a **"Start SFG Production"**
-button — click it to raise a *separate* work order that produces the Cookie
-first, linked to the same customer order. After starting, the row flips to
-**"In Production"** so it can't be started twice.
+**Sub-product shortages (two-level BOM):** in the same plan view, the
+**Sub-Products** table lists items like the **Cookie**. When a sub-product is
+short, its row shows a **"Make sub-product"** button — click it to raise a
+*separate* work order that makes the Cookie first, linked to the same customer
+order. The row then flips to **"In Production"** so it can't be started twice,
+and the work order appears on the Shop Floor under **Sub-Products**.
 
 > "A finished good often depends on a semi-finished one. The system spots that,
 > and lets us kick off the semi-finished production run in one click before the
@@ -255,26 +253,33 @@ first, linked to the same customer order. After starting, the row flips to
 **Screen:** Production → **Shop Floor** tab.
 
 > **Production tabs (left→right, the MTO flow):** Production Plans → Schedule →
-> **Shop Floor** → Material Requisitions → **Bill of Materials** → **Routing** →
-> Lines & Capacity. The plan converts into a **Work Order** that runs on the
-> Shop Floor.
+> **Shop Floor** → Material Requisitions → **BOM & Routing** → Lines & Capacity.
+> The plan becomes a **Work Order** that runs on the Shop Floor.
+
+**The Shop Floor is split into two panels:**
+- **Sub-Products (Semi-Finished)** — made first (e.g. the Cookie). When the last
+  step is completed, the output goes **straight into inventory — no QA** — ready
+  for the final product.
+- **Final Products** — e.g. Smarties Cookies. When the last step is completed,
+  the output goes to **QA** before it becomes sellable stock.
 
 **Actions:**
-1. Open the **Work Order** for the order (PRD-2026-001).
-2. Show its **links to the production plan and the customer order**.
-3. Review the operations: **Mixing → Baking → Cooling → Smarties Addition →
-   Packing → Final Inspection** — each with Start / Report / Pause controls.
-4. Show assigned **machines and operators** per operation.
-5. Show planned **capacity / scheduling** (machine run-rates, manpower).
-6. Open the **live WIP quantities** on the WIP board (completed/planned, current
-   operation, bottleneck, operations done e.g. "4/6").
+1. Show the two panels and the work orders in each.
+2. Open the final-product **Work Order** (PRD-2026-001); show its links to the
+   plan and the customer order.
+3. Show the steps: **Smarties Addition → Packing → Final Inspection** (plus the
+   Cookie's own steps in its sub-product work order). Each step has a green
+   **Complete** button, plus **Report qty** for partial quantities or rejects.
+4. Press **Complete** on a step — it finishes with all units that reached it.
+   On the **last** step, the work order finishes automatically.
+5. Show assigned **machines and operators**, and the live progress (steps done,
+   current step, bottleneck).
 
 **Say:**
-> "Once material readiness is established, the plan is converted into a work
-> order that runs here on the shop floor. We see progress *by operation* — not a
-> single status — so we know exactly where the order is and where it's stuck. A
-> user advances each operation (Start → Report output), and reported output goes
-> to QA before it becomes sellable stock."
+> "The shop floor separates what we make for ourselves — sub-products — from what
+> we ship. Each step is completed with one click; when the last step is done,
+> sub-products drop straight into stock for the next stage, and finished products
+> go to quality first."
 
 **Demonstrate:** Click from a WIP record **back to CO-2026-001**.
 
@@ -478,8 +483,10 @@ payment). If a tested rejected-material or rework scenario exists, show it brief
 - [ ] All four demo accounts can log in with the **username** (e.g. `admin@smartiesfoods`), password `SmartiesDemo@2026`, and the correct **role** shows the right sidebar.
 - [ ] The demo dataset is loaded and internally consistent.
 - [ ] **CO-2026-001** is linked to **PP-2026-001** and **PRD-2026-001**.
-- [ ] The BOM lives under **Production → Bill of Materials** (and is gone from Inventory); its two-level **Explode** shows correct quantities and units.
-- [ ] MRP displays the **20 kg Dates** shortage, and the **Cookie** semi-finished row shows a **Start SFG Production** action.
+- [ ] Sales **Send to Production** keeps the sales user on the Orderbook and the plan appears as **New** in Production Plan Orders.
+- [ ] **Production → BOM & Routing** shows each product's components *and* steps on one card; **Explode** shows correct quantities.
+- [ ] The plan view shows **Sub-Products** and **Raw Materials** together, the **20 kg Dates** shortage, and **Make sub-product** on the Cookie row.
+- [ ] Shop Floor shows **Sub-Products** and **Final Products** panels; **Complete** works on each step; a finished sub-product lands in inventory with no QA.
 - [ ] The requisition, PO, goods receipt and incoming QC records reconcile.
 - [ ] The **300 completed** and **700 remaining** units reconcile across production and fulfilment.
 - [ ] The invoice **₹2,10,000**, payment **₹1,00,000** and receivable **₹1,10,000** reconcile.
