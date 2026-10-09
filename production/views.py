@@ -355,8 +355,18 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         order = self.get_object()
         if order.quantity <= 0:
             return Response({"error": "Production quantity must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
-        if not order.is_rework and not RecipeIngredient.objects.filter(recipe=order.recipe).exists():
-            return Response({"error": "This recipe has no ingredients defined."}, status=status.HTTP_400_BAD_REQUEST)
+        # Components come from the BOM (the single source of truth); the legacy
+        # RecipeIngredient list is only a fallback. Block completion only when
+        # there is neither a BOM nor any legacy ingredients.
+        if not order.is_rework:
+            from inventory.models import BOM
+            has_bom = BOM.objects.filter(finished_good=order.recipe.product, is_active=True).exists()
+            has_legacy = RecipeIngredient.objects.filter(recipe=order.recipe).exists()
+            if not has_bom and not has_legacy:
+                return Response(
+                    {"error": "This product has no BOM (or legacy recipe) defining its components."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         try:
             execution.complete_order(order, request.user)
         except ValidationError as e:
@@ -366,6 +376,75 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return Response({"error": "Production failed due to internal error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         log_activity(request.user, "Production", "Complete Production Order", f"Completed {order.order_number}: {order.quantity} x '{order.recipe.product.name}' sent to QA")
         return Response({"status": "Production completed successfully."}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAdmin])
+    def complete_all_operations(self, request, pk=None):
+        """ADMIN-ONLY: auto-run every remaining operation to full quantity.
+
+        The shop floor normally advances operations one at a time, in sequence.
+        This admin shortcut drives all unfinished operations of the order to
+        their planned quantity in order (respecting the routing), so the order's
+        whole process is completed in one action. Optionally, when
+        ``report_output`` is true (default), it then reports the finished units
+        to QA so the order lands QA-pending.
+        """
+        from django.db import transaction
+        order = self.get_object()
+        # Step 1: complete every remaining operation, in sequence. This part is
+        # atomic on its own so a later material shortage doesn't undo it.
+        try:
+            with transaction.atomic():
+                advanced = 0
+                for op in order.operations.order_by("sequence"):
+                    if op.status == "completed":
+                        continue
+                    remaining = float(op.planned_quantity) - execution._processed(op)
+                    execution.report_operation(
+                        op, request.user,
+                        good=max(remaining, 0),
+                        complete=True,
+                        notes="Auto-completed by admin.",
+                    )
+                    advanced += 1
+        except ValidationError as e:
+            return _bad(e)
+        except Exception:
+            logging.getLogger(__name__).exception("Auto-complete operations failed (order #%s)", order.id)
+            return Response({"error": "Auto-complete failed due to an internal error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Step 2 (optional): report the finished units to QA. A two-level product
+        # can be short of its components (e.g. the semi-finished good must be
+        # produced first), so a shortage here is reported, not treated as a
+        # failure of the operation completion above.
+        reported = None
+        output_note = ""
+        if request.data.get("report_output", True) is not False:
+            order.refresh_from_db()
+            if order.remaining_quantity > 1e-6:
+                try:
+                    reported = execution.report_output(order, order.remaining_quantity, request.user)
+                except ValidationError as e:
+                    msgs = getattr(e, "detail", None) or getattr(e, "messages", None) or [str(e)]
+                    output_note = (
+                        " Operations are done, but finished output could not be reported yet: "
+                        + "; ".join(str(m) for m in msgs)
+                    )
+
+        log_activity(
+            request.user, "Production", "Auto-complete Operations",
+            f"{order.order_number}: admin auto-completed {advanced} operation(s)"
+            + (" and reported output to QA" if reported else ""),
+        )
+        order.refresh_from_db()
+        return Response(
+            {
+                "status": f"Auto-completed {advanced} operation(s)."
+                          + (" Finished units sent to QA." if reported else output_note),
+                "output_pending": bool(output_note),
+                "order": ProductionOrderSerializer(order).data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post"])
     def close(self, request, pk=None):

@@ -43,12 +43,16 @@ class Recipe(models.Model):
     def material_requirements(self, units):
         """Raw material needed to make `units` of finished product.
 
-        RecipeIngredient.quantity is stated per *batch*, not per unit, so the
-        requirement scales by whole batches (you cannot run a partial batch).
-        Every planning path goes through here so the availability check, the
-        reservation, and the actual lot consumption can never disagree.
+        The BOM is the single source of truth for a product's components across
+        the whole ERP (Inventory, MRP, costing, execution all read it). A Recipe
+        now only carries the *routing* (operations, batch size, line); its
+        legacy RecipeIngredient list is a fallback kept only for the rare product
+        that has no BOM yet. Every planning path goes through here so the
+        availability check, the reservation and the actual lot consumption can
+        never disagree.
 
-        Returns [(ingredient, required_qty), ...].
+        Returns [(component, required_qty), ...] where component is a BOMLine
+        (normal case) or, only as a legacy fallback, a RecipeIngredient.
         """
         from inventory.models import BOM
         bom = BOM.objects.filter(finished_good=self.product, is_active=True).first()
@@ -58,6 +62,8 @@ class Recipe(models.Model):
                 for line in bom.lines.select_related("raw_material").all()
             ]
 
+        # Legacy fallback: no BOM exists for this product. RecipeIngredient
+        # quantity is per *batch*, so scale by whole batches.
         batches = self.batches_for(units)["batches"]
         return [
             (ing, ing.quantity * batches)
