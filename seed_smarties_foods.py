@@ -61,8 +61,11 @@ from production.models import (
     ProductionOrder, ProductionOperation, ProductionPlan,
     ProductionMaterialRequirement, ManufacturingSettings, Resource,
 )
-from sales.models import Customer, SalesOrder, SalesOrderItem, Invoice, InvoiceLine
+from sales.models import (
+    Customer, SalesOrder, SalesOrderItem, Invoice, InvoiceLine, CustomerPayment,
+)
 from quality.models import QualityCheck, IncomingQualityCheck
+from fulfillment.models import FGAllocation, Dispatch, DispatchLine
 
 PASSWORD = "SmartiesDemo@2026"
 COMPANY_NAME = "Smarties Foods Manufacturing Pvt. Ltd."
@@ -536,7 +539,7 @@ def seed():
             planned_end=timezone.make_aware(datetime(2026, 11, 21, 17, 0)),
             notes="MTO Production Order for CO-2026-001. Two-level BOM: Cookie SFG first, then Smarties Cookies.",
         )
-        prod.order_number = "PR-2026-001"
+        prod.order_number = "PRD-2026-001"
         prod.save(update_fields=["order_number"])
 
         # Material requirements
@@ -620,7 +623,102 @@ def seed():
     log("Operations: Mixing 1000/1000 ✓ | Baking 1000/1000 ✓ | Cooling 700/1000 ● | Packing 0/1000 ○ | Inspection 0/1000 ○")
     log("WIP = 300 units in cooling (in_progress)")
 
-    # ── 22. Invoice INV-2026-001 ───────────────────────────────────────────────
+    # An earlier sub-batch of 300 units has already finished the full routing,
+    # passed FG QA and been moved into the Finished Goods warehouse. This lets
+    # the demo show the *complete* downstream chain (FG stock → allocation →
+    # dispatch/Delivery Note → invoice → AR) as a PARTIAL fulfilment, while the
+    # remaining 700 are still the WIP shown above. This demonstrates req #50
+    # (partial production & dispatch) end to end.
+    DISPATCHED_QTY = 300
+
+    # ── 22. FG QA + Finished-Goods stock for the completed sub-batch ───────────
+    fgqc_qs = QualityCheck.objects.filter(item=fg_smarties, production_order=prod)
+    if not fgqc_qs.exists():
+        QualityCheck.objects.create(
+            production_order=prod,
+            item=fg_smarties,
+            inspector=qual_user,
+            inspection_type="production",
+            status="approved",
+            result_decision="pass",
+            received_quantity=DISPATCHED_QTY,
+            accepted_quantity=DISPATCHED_QTY,
+            rejected_quantity=0,
+            remarks=("FG QA gate (req #28): 300-unit sub-batch of Smarties Cookies "
+                     "passed final inspection — released to Finished Goods Warehouse."),
+        )
+    set_stock(fg_smarties, wh_fg, DISPATCHED_QTY)
+    StockMovement.objects.get_or_create(
+        item=fg_smarties, warehouse=wh_fg, movement_type="IN", quantity=DISPATCHED_QTY,
+        reference=f"FG production receipt — {prod.order_number} (QA passed)",
+    )
+    log(f"FG QA passed + {DISPATCHED_QTY} units Smarties Cookies → Finished Goods Warehouse")
+
+    # ── 23. FG Allocation against the customer order (req #25) ─────────────────
+    alloc_qs = FGAllocation.objects.filter(sales_order=so, item=fg_smarties)
+    if alloc_qs.exists():
+        alloc = alloc_qs.first()
+    else:
+        alloc = FGAllocation.objects.create(
+            company=co,
+            sales_order=so,
+            sales_order_item=so_item,
+            item=fg_smarties,
+            quantity=DISPATCHED_QTY,
+            dispatched_quantity=DISPATCHED_QTY,
+            status="dispatched",
+            created_by=store_user,
+        )
+    log(f"FG Allocation: {DISPATCHED_QTY} units reserved for {cust.name} against SO-{so.id}")
+
+    # ── 24. Dispatch + Delivery Note with logistics (req #29, #30, #38) ────────
+    dsp_qs = Dispatch.objects.filter(sales_order=so)
+    if dsp_qs.exists():
+        dsp = dsp_qs.first()
+    else:
+        dsp = Dispatch.objects.create(
+            company=co,
+            sales_order=so,
+            warehouse=wh_fg,
+            status="dispatched",
+            shipment_mode="road",
+            carrier="BlueDart Surface Logistics",
+            shipment_reference="LR-MH-2026-88214",
+            vehicle_number="MH-04-GT-5521",
+            driver_name="Ramesh Kumar",
+            freight_amount=Decimal("4500"),
+            packages=30,
+            gross_weight="340 kg",
+            ship_to_name=cust.name,
+            ship_to_address=cust.address,
+            expected_delivery=date(2026, 11, 25),
+            delivery_notes=("Partial dispatch #1 of CO-2026-001: 300 of 1,000 units. "
+                            "Balance 700 to follow on completion of production."),
+            verified_by=store_user,
+            verified_at=timezone.make_aware(datetime(2026, 11, 22, 11, 0)),
+            dispatched_at=timezone.make_aware(datetime(2026, 11, 22, 15, 30)),
+            created_by=store_user,
+        )
+        DispatchLine.objects.create(
+            dispatch=dsp,
+            sales_order_item=so_item,
+            item=fg_smarties,
+            requested_quantity=1000,
+            quantity=DISPATCHED_QTY,
+            packed=True,
+            unit_price=Decimal("700"),
+        )
+        # Finished goods leave the FG warehouse on dispatch.
+        StockMovement.objects.create(
+            item=fg_smarties, warehouse=wh_fg, movement_type="OUT",
+            quantity=DISPATCHED_QTY,
+            reference=f"Dispatch {dsp.dispatch_number} → {cust.name}",
+        )
+        set_stock(fg_smarties, wh_fg, 0)
+    log(f"Dispatch: {dsp.dispatch_number}  {DISPATCHED_QTY} units by Road ({dsp.carrier}, {dsp.vehicle_number})")
+
+    # ── 25. Invoice INV-2026-001 (for the dispatched 300 units) ────────────────
+    inv_amount = Decimal("700") * DISPATCHED_QTY  # ₹2,10,000
     inv_qs = Invoice.objects.filter(sales_order=so, company=co)
     if inv_qs.exists():
         inv = inv_qs.first()
@@ -629,9 +727,9 @@ def seed():
             company=co,
             sales_order=so,
             customer=cust,
-            invoice_date=date(2026, 11, 30),
-            due_date=date(2026, 12, 30),
-            total_amount=Decimal("700000"),
+            invoice_date=date(2026, 11, 22),
+            due_date=date(2026, 12, 22),
+            total_amount=inv_amount,
             amount_paid=Decimal("0"),
             status="open",
         )
@@ -639,13 +737,31 @@ def seed():
             invoice=inv,
             sales_order_item=so_item,
             item=fg_smarties,
-            description="Smarties Cookies — 1,000 units @ ₹700",
-            quantity=1000,
+            description=f"Smarties Cookies — {DISPATCHED_QTY} units @ ₹700 (partial dispatch 1)",
+            quantity=DISPATCHED_QTY,
             unit_price=Decimal("700"),
-            amount=Decimal("700000"),
+            amount=inv_amount,
         )
+        dsp.invoice = inv
+        dsp.save(update_fields=["invoice"])
+    log(f"Invoice: INV-{inv.id}  ₹{inv_amount:,.0f}  (300 units dispatched)  due=22 Dec 2026")
 
-    log(f"Invoice: INV-{inv.id}  ₹7,00,000  status={inv.status}  due=30 Dec 2026")
+    # ── 26. Accounts Receivable — partial customer payment (req #32) ───────────
+    pay_qs = CustomerPayment.objects.filter(invoice=inv)
+    if not pay_qs.exists():
+        part_payment = Decimal("100000")  # ₹1,00,000 part payment → balance ₹1,10,000
+        CustomerPayment.objects.create(
+            company=co,
+            customer=cust,
+            invoice=inv,
+            amount=part_payment,
+            payment_date=date(2026, 11, 28),
+            method="bank_transfer",
+            reference="NEFT-ABCRETAIL-88213",
+        )
+        inv.apply_payment(part_payment)
+    inv.refresh_from_db()
+    log(f"AR: ₹1,00,000 received  →  INV-{inv.id} status={inv.status}, balance ₹{inv.balance_due:,.0f}")
 
     # ══ SUMMARY ═══════════════════════════════════════════════════════════════
     print(f"\n{'═'*65}")
@@ -669,14 +785,21 @@ def seed():
     print(f"  Purchase Req    : {pr.requisition_number}  Dates 20 kg short")
     print(f"  Purchase Order  : PO-{po.id}  Dates 20 kg @ ₹120  → received")
     print(f"  Production Order: {prod.order_number}  1,000 units  status=running")
-    print(f"  Invoice         : INV-{inv.id}  ₹7,00,000  status=open")
+    print(f"  FG Allocation   : {int(DISPATCHED_QTY)} units reserved for {cust.name}")
+    print(f"  Dispatch        : {dsp.dispatch_number}  {int(DISPATCHED_QTY)} units by Road ({dsp.carrier})")
+    print(f"  Invoice         : INV-{inv.id}  ₹{inv.total_amount:,.0f}  status={inv.status}")
+    print(f"  AR Payment      : ₹{inv.amount_paid:,.0f} received, balance ₹{inv.balance_due:,.0f}")
     print(f"  {'─'*60}")
-    print(f"  WIP STATUS")
+    print(f"  WIP STATUS (remaining 700 units in production)")
     print(f"  Mixing     1000/1000  ✓ Completed")
     print(f"  Baking     1000/1000  ✓ Completed")
     print(f"  Cooling     700/1000  ● In Progress (WIP=300)")
     print(f"  Packing       0/1000  ○ Not Started")
     print(f"  Inspection    0/1000  ○ Not Started")
+    print(f"  {'─'*60}")
+    print(f"  PARTIAL FULFILMENT: 300 of 1,000 units completed → QA → FG →")
+    print(f"  allocated → dispatched (Delivery Note) → invoiced → part-paid.")
+    print(f"  Balance 700 units still in production (demonstrates req #50).")
     print(f"{'═'*65}\n")
 
 
