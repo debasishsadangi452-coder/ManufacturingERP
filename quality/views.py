@@ -120,6 +120,38 @@ class QualityCheckViewSet(viewsets.ModelViewSet):
         return Response(ProductionOrderSerializer(order).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"])
+    def waive_incoming(self, request):
+        """Release every pending incoming inspection of raw materials into stock
+        without inspecting (QC waived). Same effect as approving each one in
+        full; each is applied on its own so one failure doesn't block the rest.
+        Optional payload: ids (list) to limit which checks are waived."""
+        from django.db import transaction as _tx
+        qs = self.get_queryset().filter(inspection_type="incoming", status="pending",
+                                        item__category="raw_material")
+        if request.data.get("ids"):
+            qs = qs.filter(id__in=request.data["ids"])
+        released, failed = [], []
+        for qc_id in list(qs.values_list("id", flat=True)):
+            try:
+                with _tx.atomic():
+                    qc = QualityCheck.objects.select_for_update().get(pk=qc_id)
+                    if qc.status != "pending":
+                        continue
+                    services.decide(qc, {
+                        "accepted_quantity": qc.inspected_quantity, "rejected_quantity": 0,
+                        "quarantined_quantity": 0, "rework_quantity": 0,
+                        "remarks": "Incoming QC waived for raw-material purchase.",
+                    }, request.user)
+                released.append(qc_id)
+            except Exception as e:  # report and continue with the others
+                failed.append({"id": qc_id, "error": str(getattr(e, "detail", e))[:200]})
+        if released:
+            log_activity(request.user, "Quality", "Waive Incoming QC",
+                         f"Released {len(released)} raw-material receipt(s) to stock without inspection")
+        return Response({"released": len(released), "failed": failed},
+                        status=status.HTTP_200_OK if not failed else status.HTTP_207_MULTI_STATUS)
+
+    @action(detail=False, methods=["post"])
     def release_quarantine(self, request):
         """Re-inspect a quarantined lot. Payload: lot, accepted_quantity, rejected_quantity."""
         from inventory.models import Batch

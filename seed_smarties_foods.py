@@ -209,12 +209,14 @@ def seed():
     # ── 2. Manufacturing Settings ──────────────────────────────────────────────
     ms = ManufacturingSettings.for_company(co)
     ms.business_model = "mto"
-    ms.incoming_qc_required = True
+    # Raw-material purchases go straight to inventory (incoming QC waived);
+    # an admin can switch it back on in Shop Floor -> Settings.
+    ms.incoming_qc_required = False
     ms.enforce_operation_sequence = True
     ms.auto_invoice_on_dispatch = True
     ms.allow_partial_production_and_dispatch = True
     ms.save()
-    log("Manufacturing settings: MTO, incoming QC enabled")
+    log("Manufacturing settings: MTO, incoming QC waived for raw materials")
 
     # ── 3. Users ───────────────────────────────────────────────────────────────
     admin_user, _ = get_or_create_user(
