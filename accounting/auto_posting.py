@@ -76,6 +76,7 @@ def queue_auto_post(event, company, source_id, user=None, payload=None):
     Safe to call from any operational view: it never raises."""
     try:
         if not is_auto_posting_enabled(company):
+            _log_missing_chart(event, company, source_id, payload)
             return
     except Exception:
         logger.exception("Auto-posting: could not check settings for %s #%s", event, source_id)
@@ -83,6 +84,23 @@ def queue_auto_post(event, company, source_id, user=None, payload=None):
     transaction.on_commit(
         lambda: execute_auto_post(event, company, source_id, user=user, payload=payload)
     )
+
+
+def _log_missing_chart(event, company, source_id, payload):
+    """Auto-post is on but there is no chart of accounts: record the skipped
+    event (instead of dropping it silently) so it shows up and can be replayed
+    once accounting is set up."""
+    try:
+        if company is None:
+            return
+        on = AccountingSettings.objects.filter(company=company, auto_post_enabled=True).exists()
+        if on and not Account.objects.filter(company=company).exists():
+            AutoPostingLog.objects.create(
+                company=company, event=event, source_id=source_id, payload=payload or {},
+                status="skipped", message="Chart of accounts not set up — set up accounting, then replay.",
+            )
+    except Exception:
+        logger.exception("Auto-posting: could not log missing chart for %s #%s", event, source_id)
 
 
 def execute_auto_post(event, company, source_id, user=None, payload=None, log=None):

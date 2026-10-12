@@ -374,7 +374,7 @@ def calculate_item_unit_cost(item, company):
 
     poi = PurchaseOrderItem.objects.filter(
         item=item,
-        po__vendor__company=company
+        purchase_order__vendor__company=company
     ).order_by("-id").first()
     if poi and poi.unit_price > Decimal("0.00"):
         return Decimal(str(poi.unit_price)).quantize(Decimal("0.01"))
@@ -411,17 +411,20 @@ def calculate_production_order_costs(order, company, policy=None, labor_cost_ove
     materials = []
     total_material_cost = Decimal("0.00")
 
-    ingredients = recipe.recipeingredient_set.select_related("item").all()
-    for ing in ingredients:
-        required_qty = (Decimal(str(ing.quantity)) * batches).quantize(Decimal("0.0001"))
-        unit_cost = calculate_item_unit_cost(ing.item, company)
+    # Components come from the BOM (single source of truth); legacy recipe
+    # ingredients only when the product has no BOM. Same quantities production
+    # actually issues (Recipe.material_requirements).
+    for ing, required in recipe.material_requirements(float(planned_qty)):
+        comp = ing.item
+        required_qty = Decimal(str(required)).quantize(Decimal("0.0001"))
+        unit_cost = calculate_item_unit_cost(comp, company)
         line_cost = (required_qty * unit_cost).quantize(Decimal("0.01"))
         total_material_cost += line_cost
 
         materials.append({
-            "item_id": ing.item.id,
-            "item_name": ing.item.name,
-            "sku": getattr(ing.item, "sku", ""),
+            "item_id": comp.id,
+            "item_name": comp.name,
+            "sku": getattr(comp, "sku", ""),
             "quantity_required": float(required_qty),
             "unit_cost": float(unit_cost),
             "total_cost": float(line_cost),

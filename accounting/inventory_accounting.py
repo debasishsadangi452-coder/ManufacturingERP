@@ -78,6 +78,19 @@ def recipe_unit_cost(item, _depth=0):
     own recipe cost. None when the item has no recipe."""
     if _depth > 5:  # guard against a recipe that (indirectly) contains itself
         return None
+    # The BOM is the single source of components (quantities per finished
+    # unit); the legacy recipe ingredient list (per batch) is only a fallback.
+    from inventory.models import BOM
+    bom = BOM.objects.filter(finished_good=item, is_active=True).prefetch_related("lines__raw_material").first()
+    if bom:
+        unit_cost = Decimal("0")
+        for line in bom.lines.all():
+            comp = line.raw_material
+            cost = comp.purchase_cost or Decimal("0")
+            if cost <= 0:
+                cost = recipe_unit_cost(comp, _depth + 1) or Decimal("0")
+            unit_cost += Decimal(str(line.quantity_in_base_unit())) * Decimal(str(cost))
+        return unit_cost
     recipe = item.recipes.prefetch_related("recipeingredient_set__item").first()
     if not recipe:
         return None

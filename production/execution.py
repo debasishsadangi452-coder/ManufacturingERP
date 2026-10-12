@@ -780,6 +780,11 @@ def report_output(order, quantity, user=None):
         if order.qa_status != "passed":
             order.qa_status = "passed"
             type(order).objects.filter(pk=order.pk).update(qa_status="passed")
+        # Finished goods post RM -> WIP -> FG when QA approves; sub-products
+        # have no QA step, so post as soon as the order is complete.
+        if order.status == "completed":
+            from quality.services import maybe_post_manufacturing_accounting
+            maybe_post_manufacturing_accounting(order, user)
     else:
         refresh_order_qa_status(order)
 

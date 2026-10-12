@@ -303,6 +303,9 @@ def maybe_post_manufacturing_accounting(order, user=None):
     good = (agg["accepted"] or 0) + (agg["quarantined"] or 0) + (agg["rework"] or 0)
     if legacy and good <= EPS:
         good = order.produced_quantity or order.quantity
+    if not order.qualitycheck_set.exists():
+        # Sub-products skip QA: everything booked as output is good stock.
+        good = order.produced_quantity
     scrap = (agg["rejected"] or 0) + sum(op.scrap_quantity for op in order.operations.all())
     scrap = min(scrap, max(order.quantity - good, 0))
     payload = {"completed_qty": round(good, 6), "scrap_qty": round(scrap, 6)}

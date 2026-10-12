@@ -218,6 +218,19 @@ def seed():
     ms.save()
     log("Manufacturing settings: MTO, incoming QC waived for raw materials")
 
+    # Accounting: chart of accounts + fiscal year + auto-posting, so receipts,
+    # production, dispatches, invoices and payments post to the GL as they happen.
+    from accounting.models import Account, AccountingSettings
+    from accounting.seeds import ensure_current_fiscal_year, seed_standard_chart_of_accounts
+    if not Account.objects.filter(company=co).exists():
+        seed_standard_chart_of_accounts(co)
+    ensure_current_fiscal_year(co)
+    acc_settings, _ = AccountingSettings.objects.get_or_create(company=co)
+    if not acc_settings.auto_post_enabled:
+        acc_settings.auto_post_enabled = True
+        acc_settings.save(update_fields=["auto_post_enabled"])
+    log("Accounting: chart of accounts, fiscal year, auto-posting on")
+
     # ── 3. Users ───────────────────────────────────────────────────────────────
     admin_user, _ = get_or_create_user(
         f"admin@{COMPANY_SLUG}", "admin@smartiesfoods.com",
