@@ -256,24 +256,23 @@ and the work order appears on the Shop Floor under **Sub-Products**.
 > **Shop Floor** → Material Requisitions → **BOM & Routing** → Lines & Capacity.
 > The plan becomes a **Work Order** that runs on the Shop Floor.
 
-**The Shop Floor is split into two panels:**
-- **Sub-Products (Semi-Finished)** — made first (e.g. the Cookie). When the last
-  step is completed, the output goes **straight into inventory — no QA** — ready
-  for the final product.
-- **Final Products** — e.g. Smarties Cookies. When the last step is completed,
-  the output goes to **QA** before it becomes sellable stock.
+**The Shop Floor groups each final product with its sub-products:**
+- Each **Final Product** work order (e.g. Smarties Cookies) is shown with the
+  **Sub-Product** work orders it needs (e.g. the Cookie) nested underneath.
+- Sub-products go **straight into inventory — no QA**; final products go to **QA**.
+- If materials are short, the work order says exactly what's missing *before*
+  anyone starts, instead of failing at the end.
 
 **Actions:**
-1. Show the two panels and the work orders in each.
-2. Open the final-product **Work Order** (PRD-2026-001); show its links to the
-   plan and the customer order.
-3. Show the steps: **Smarties Addition → Packing → Final Inspection** (plus the
-   Cookie's own steps in its sub-product work order). Each step has a green
-   **Complete** button, plus **Report qty** for partial quantities or rejects.
-4. Press **Complete** on a step — it finishes with all units that reached it.
-   On the **last** step, the work order finishes automatically.
-5. Show assigned **machines and operators**, and the live progress (steps done,
-   current step, bottleneck).
+1. Show a final product with its sub-product underneath.
+2. **Quick way:** press **Complete Work Order** on a card — every remaining step
+   is finished and the output booked in one click. The same button is on the
+   Production Plan Orders list and the work-order cards, so you never have to go
+   into the step detail.
+3. **Step by step:** press **View steps**, then **Complete step** on the current
+   step (extra controls like partial quantity or pause are under **More**).
+   Finishing the last step books the output automatically.
+4. Show the live progress (Step X of N, current step, missing materials if any).
 
 **Say:**
 > "The shop floor separates what we make for ourselves — sub-products — from what
@@ -486,7 +485,8 @@ payment). If a tested rejected-material or rework scenario exists, show it brief
 - [ ] Sales **Send to Production** keeps the sales user on the Orderbook and the plan appears as **New** in Production Plan Orders.
 - [ ] **Production → BOM & Routing** shows each product's components *and* steps on one card; **Explode** shows correct quantities.
 - [ ] The plan view shows **Sub-Products** and **Raw Materials** together, the **20 kg Dates** shortage, and **Make sub-product** on the Cookie row.
-- [ ] Shop Floor shows **Sub-Products** and **Final Products** panels; **Complete** works on each step; a finished sub-product lands in inventory with no QA.
+- [ ] Shop Floor shows each final product with its sub-products; **Complete Work Order** finishes in one click; a finished sub-product lands in inventory with no QA.
+- [ ] Enough raw-material stock is on hand for the demo quantity (otherwise the work order shows "Missing materials").
 - [ ] The requisition, PO, goods receipt and incoming QC records reconcile.
 - [ ] The **300 completed** and **700 remaining** units reconcile across production and fulfilment.
 - [ ] The invoice **₹2,10,000**, payment **₹1,00,000** and receivable **₹1,10,000** reconcile.

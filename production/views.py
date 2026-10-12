@@ -350,101 +350,31 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
-        """Report the whole remaining quantity. Finished goods go to QA; stock
-        is only released when QA accepts them."""
+        """One click "Complete Work Order": run every remaining step to full
+        quantity and report the output (finished good -> QA, sub-product ->
+        inventory). Materials are checked first so nothing is left half-done."""
         order = self.get_object()
-        if order.quantity <= 0:
-            return Response({"error": "Production quantity must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
-        # Components come from the BOM (the single source of truth); the legacy
-        # RecipeIngredient list is only a fallback. Block completion only when
-        # there is neither a BOM nor any legacy ingredients.
-        if not order.is_rework:
-            from inventory.models import BOM
-            has_bom = BOM.objects.filter(finished_good=order.recipe.product, is_active=True).exists()
-            has_legacy = RecipeIngredient.objects.filter(recipe=order.recipe).exists()
-            if not has_bom and not has_legacy:
-                return Response(
-                    {"error": "This product has no BOM (or legacy recipe) defining its components."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
         try:
-            execution.complete_order(order, request.user)
+            order = execution.finish_work_order(order, request.user)
         except ValidationError as e:
             return _bad(e)
         except Exception:
-            logging.getLogger(__name__).exception("Production order completion failed (order #%s)", order.id)
-            return Response({"error": "Production failed due to internal error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        log_activity(request.user, "Production", "Complete Production Order", f"Completed {order.order_number}: {order.quantity} x '{order.recipe.product.name}' sent to QA")
-        return Response({"status": "Production completed successfully."}, status=status.HTTP_200_OK)
+            logging.getLogger(__name__).exception("Complete work order failed (order #%s)", order.id)
+            return Response({"error": "Could not complete the work order due to an internal error."},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        product = order.recipe.product
+        where = "added to inventory" if product.is_semi_finished and not order.is_rework else "sent to QA"
+        log_activity(request.user, "Production", "Complete Work Order",
+                     f"Completed {order.order_number}: {order.produced_quantity:g} x '{product.name}' {where}")
+        return Response({
+            "status": f"{order.order_number} completed — {order.produced_quantity:g} {product.unit} {where}.",
+            "order": ProductionOrderSerializer(order).data,
+        }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdmin])
     def complete_all_operations(self, request, pk=None):
-        """ADMIN-ONLY: auto-run every remaining operation to full quantity.
-
-        The shop floor normally advances operations one at a time, in sequence.
-        This admin shortcut drives all unfinished operations of the order to
-        their planned quantity in order (respecting the routing), so the order's
-        whole process is completed in one action. Optionally, when
-        ``report_output`` is true (default), it then reports the finished units
-        to QA so the order lands QA-pending.
-        """
-        from django.db import transaction
-        order = self.get_object()
-        # Step 1: complete every remaining operation, in sequence. This part is
-        # atomic on its own so a later material shortage doesn't undo it.
-        try:
-            with transaction.atomic():
-                advanced = 0
-                for op in order.operations.order_by("sequence"):
-                    if op.status == "completed":
-                        continue
-                    remaining = float(op.planned_quantity) - execution._processed(op)
-                    execution.report_operation(
-                        op, request.user,
-                        good=max(remaining, 0),
-                        complete=True,
-                        notes="Auto-completed by admin.",
-                    )
-                    advanced += 1
-        except ValidationError as e:
-            return _bad(e)
-        except Exception:
-            logging.getLogger(__name__).exception("Auto-complete operations failed (order #%s)", order.id)
-            return Response({"error": "Auto-complete failed due to an internal error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        # Step 2 (optional): report the finished units to QA. A two-level product
-        # can be short of its components (e.g. the semi-finished good must be
-        # produced first), so a shortage here is reported, not treated as a
-        # failure of the operation completion above.
-        reported = None
-        output_note = ""
-        if request.data.get("report_output", True) is not False:
-            order.refresh_from_db()
-            if order.remaining_quantity > 1e-6:
-                try:
-                    reported = execution.report_output(order, order.remaining_quantity, request.user)
-                except ValidationError as e:
-                    msgs = getattr(e, "detail", None) or getattr(e, "messages", None) or [str(e)]
-                    output_note = (
-                        " Operations are done, but finished output could not be reported yet: "
-                        + "; ".join(str(m) for m in msgs)
-                    )
-
-        log_activity(
-            request.user, "Production", "Auto-complete Operations",
-            f"{order.order_number}: admin auto-completed {advanced} operation(s)"
-            + (" and reported output to QA" if reported else ""),
-        )
-        order.refresh_from_db()
-        return Response(
-            {
-                "status": f"Auto-completed {advanced} operation(s)."
-                          + (" Finished units sent to QA." if reported else output_note),
-                "output_pending": bool(output_note),
-                "order": ProductionOrderSerializer(order).data,
-            },
-            status=status.HTTP_200_OK,
-        )
+        """Kept for compatibility: same as Complete Work Order."""
+        return self.complete(request, pk)
 
     @action(detail=True, methods=["post"])
     def close(self, request, pk=None):
@@ -582,6 +512,32 @@ class ProductionOperationViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             return _bad(e)
         return Response(ProductionOperationSerializer(op).data)
 
+    def _finish_if_last_step(self, op, user):
+        """If the last step is now completed, report the units that finished it
+        as the work order's output (finished good -> QA, sub-product ->
+        inventory). Returns a note when that couldn't happen, else ""."""
+        order = op.production_order
+        order.refresh_from_db()
+        to_report = execution.pending_output(order)
+        if to_report <= 1e-6:
+            return ""
+        try:
+            execution.report_output(order, to_report, user)
+        except ValidationError as e:
+            msgs = getattr(e, "detail", None) or [str(e)]
+            if not isinstance(msgs, (list, tuple)):
+                msgs = [msgs]
+            return "Step completed, but the output could not be booked yet: " + "; ".join(str(m) for m in msgs)
+        return ""
+
+    def _step_response(self, op, output_note):
+        order = op.production_order
+        order.refresh_from_db()
+        data = ProductionOperationSerializer(op).data
+        data.update({"order_status": order.status, "output_note": output_note,
+                     "operation": ProductionOperationSerializer(op).data})
+        return Response(data)
+
     @action(detail=True, methods=["post"])
     def report(self, request, pk=None):
         d = request.data
@@ -595,21 +551,15 @@ class ProductionOperationViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             )
         except ValidationError as e:
             return _bad(e)
-        return Response(ProductionOperationSerializer(op).data)
+        # Reporting the full quantity on the last step finishes the work order too.
+        return self._step_response(op, self._finish_if_last_step(op, request.user))
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
-        """One-click: finish this operation with every unit available to it.
-
-        Reports as good all units that have reached this step (bounded by the
-        previous operation's output and the planned quantity) and marks the step
-        completed; the routing sequence is still enforced. When this is the LAST
-        operation, the work order's output is reported too — a finished good goes
-        to QA, a sub-product goes straight into inventory.
-        """
+        """One click: finish this step with every unit that has reached it (the
+        step sequence is still enforced). On the LAST step the work order's
+        output is booked as well."""
         op = self.get_object()
-        order = op.production_order
-        output_note = ""
         try:
             with transaction.atomic():
                 available = max(min(execution._input_quantity(op), float(op.planned_quantity))
@@ -620,27 +570,10 @@ class ProductionOperationViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 )
         except ValidationError as e:
             return _bad(e)
-
-        is_last = not order.operations.filter(sequence__gt=op.sequence).exists()
-        if is_last:
-            order.refresh_from_db()
-            to_report = float(op.completed_quantity) - float(order.produced_quantity)
-            if to_report > 1e-6:
-                try:
-                    execution.report_output(order, to_report, request.user)
-                except ValidationError as e:
-                    msgs = getattr(e, "detail", None) or [str(e)]
-                    if not isinstance(msgs, (list, tuple)):
-                        msgs = [msgs]
-                    output_note = "Step completed, but output could not be reported yet: " + "; ".join(str(m) for m in msgs)
+        note = self._finish_if_last_step(op, request.user)
         log_activity(request.user, "Production", "Complete Operation",
-                     f"{order.order_number}: completed Op {op.sequence} ({op.name})")
-        order.refresh_from_db()
-        return Response({
-            "operation": ProductionOperationSerializer(op).data,
-            "order_status": order.status,
-            "output_note": output_note,
-        })
+                     f"{op.production_order.order_number}: completed Op {op.sequence} ({op.name})")
+        return self._step_response(op, note)
 
     def _status(self, request, new_status):
         try:

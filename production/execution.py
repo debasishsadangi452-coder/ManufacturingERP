@@ -283,6 +283,36 @@ def issue_materials(order, cumulative_quantity, user=None):
         raise ValidationError(errors)
 
 
+def material_shortfalls(order, quantity=None):
+    """Plain-language list of components that are short for producing `quantity`
+    more units of `order` (default: everything still to make). Empty = OK.
+
+    Mirrors issue_materials so the answer matches what reporting output will
+    actually need; used to stop work starting (or a one-click finish) when the
+    materials aren't there, instead of failing only at the very end.
+    """
+    if order.is_rework:
+        return []
+    qty = order.remaining_quantity if quantity is None else float(quantity)
+    if qty <= EPS or not order.quantity:
+        return []
+    fraction = min((order.produced_quantity + qty) / order.quantity, 1)
+    consumed = {l.item_id: l.consumed_quantity for l in order.material_requirements.all()}
+    out = []
+    for ing, required in order.recipe.material_requirements(order.quantity):
+        item = ing.item
+        need = required * fraction - consumed.get(item.id, 0)
+        if need <= EPS:
+            continue
+        available = sum(s.quantity for s in _stocks(item))
+        if available + EPS < need:
+            msg = f"{item.name}: need {_fmt(need)} {item.unit}, in stock {_fmt(available)}"
+            if item.is_semi_finished:
+                msg += " — sub-product, make it first"
+            out.append(msg)
+    return out
+
+
 def material_status(order):
     """'available' | 'partial' | 'short' for the order's remaining requirement."""
     if order.is_rework or order.materials_reserved:
@@ -471,6 +501,14 @@ def start_operation(op, user=None, quantity=None, machine=None, manpower=None, o
         if previous and previous[-1].completed_quantity <= EPS and previous[-1].status != "completed":
             raise ValidationError(
                 f"Operation {previous[-1].sequence} ({previous[-1].name}) has not completed any units yet."
+            )
+    # Don't let work begin on materials that aren't there: otherwise every step
+    # can be marked done and the order then fails to finish at the very end.
+    if not _previous(op) and op.started_quantity <= EPS and op.completed_quantity <= EPS:
+        missing = material_shortfalls(order)
+        if missing:
+            raise ValidationError(
+                [f"Cannot start {order.order_number} — materials are short:"] + missing
             )
     if machine is not None:
         op.machine = machine
@@ -724,6 +762,42 @@ def complete_order(order, user=None):
     if order.status == "completed" or order.remaining_quantity <= EPS:
         raise ValidationError("This production order is already completed.")
     return report_output(order, order.remaining_quantity, user)
+
+
+def pending_output(order):
+    """Units that finished the last step but haven't been reported as output yet."""
+    ops = list(order.operations.order_by("sequence"))
+    if not ops or ops[-1].status != "completed":
+        return 0.0
+    return max(min(ops[-1].completed_quantity, order.quantity) - order.produced_quantity, 0.0)
+
+
+def finish_work_order(order, user=None):
+    """One click: run every remaining step to full quantity, then report output.
+
+    Materials are checked first, so the order is never left with all steps done
+    but no output. A finished good's output goes to QA; a sub-product's output
+    goes straight into inventory (see report_output).
+    """
+    order = ProductionOrder.objects.get(pk=order.pk)
+    if order.status in ("completed", "closed", "cancelled"):
+        raise ValidationError(f"{order.order_number} is already {order.get_status_display().lower()}.")
+    missing = material_shortfalls(order)
+    if missing:
+        raise ValidationError([f"Cannot complete {order.order_number} — materials are short:"] + missing)
+    with transaction.atomic():
+        for op in build_operations(order):
+            op.refresh_from_db()
+            if op.status == "completed":
+                continue
+            available = max(float(op.planned_quantity) - _processed(op), 0)
+            report_operation(op, user, good=available, complete=True, notes="Completed with Complete Work Order.")
+        order.refresh_from_db()
+        to_report = pending_output(order)
+        if to_report > EPS:
+            report_output(order, to_report, user)
+    order.refresh_from_db()
+    return order
 
 
 # ---------------------------------------------------------------------------

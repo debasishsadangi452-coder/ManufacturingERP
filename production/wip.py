@@ -14,7 +14,7 @@ from datetime import timedelta
 
 from django.utils import timezone
 
-from .execution import build_operations, material_status, order_summary
+from .execution import build_operations, material_shortfalls, material_status, order_summary, pending_output
 from .models import ProductionOrder
 
 WIP_STATUSES = ProductionOrder.ACTIVE_STATUSES + ("completed",)
@@ -73,6 +73,10 @@ def wip_row(order):
         # and skip QA; finished goods go through the QA gate.
         "product_category": order.recipe.product.category,
         "is_sub_product": order.recipe.product.is_semi_finished,
+        # What is missing to finish (empty = ready) and units that finished the
+        # last step but were not booked yet; the shop floor shows both.
+        "material_shortfalls": material_shortfalls(order) if order.status not in ("completed", "closed", "cancelled") else [],
+        "pending_output": pending_output(order),
         "unit": order.recipe.product.unit,
         "planned_quantity": order.quantity,
         "completed_quantity": order.produced_quantity,
