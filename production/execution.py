@@ -283,58 +283,79 @@ def issue_materials(order, cumulative_quantity, user=None):
         raise ValidationError(errors)
 
 
-def material_shortfalls(order, quantity=None):
-    """Plain-language list of components that are short for producing `quantity`
-    more units of `order` (default: everything still to make). Empty = OK.
+def material_lines(order, quantity=None):
+    """Per-component availability for producing `quantity` more units of
+    `order` (default: everything still to make). Read-only.
 
-    Mirrors issue_materials so the answer matches what reporting output will
-    actually need; used to stop work starting (or a one-click finish) when the
-    materials aren't there, instead of failing only at the very end.
+    Each row: item, required (whole order), issued (already consumed by this
+    order), needed (still to issue for `quantity`), on_hand (free physical stock;
+    stock reserved for other orders has already left stock), shortage,
+    held_at_qc, on_order, expected_receipt, is_sub_product.
+    Mirrors issue_materials so it matches what booking output will need.
     """
-    if order.is_rework:
+    if order.is_rework or not order.quantity:
         return []
     qty = order.remaining_quantity if quantity is None else float(quantity)
-    if qty <= EPS or not order.quantity:
+    if qty <= EPS:
         return []
     fraction = min((order.produced_quantity + qty) / order.quantity, 1)
     consumed = {l.item_id: l.consumed_quantity for l in order.material_requirements.all()}
-    out = []
+    rows = []
     for ing, required in order.recipe.material_requirements(order.quantity):
         item = ing.item
-        need = required * fraction - consumed.get(item.id, 0)
-        if need <= EPS:
+        issued = consumed.get(item.id, 0)
+        need = max(required * fraction - issued, 0)
+        on_hand = sum(s.quantity for s in _stocks(item))
+        shortage = max(need - on_hand, 0) if need > EPS else 0
+        held = on_order = 0.0
+        expected = None
+        if shortage > EPS and not item.is_semi_finished:
+            held, on_order, expected = _incoming_pipeline(item)
+        rows.append({
+            "item_id": item.id, "sku": item.sku or "", "name": item.name, "unit": item.unit,
+            "required": round(required, 4), "issued": round(issued, 4), "needed": round(need, 4),
+            "on_hand": round(on_hand, 4), "shortage": round(shortage, 4),
+            "held_at_qc": round(held, 4), "on_order": round(on_order, 4),
+            "expected_receipt": expected.isoformat() if expected else None,
+            "is_sub_product": item.is_semi_finished,
+        })
+    return rows
+
+
+def material_shortfalls(order, quantity=None, lines=None):
+    """Plain-language list of short components (empty = OK). Used to stop work
+    starting, or a one-click finish, when materials aren't there."""
+    out = []
+    for r in (lines if lines is not None else material_lines(order, quantity)):
+        if r["shortage"] <= EPS:
             continue
-        available = sum(s.quantity for s in _stocks(item))
-        if available + EPS < need:
-            msg = f"{item.name}: need {_fmt(need)} {item.unit}, in stock {_fmt(available)}"
-            if item.is_semi_finished:
-                msg += " — sub-product, make it first"
-            else:
-                # Say where the material actually is, so the user knows the next
-                # action: approve incoming QC, receive the PO, or raise a purchase.
-                held, on_order = _incoming_pipeline(item)
-                if held > EPS:
-                    msg += f" — {_fmt(held)} {item.unit} received but waiting for incoming QC (approve it in Quality)"
-                elif on_order > EPS:
-                    msg += f" — {_fmt(on_order)} {item.unit} on order, not received yet"
-                else:
-                    msg += " — not on order; raise a purchase requisition"
-            out.append(msg)
+        msg = f"{r['name']}: need {_fmt(r['needed'])} {r['unit']}, in stock {_fmt(r['on_hand'])}"
+        if r["is_sub_product"]:
+            msg += " — sub-product, make it first"
+        elif r["held_at_qc"] > EPS:
+            msg += f" — {_fmt(r['held_at_qc'])} {r['unit']} received but waiting for incoming QC (approve it in Quality)"
+        elif r["on_order"] > EPS:
+            msg += f" — {_fmt(r['on_order'])} {r['unit']} on order, not received yet"
+        else:
+            msg += " — not on order; raise a purchase requisition"
+        out.append(msg)
     return out
 
 
 def _incoming_pipeline(item):
-    """(quantity received but held at incoming QC, quantity on open POs)."""
-    from django.db.models import Sum
+    """(qty received but held at incoming QC, qty on open POs, earliest expected
+    delivery of those POs)."""
+    from django.db.models import Min, Sum
     from quality.models import QualityCheck
     from procurement.models import PurchaseOrderItem
     held = QualityCheck.objects.filter(
         item=item, inspection_type="incoming", status="pending",
     ).aggregate(t=Sum("received_quantity"))["t"] or 0
-    on_order = PurchaseOrderItem.objects.filter(
+    open_lines = PurchaseOrderItem.objects.filter(
         item=item, purchase_order__status__in=("draft", "pending", "approved", "ordered"),
-    ).aggregate(t=Sum("quantity"))["t"] or 0
-    return float(held), float(on_order)
+    )
+    agg = open_lines.aggregate(t=Sum("quantity"), d=Min("purchase_order__expected_delivery"))
+    return float(held), float(agg["t"] or 0), agg["d"]
 
 
 def material_status(order):

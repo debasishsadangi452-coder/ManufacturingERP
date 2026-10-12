@@ -14,7 +14,7 @@ from datetime import timedelta
 
 from django.utils import timezone
 
-from .execution import build_operations, material_shortfalls, material_status, order_summary, pending_output
+from .execution import build_operations, material_lines, material_shortfalls, material_status, order_summary, pending_output
 from .models import ProductionOrder
 
 WIP_STATUSES = ProductionOrder.ACTIVE_STATUSES + ("completed",)
@@ -53,6 +53,11 @@ def wip_row(order):
     delayed = bool(order.planned_end and order.status != "completed" and order.planned_end < timezone.now())
     summary = order_summary(order)
     so = order.sales_order
+    is_open = order.status not in ("completed", "closed", "cancelled")
+    lines = material_lines(order) if is_open else []
+    short_lines = [l for l in lines if l["shortage"] > 1e-6]
+    # Ready = every component available; partial = some short; blocked = all short.
+    readiness = "ready" if not short_lines else ("blocked" if len(short_lines) == len(lines) else "partial")
     resource = None
     if current:
         resource = " / ".join(r.name for r in (current.machine, current.manpower) if r) or None
@@ -75,7 +80,12 @@ def wip_row(order):
         "is_sub_product": order.recipe.product.is_semi_finished,
         # What is missing to finish (empty = ready) and units that finished the
         # last step but were not booked yet; the shop floor shows both.
-        "material_shortfalls": material_shortfalls(order) if order.status not in ("completed", "closed", "cancelled") else [],
+        "material_shortfalls": material_shortfalls(order, lines=lines) if is_open else [],
+        "material_lines": lines,
+        "material_readiness": readiness if is_open else None,
+        "component_count": len(lines),
+        "priority": so.priority if so else "normal",
+        "due_date": so.required_delivery_date if so else None,
         "pending_output": pending_output(order),
         "unit": order.recipe.product.unit,
         "planned_quantity": order.quantity,
