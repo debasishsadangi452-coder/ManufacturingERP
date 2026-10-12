@@ -138,6 +138,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     requisition_number = serializers.CharField(source="requisition.requisition_number", read_only=True)
     email_count = serializers.SerializerMethodField()
     billing = serializers.SerializerMethodField()
+    # Received goods held at incoming QC (not yet in stock), per line.
+    awaiting_qc = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseOrder
@@ -145,9 +147,17 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             "id", "vendor", "vendor_name", "vendor_email", "vendor_payment_terms",
             "requisition", "requisition_number",
             "created_at", "expected_delivery", "priority", "total_amount",
-            "status", "notes", "items", "email_count", "quickbooks_id", "billing",
+            "status", "notes", "items", "email_count", "quickbooks_id", "billing", "awaiting_qc",
         ]
         read_only_fields = ["total_amount", "created_at", "quickbooks_id"]
+
+    def get_awaiting_qc(self, obj):
+        from quality.models import QualityCheck
+        rows = QualityCheck.objects.filter(
+            inspection_type="incoming", status="pending", goods_receipt__purchase_order=obj,
+        ).select_related("item")
+        return [{"item": q.item.name if q.item_id else "", "quantity": q.received_quantity,
+                 "unit": q.item.unit if q.item_id else ""} for q in rows]
 
     def get_email_count(self, obj):
         return obj.emails.count()
@@ -212,9 +222,17 @@ class VendorEmailSerializer(serializers.ModelSerializer):
 
 
 class GoodsReceiptSerializer(serializers.ModelSerializer):
+    # True when the received goods were held for incoming QC instead of being
+    # added to stock (incoming QC required).
+    held_for_qc = serializers.SerializerMethodField()
+
     class Meta:
         model = GoodsReceipt
         fields = "__all__"
+
+    def get_held_for_qc(self, obj):
+        from quality.models import QualityCheck
+        return QualityCheck.objects.filter(goods_receipt=obj, inspection_type="incoming", status="pending").exists()
 
 
 class BillLineSerializer(serializers.ModelSerializer):

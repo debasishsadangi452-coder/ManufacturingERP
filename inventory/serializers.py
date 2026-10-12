@@ -142,6 +142,8 @@ class ItemSerializer(serializers.ModelSerializer):
     is_finished_good = serializers.ReadOnlyField()
     quickbooks_item_type = serializers.SerializerMethodField()
     procurement_policy = serializers.SerializerMethodField()
+    # Received but held at incoming QC: not in stock until Quality approves it.
+    awaiting_qc_quantity = serializers.SerializerMethodField()
     warehouse_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     initial_quantity = serializers.FloatField(write_only=True, required=False, default=0)
 
@@ -153,9 +155,21 @@ class ItemSerializer(serializers.ModelSerializer):
             "quickbooks_item_type", "procurement_policy", "sku", "purchase_cost",
             "reorder_point", "safety_stock", "minimum_order_quantity", "lead_time_days",
             "costing_rule", "default_warehouse", "warehouse_id", "initial_quantity",
-            "base_unit", "purchase_unit",
+            "base_unit", "purchase_unit", "awaiting_qc_quantity",
         ]
         read_only_fields = ["quickbooks_id", "quickbooks_sync_token", "quickbooks_last_synced_at"]
+
+    def get_awaiting_qc_quantity(self, obj):
+        # One query for the whole list, cached in the shared serializer context.
+        held = self.context.get("_awaiting_qc")
+        if held is None:
+            from django.db.models import Sum
+            from quality.models import QualityCheck
+            held = {r["item_id"]: r["t"] or 0 for r in QualityCheck.objects.filter(
+                inspection_type="incoming", status="pending", item__isnull=False,
+            ).values("item_id").annotate(t=Sum("received_quantity"))}
+            self.context["_awaiting_qc"] = held
+        return held.get(obj.id, 0)
 
     def get_quickbooks_item_type(self, obj):
         return "Inventory" if obj.category in ("raw_material", "intermediate", "semi_finished") else "Inventory/Sales Item"
