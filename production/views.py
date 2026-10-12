@@ -825,6 +825,20 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 status=400,
             )
 
+        # One sub-product work order per plan and item: starting it twice doubles
+        # the material need and leaves duplicate work orders on the shop floor.
+        existing = ProductionOrder.objects.filter(
+            recipe__product=sfg_item,
+            production_plan_ref=f"{plan.plan_number} · SFG {sfg_item.name}",
+        ).exclude(status__in=["completed", "closed", "cancelled"]).first()
+        if existing:
+            return Response(
+                {"error": f"A work order for '{sfg_item.name}' already exists for this plan "
+                          f"({existing.order_number}, {existing.get_status_display()}). "
+                          "Find it on the Shop Floor under this order's sub-products."},
+                status=400,
+            )
+
         try:
             quantity = float(request.data.get("quantity") or plan.planned_quantity)
         except (TypeError, ValueError):

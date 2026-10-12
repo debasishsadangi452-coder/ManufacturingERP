@@ -309,8 +309,32 @@ def material_shortfalls(order, quantity=None):
             msg = f"{item.name}: need {_fmt(need)} {item.unit}, in stock {_fmt(available)}"
             if item.is_semi_finished:
                 msg += " — sub-product, make it first"
+            else:
+                # Say where the material actually is, so the user knows the next
+                # action: approve incoming QC, receive the PO, or raise a purchase.
+                held, on_order = _incoming_pipeline(item)
+                if held > EPS:
+                    msg += f" — {_fmt(held)} {item.unit} received but waiting for incoming QC (approve it in Quality)"
+                elif on_order > EPS:
+                    msg += f" — {_fmt(on_order)} {item.unit} on order, not received yet"
+                else:
+                    msg += " — not on order; raise a purchase requisition"
             out.append(msg)
     return out
+
+
+def _incoming_pipeline(item):
+    """(quantity received but held at incoming QC, quantity on open POs)."""
+    from django.db.models import Sum
+    from quality.models import QualityCheck
+    from procurement.models import PurchaseOrderItem
+    held = QualityCheck.objects.filter(
+        item=item, inspection_type="incoming", status="pending",
+    ).aggregate(t=Sum("received_quantity"))["t"] or 0
+    on_order = PurchaseOrderItem.objects.filter(
+        item=item, purchase_order__status__in=("draft", "pending", "approved", "ordered"),
+    ).aggregate(t=Sum("quantity"))["t"] or 0
+    return float(held), float(on_order)
 
 
 def material_status(order):
