@@ -129,3 +129,15 @@ class SplitDeliveryAndAdjustmentTests(APITestCase):
             self.assertEqual(doc.status_code, 200, doc_type)
         totals = dict(self.client.get(f"/api/documents/customer_order_confirmation/{order.id}/?format=json").data["totals"])
         self.assertIn("Subtotal", totals)
+
+    def test_production_can_be_planned_after_a_partial_delivery(self):
+        order = self._order()
+        line = order.salesorderitem_set.first()
+        res = self.client.post(f"/api/sales/sales-orders/{order.id}/split_delivery/",
+                               {"lines": [{"order_item_id": line.id, "quantity": 40}]}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        order.refresh_from_db()
+        self.assertEqual(order.status, "shipped")
+        res = self.client.post(f"/api/sales/sales-orders/{order.id}/split_production_plan/",
+                               {"item_id": self.fg.id, "parts": [{"quantity": 30}, {"quantity": 30}]}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)

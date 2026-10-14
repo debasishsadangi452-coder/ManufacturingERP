@@ -637,7 +637,7 @@ class ProductionPlan(models.Model):
             if (
                 settings.business_model == "mto"
                 and locked_plan.sales_order
-                and locked_plan.sales_order.status != "confirmed"
+                and locked_plan.sales_order.status not in ("confirmed", "shipped")
             ):
                 raise ValidationError("Confirm the customer order before converting its production plan.")
             if settings.production_plan_approval_required and locked_plan.status != "approved":

@@ -319,7 +319,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
         from production.models import ManufacturingSettings
         settings = ManufacturingSettings.for_company(order.customer.company)
-        if settings.business_model == "mto" and order.status != "confirmed":
+        if settings.business_model == "mto" and order.status not in ("confirmed", "shipped"):
             return Response(
                 {"error": "Confirm the customer order before creating its production plan."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -828,7 +828,7 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         settings = ManufacturingSettings.for_company(order.customer.company)
-        if settings.business_model == "mto" and order.status != "confirmed":
+        if settings.business_model == "mto" and order.status not in ("confirmed", "shipped"):
             return Response({"error": "Confirm the customer order before planning production."},
                             status=status.HTTP_400_BAD_REQUEST)
         plans = [
