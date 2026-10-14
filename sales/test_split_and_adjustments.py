@@ -141,3 +141,22 @@ class SplitDeliveryAndAdjustmentTests(APITestCase):
         res = self.client.post(f"/api/sales/sales-orders/{order.id}/split_production_plan/",
                                {"item_id": self.fg.id, "parts": [{"quantity": 30}, {"quantity": 30}]}, format="json")
         self.assertEqual(res.status_code, 201, res.data)
+
+    def test_plan_converts_to_work_order_after_partial_delivery(self):
+        from inventory.models import Item
+        from production.models import ProductionOrder, Recipe, RecipeIngredient
+        raw = Item.objects.create(company=self.company, name="Dough", category="raw_material", unit="kg")
+        Stock.objects.create(item=raw, warehouse=self.warehouse, quantity=1000)
+        recipe = Recipe.objects.create(product=self.fg, batch_size=1)
+        RecipeIngredient.objects.create(recipe=recipe, item=raw, quantity=1)
+        order = self._order()
+        line = order.salesorderitem_set.first()
+        self.client.post(f"/api/sales/sales-orders/{order.id}/split_delivery/",
+                         {"lines": [{"order_item_id": line.id, "quantity": 40}]}, format="json")
+        res = self.client.post(f"/api/sales/sales-orders/{order.id}/split_production_plan/",
+                               {"item_id": self.fg.id, "parts": [{"quantity": 30}, {"quantity": 30}]}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        plan_id = res.data["plans"][0]["id"]
+        res = self.client.post(f"/api/production/production-plans/{plan_id}/convert/", {}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertTrue(ProductionOrder.objects.filter(sales_order=order).exists())

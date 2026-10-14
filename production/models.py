@@ -637,9 +637,12 @@ class ProductionPlan(models.Model):
             if (
                 settings.business_model == "mto"
                 and locked_plan.sales_order
-                and locked_plan.sales_order.status not in ("confirmed", "shipped")
+                and locked_plan.sales_order.status in ("draft", "pending", "pending_approval", "cancelled")
             ):
-                raise ValidationError("Confirm the customer order before converting its production plan.")
+                raise ValidationError(
+                    f"SO-{locked_plan.sales_order_id} is '{locked_plan.sales_order.get_status_display()}'. "
+                    "Confirm the customer order first (it must not be draft, pending, awaiting approval or cancelled)."
+                )
             if settings.production_plan_approval_required and locked_plan.status != "approved":
                 raise ValidationError("Production Plan must be approved before conversion.")
 
