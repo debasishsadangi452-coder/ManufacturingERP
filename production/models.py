@@ -401,6 +401,29 @@ class RoutingStep(models.Model):
         return f"{self.recipe.product.name} · Op {self.sequence} {self.name}"
 
 
+class ProductionExtraCost(models.Model):
+    """A cost the team adds to a production order on top of material and
+    routing cost: per unit made, per working hour, or a fixed total. Optionally
+    tied to one step (operation) so cost can be followed step by step."""
+
+    BASIS_CHOICES = [("per_unit", "Per unit"), ("per_hour", "Per hour"), ("total", "Fixed total")]
+
+    production_order = models.ForeignKey("production.ProductionOrder", on_delete=models.CASCADE, related_name="extra_costs")
+    operation = models.ForeignKey("production.ProductionOperation", null=True, blank=True,
+                                  on_delete=models.CASCADE, related_name="extra_costs")
+    name = models.CharField(max_length=120)
+    basis = models.CharField(max_length=10, choices=BASIS_CHOICES, default="total")
+    amount = models.DecimalField(max_digits=12, decimal_places=4)
+    created_by = models.ForeignKey("accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.get_basis_display()} {self.amount})"
+
+
 class ProductionOperation(models.Model):
     """An operation of one production order on the shop floor."""
 

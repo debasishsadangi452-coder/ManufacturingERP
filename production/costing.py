@@ -108,6 +108,7 @@ def _side(order, settings, company, *, actual):
     operations = []
     op_total = machine_cost = labour_cost = ZERO
     machine_hours = labour_hours = 0.0
+    op_stats = {}
     for op in order.operations.select_related("machine", "manpower"):
         units = (op.completed_quantity + op.rejected_quantity + op.scrap_quantity + op.rework_quantity) if actual \
             else op.planned_quantity
@@ -123,11 +124,14 @@ def _side(order, settings, company, *, actual):
         op_total += op_cost
         machine_cost += m_cost
         labour_cost += l_cost
+        op_stats[op.id] = (units, hours)
         operations.append({
             "operation_id": op.id, "sequence": op.sequence, "name": op.name,
             "units": round(units, 6), "hours": round(hours, 4),
             "operation_cost": float(_money(op_cost)),
             "machine_cost": float(_money(m_cost)), "labour_cost": float(_money(l_cost)),
+            "extra_cost": 0.0,
+            "step_cost": float(_money(op_cost + m_cost + l_cost)),
         })
 
     units = order.produced_quantity if actual else order.quantity
@@ -138,8 +142,31 @@ def _side(order, settings, company, *, actual):
         machine_cost += _d(line.machinery_cost_per_unit) * _d(units)
         labour_cost += _d(line.labour_cost_per_unit) * _d(units)
         overhead += _d(line.overhead_cost_per_unit) * _d(units)
+    # Team-defined extra costs (per unit / per hour / fixed), order-wide or per step.
+    extra_total = ZERO
+    extra_rows = []
+    order_units = _d(units)
+    order_hours = sum(h for _, h in op_stats.values())
+    for extra in order.extra_costs.all():
+        if extra.operation_id and extra.operation_id in op_stats:
+            u, h = op_stats[extra.operation_id]
+        elif extra.operation_id:
+            u, h = 0, 0
+        else:
+            u, h = float(order_units), order_hours
+        amount = _d(extra.amount)
+        value = amount * _d(u) if extra.basis == "per_unit" else amount * _d(h) if extra.basis == "per_hour" else amount
+        extra_total += value
+        extra_rows.append({"id": extra.id, "name": extra.name, "basis": extra.basis, "rate": float(amount),
+                           "operation_id": extra.operation_id, "cost": float(_money(value))})
+        if extra.operation_id:
+            for row in operations:
+                if row["operation_id"] == extra.operation_id:
+                    row["extra_cost"] = round(row["extra_cost"] + float(_money(value)), 2)
+                    row["step_cost"] = round(row["step_cost"] + float(_money(value)), 2)
+
     basis = "resources"
-    if machine_cost + labour_cost + op_total == ZERO and settings.overhead_method == "none":
+    if machine_cost + labour_cost + op_total + extra_total == ZERO and settings.overhead_method == "none":
         policy = _policy(company)
         basis = "accounting_policy"
         if policy.get("labor_enabled"):
@@ -148,7 +175,7 @@ def _side(order, settings, company, *, actual):
             overhead = _d(policy["overhead_rate_per_unit"]) * _d(units)
 
     resource_cost = machine_cost + labour_cost
-    total = material_total + op_total + resource_cost + overhead
+    total = material_total + op_total + resource_cost + overhead + extra_total
     return {
         "basis": basis,
         "units": round(float(units), 6),
@@ -158,6 +185,8 @@ def _side(order, settings, company, *, actual):
         "labour_cost": float(_money(labour_cost)),
         "resource_cost": float(_money(resource_cost)),
         "overhead_cost": float(_money(overhead)),
+        "extra_cost": float(_money(extra_total)),
+        "extra_costs": extra_rows,
         "total_cost": float(_money(total)),
         "unit_cost": float((total / _d(units)).quantize(Decimal("0.0001"))) if units else 0.0,
         "machine_hours": round(machine_hours, 4),
@@ -220,7 +249,8 @@ def gl_cost_overrides(order):
     if side["basis"] != "resources":
         return None, None
     labour = _money(side["labour_cost"])
-    overhead = _money(side["machine_cost"]) + _money(side["operation_cost"]) + _money(side["overhead_cost"])
+    overhead = (_money(side["machine_cost"]) + _money(side["operation_cost"]) + _money(side["overhead_cost"])
+                + _money(side["extra_cost"]))
     if labour == ZERO and overhead == ZERO:
         return None, None
     return labour, overhead
@@ -254,7 +284,7 @@ def line_cost_summary(company):
         row["raw_material_cost"] += actual["raw_material_cost"]
         row["machinery_cost"] += actual["machine_cost"] + actual["operation_cost"]
         row["labour_cost"] += actual["labour_cost"]
-        row["overhead_cost"] += actual["overhead_cost"]
+        row["overhead_cost"] += actual["overhead_cost"] + actual["extra_cost"]
         row["total_cost"] += actual["total_cost"]
     result = []
     for lid, row in rows.items():

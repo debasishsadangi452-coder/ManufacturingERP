@@ -450,6 +450,45 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         from .costing import order_cost
         return Response(order_cost(self.get_object()))
 
+    @action(detail=True, methods=["post"])
+    def add_extra_cost(self, request, pk=None):
+        """Payload: {name, basis: per_unit|per_hour|total, amount, operation?}"""
+        from decimal import Decimal, InvalidOperation
+        from .models import ProductionExtraCost
+        order = self.get_object()
+        try:
+            amount = Decimal(str(request.data.get("amount")))
+        except (InvalidOperation, TypeError):
+            return Response({"error": "Amount must be a number."}, status=400)
+        if amount < 0:
+            return Response({"error": "Amount cannot be negative."}, status=400)
+        basis = request.data.get("basis", "total")
+        if basis not in dict(ProductionExtraCost.BASIS_CHOICES):
+            return Response({"error": "Basis must be per_unit, per_hour or total."}, status=400)
+        name = (request.data.get("name") or "").strip()
+        if not name:
+            return Response({"error": "Give the cost a name."}, status=400)
+        operation = None
+        if request.data.get("operation"):
+            operation = order.operations.filter(pk=request.data["operation"]).first()
+            if operation is None:
+                return Response({"error": "That step is not on this order."}, status=400)
+        ProductionExtraCost.objects.create(
+            production_order=order, operation=operation, name=name[:120], basis=basis, amount=amount,
+            created_by=request.user if request.user.is_authenticated else None,
+        )
+        from .costing import order_cost
+        return Response(order_cost(order), status=201)
+
+    @action(detail=True, methods=["post"])
+    def remove_extra_cost(self, request, pk=None):
+        order = self.get_object()
+        deleted, _ = order.extra_costs.filter(pk=request.data.get("id")).delete()
+        if not deleted:
+            return Response({"error": "Cost not found."}, status=404)
+        from .costing import order_cost
+        return Response(order_cost(order))
+
     @action(detail=True, methods=["get"])
     def capacity_check(self, request, pk=None):
         from .capacity import order_capacity_check

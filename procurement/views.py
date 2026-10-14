@@ -490,7 +490,7 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         # `lines` ([{po_item, quantity}]) receives part of the order; without
         # it everything still outstanding is received, as before.
         requested = self.request.data.get("lines")
-        po_items = list(po.items.select_related("item", "unit_of_measure").select_for_update())
+        po_items = list(po.items.select_related("item", "unit_of_measure").select_for_update(of=("self",)))
         to_receive = {}
         if requested is None:
             to_receive = {poi.id: poi.remaining_quantity for poi in po_items if poi.remaining_quantity > 0}

@@ -187,6 +187,12 @@ class ItemSerializer(serializers.ModelSerializer):
         warehouse = attrs.get("default_warehouse", getattr(self.instance, "default_warehouse", None))
         if company and warehouse and warehouse.company_id not in (None, company.id):
             raise serializers.ValidationError({"default_warehouse": "Pick a warehouse belonging to your company."})
+        if self.instance is not None and self.instance.base_unit_id and "base_unit" in attrs \
+                and attrs["base_unit"] is not None and attrs["base_unit"].id != self.instance.base_unit_id:
+            raise serializers.ValidationError({
+                "base_unit": f"{self.instance.name} is held in {self.instance.base_unit.code}. A stocked unit is fixed; "
+                             "departments can view and use any compatible unit instead."
+            })
         for field in ("base_unit", "purchase_unit"):
             unit = attrs.get(field, getattr(self.instance, field, None))
             if company and unit and unit.company_id not in (None, company.id):
@@ -323,11 +329,12 @@ class BOMLineSerializer(serializers.ModelSerializer):
     raw_material_name = serializers.CharField(source='raw_material.name', read_only=True)
     raw_material_unit = serializers.CharField(source='raw_material.unit', read_only=True)
     raw_material_category = serializers.CharField(source='raw_material.category', read_only=True)
+    raw_material_base_unit = serializers.IntegerField(source='raw_material.base_unit_id', read_only=True)
 
     class Meta:
         model = BOMLine
         fields = [
-            'id', 'raw_material', 'raw_material_name', 'raw_material_unit',
+            'id', 'raw_material', 'raw_material_name', 'raw_material_unit', 'raw_material_base_unit',
             'raw_material_category', 'quantity', 'unit', 'unit_of_measure'
         ]
 

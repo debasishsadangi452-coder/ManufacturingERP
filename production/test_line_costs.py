@@ -65,3 +65,35 @@ class LineCostTests(APITestCase):
         self.assertEqual(len(res.data), 3)
         self.assertEqual(this_month["sales"], 500.0)
         self.assertAlmostEqual(this_month["production_cost"], 100.0, places=2)
+
+
+class ExtraCostTests(LineCostTests):
+    def test_team_costs_per_unit_per_hour_and_total(self):
+        from production.models import ProductionOperation
+        order = self.make_order(produced=100)
+        op = ProductionOperation.objects.create(
+            production_order=order, sequence=1, name="Mixing", planned_quantity=100,
+            actual_minutes=120, completed_quantity=100,
+        )
+        url = f"/api/production/production-orders/{order.id}/add_extra_cost/"
+        for body in ({"name": "Tooling", "basis": "per_unit", "amount": "0.5"},
+                     {"name": "Steam", "basis": "per_hour", "amount": "10", "operation": op.id},
+                     {"name": "Permit", "basis": "total", "amount": "25"}):
+            res = self.client.post(url, body, format="json")
+            self.assertEqual(res.status_code, 201, res.data)
+        actual = order_cost(ProductionOrder.objects.get(pk=order.pk))["actual"]
+        self.assertAlmostEqual(actual["extra_cost"], 50 + 20 + 25, places=2)   # 100 x 0.5, 2h x 10, fixed 25
+        step = actual["operations"][0]
+        self.assertAlmostEqual(step["extra_cost"], 20.0, places=2)
+        self.assertAlmostEqual(step["step_cost"], 20.0, places=2)
+        first = actual["extra_costs"][0]["id"]
+        res = self.client.post(f"/api/production/production-orders/{order.id}/remove_extra_cost/", {"id": first}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertAlmostEqual(res.data["actual"]["extra_cost"], 45.0, places=2)
+
+    def test_bad_extra_costs_are_refused(self):
+        order = self.make_order()
+        url = f"/api/production/production-orders/{order.id}/add_extra_cost/"
+        self.assertEqual(self.client.post(url, {"name": "", "basis": "total", "amount": "1"}, format="json").status_code, 400)
+        self.assertEqual(self.client.post(url, {"name": "x", "basis": "weekly", "amount": "1"}, format="json").status_code, 400)
+        self.assertEqual(self.client.post(url, {"name": "x", "basis": "total", "amount": "-1"}, format="json").status_code, 400)

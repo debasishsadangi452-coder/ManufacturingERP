@@ -107,6 +107,8 @@ class SalesOrderSerializer(serializers.ModelSerializer):
                 "id": d.id, "dispatch_number": d.dispatch_number, "status": d.status,
                 "dispatched_at": d.dispatched_at, "invoice": d.invoice_id,
                 "quantity": d.total_quantity,
+                "lines": [{"order_item_id": l.sales_order_item_id, "item": l.item.name, "quantity": l.quantity,
+                           "unit": l.item.unit} for l in d.lines.select_related("item")],
             }
             for d in order.dispatches.exclude(status="cancelled")
         ]

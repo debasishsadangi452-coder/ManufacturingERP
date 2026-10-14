@@ -6,7 +6,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 from accounts.permission import IsSales, IsAdmin, IsStore, IsFinance, IsProduction, IsQuality
 
@@ -1224,6 +1224,9 @@ class PriceListViewSet(viewsets.ViewSet):
             "name": item.name,
             "sku": item.sku,
             "unit": item.unit,
+            "base_unit": item.base_unit_id,
+            "unit_code": item.base_unit.code if item.base_unit_id else item.unit,
+            "dimension": item.base_unit.dimension if item.base_unit_id else None,
             "selling_price": str(item.selling_price),
             "standard_cost": str(Decimal(cost).quantize(Decimal("0.01"))),
         }
@@ -1246,4 +1249,23 @@ class PriceListViewSet(viewsets.ViewSet):
         item.selling_price = price.quantize(Decimal("0.01"))
         item.save(update_fields=["selling_price"])
         log_activity(request.user, "Sales", "Update Selling Price", f"'{item.name}' selling price {old_price} → {item.selling_price}")
+        return Response(self._row(item))
+
+    @action(detail=True, methods=["post"])
+    def set_unit(self, request, pk=None):
+        """Define the unit of a finished good once. After that the unit (and so
+        whether it is counted, weighed or measured by volume) is fixed."""
+        from inventory.models import UnitOfMeasure
+        item = self._items(request).filter(pk=pk).first()
+        if not item:
+            return Response({"error": "Finished good not found."}, status=status.HTTP_404_NOT_FOUND)
+        if item.base_unit_id:
+            return Response({"error": f"{item.name} is already measured in {item.base_unit.code}."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        unit = UnitOfMeasure.objects.filter(Q(company=None) | Q(company=item.company), pk=request.data.get("unit")).first()
+        if unit is None:
+            return Response({"error": "Choose a unit."}, status=status.HTTP_400_BAD_REQUEST)
+        item.base_unit, item.purchase_unit, item.unit = unit, unit, unit.code
+        item.save(update_fields=["base_unit", "purchase_unit", "unit"])
+        log_activity(request.user, "Sales", "Set Item Unit", f"'{item.name}' is measured in {unit.code}")
         return Response(self._row(item))
