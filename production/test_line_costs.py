@@ -97,3 +97,22 @@ class ExtraCostTests(LineCostTests):
         self.assertEqual(self.client.post(url, {"name": "", "basis": "total", "amount": "1"}, format="json").status_code, 400)
         self.assertEqual(self.client.post(url, {"name": "x", "basis": "weekly", "amount": "1"}, format="json").status_code, 400)
         self.assertEqual(self.client.post(url, {"name": "x", "basis": "total", "amount": "-1"}, format="json").status_code, 400)
+
+
+class ConvertErrorTextTests(LineCostTests):
+    def test_convert_and_semi_finished_errors_are_plain_text(self):
+        from production.models import ProductionPlan
+        # A plan needs a sales order; build the minimum.
+        from sales.models import Customer, SalesOrder
+        customer = Customer.objects.create(company=self.company, name="Buyer")
+        order = SalesOrder.objects.create(customer=customer, status="confirmed")
+        plan = ProductionPlan.objects.create(company=self.company, sales_order=order, item=self.product,
+                                             order_quantity=10, planned_quantity=10, status="planned")
+        res = self.client.post(f"/api/production/production-plans/{plan.id}/convert/", {"quantity": 999}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertIsInstance(res.data["error"], str)
+        self.assertIn("no more than", res.data["error"])
+        res = self.client.post(f"/api/production/production-plans/{plan.id}/start_semi_finished/",
+                               {"item": self.product.id}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertIsInstance(res.data["error"], str)

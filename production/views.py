@@ -39,6 +39,22 @@ from core.utils import log_activity
 from core.tenancy import CompanyScopedMixin
 
 
+def _error_text(exc):
+    """One readable sentence from a Django or DRF validation error, whatever
+    its shape (string, list, or {field: [messages]})."""
+    detail = getattr(exc, "detail", None)
+    if detail is None:
+        detail = getattr(exc, "message_dict", None) or getattr(exc, "messages", None) or str(exc)
+
+    def flat(value):
+        if isinstance(value, dict):
+            return [m for v in value.values() for m in flat(v)]
+        if isinstance(value, (list, tuple)):
+            return [m for v in value for m in flat(v)]
+        return [str(value)]
+    return " ".join(flat(detail))
+
+
 class ProductionLineViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     company_field = "company"
     queryset = ProductionLine.objects.all()
@@ -849,8 +865,7 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 status=status.HTTP_201_CREATED,
             )
         except (DjangoValidationError, ValidationError) as e:
-            detail = getattr(e, "detail", str(e))
-            return Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": _error_text(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], permission_classes=[IsProduction | IsAdmin])
     def start_semi_finished(self, request, pk=None):
@@ -932,7 +947,7 @@ class ProductionPlanViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 order.status = "material_pending"
                 order.save(update_fields=["status"])
         except (DjangoValidationError, ValidationError) as e:
-            return Response({"error": getattr(e, "detail", str(e))}, status=400)
+            return Response({"error": _error_text(e)}, status=400)
 
         log_activity(
             request.user, "Production", "Start Semi-Finished Production",
