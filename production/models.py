@@ -96,6 +96,11 @@ class ProductionLine(models.Model):
     capacity = models.FloatField(default=100.0)  # Units per hour standard
     is_active = models.BooleanField(default=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="running")
+    # Standard conversion cost per unit made on this line. Added to every
+    # production order run on the line, on top of material and routing cost.
+    machinery_cost_per_unit = models.DecimalField(max_digits=12, decimal_places=4, default=0)
+    labour_cost_per_unit = models.DecimalField(max_digits=12, decimal_places=4, default=0)
+    overhead_cost_per_unit = models.DecimalField(max_digits=12, decimal_places=4, default=0)
 
     def __str__(self):
         return f"{self.name} ({self.location})"

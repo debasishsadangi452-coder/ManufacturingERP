@@ -6,14 +6,17 @@ data and print the upstream references (customer order, production order,
 lot, dispatch, invoice) so a paper copy can be traced back.
 """
 from django.db.models import Sum
+from datetime import timedelta
 from decimal import Decimal
+
+from django.utils import timezone
 
 from fulfillment.models import Dispatch
 from inventory.models import Batch, StockTransfer
 from production.models import ProductionOrder, ProductionPlan
-from procurement.models import GoodsReceipt, PurchaseOrder
+from procurement.models import Bill, GoodsReceipt, PurchaseOrder
 from quality.models import QualityCheck
-from sales.models import Invoice, SalesOrder
+from sales.models import Invoice, SalesOrder, SummaryInvoice
 
 
 def _n(value, places=4):
@@ -348,6 +351,10 @@ def dispatch_note_doc(d):
     return doc
 
 
+def _tax_label(order):
+    return (order.tax_label if order is not None and order.tax_label else "Tax")
+
+
 def invoice_doc(inv):
     customer = inv.customer
     doc = _base(inv.company or customer.company, "Commercial Sales Invoice", f"INV-{inv.id}", inv.get_status_display())
@@ -365,8 +372,18 @@ def invoice_doc(inv):
     rows = [[_c(l.description or l.item.name), _c(_n(l.quantity), True), _c(_money(l.unit_price), True),
              _c(_money(l.amount), True)] for l in inv.lines.select_related("item")]
     doc["tables"] = [_table("Lines", ["Description", ("Quantity", True), ("Unit price", True), ("Amount", True)], rows)]
-    doc["totals"] = [("Total", _money(inv.total_amount)), ("Paid", _money(inv.amount_paid)),
-                     ("Balance due", _money(inv.balance_due))]
+    totals = []
+    if inv.discount_amount or inv.tax_amount:
+        totals.append(("Subtotal", _money(inv.subtotal)))
+        if inv.discount_amount:
+            totals.append(("Discount", "-" + _money(inv.discount_amount)))
+        if inv.tax_amount:
+            totals.append((_tax_label(inv.sales_order), _money(inv.tax_amount)))
+    totals += [("Total", _money(inv.total_amount)), ("Paid", _money(inv.amount_paid)),
+               ("Balance due", _money(inv.balance_due))]
+    doc["totals"] = totals
+    if inv.summary_invoice_id:
+        doc["notes"].append(f"Included in summary invoice {inv.summary_invoice.number}.")
     doc["notes"].append("Prices are those agreed on the customer order.")
     doc["signatures"] = ["Authorised signatory"]
     doc["references"] = f"INV-{inv.id}" + (f" · SO-{inv.sales_order_id}" if inv.sales_order_id else "") + \
@@ -410,10 +427,151 @@ def customer_order_confirmation_doc(order):
         ["Item code", "Description", "Unit", ("Quantity", True), ("Unit price", True), ("Amount", True)],
         rows,
     )]
-    doc["totals"] = [("Order total", _money(order.total_amount))]
+    totals = []
+    discounts = list(order.discounts.all())
+    if discounts or order.tax_amount:
+        totals.append(("Subtotal", _money(order.subtotal)))
+        for d in discounts:
+            totals.append((f"{d.label} ({_n(d.percent, 2)}%)",
+                           "-" + _money(order.subtotal * d.percent / Decimal("100"))))
+        if order.tax_amount:
+            totals.append((_tax_label(order), _money(order.tax_amount)))
+    totals.append(("Order total", _money(order.total_amount)))
+    doc["totals"] = totals
+    deliveries = [d for d in order.dispatches.exclude(status="cancelled")]
+    if deliveries:
+        doc["tables"].append(_table(
+            "Deliveries so far", ["Dispatch", "Status", ("Quantity", True), "Invoice"],
+            [[_c(d.dispatch_number), _c(d.get_status_display()), _c(_n(d.total_quantity), True),
+              _c(f"INV-{d.invoice_id}" if d.invoice_id else "Not invoiced")] for d in deliveries],
+        ))
     if order.custom_specifications:
         doc["notes"].append(f"Custom specifications: {order.custom_specifications}")
     doc["references"] = f"SO-{order.id}"
+    return doc
+
+
+def summary_invoice_doc(summary):
+    customer = summary.customer
+    doc = _base(summary.company or customer.company, "Summary Invoice", summary.number)
+    doc["subtitle"] = "Statement combining the invoices listed below."
+    invoices = list(summary.invoices.select_related("sales_order").order_by("invoice_date", "id"))
+    doc["meta"] = [
+        ("Bill to", customer.name), ("Address", customer.address),
+        ("Statement date", summary.created_at.strftime("%Y-%m-%d")),
+        ("Payment terms", customer.payment_terms or None),
+        ("Invoices combined", len(invoices)),
+    ]
+    doc["tables"] = [_table(
+        "Invoices", ["Invoice", "Date", "Customer order", "Due date", ("Amount", True), ("Paid", True), ("Balance", True)],
+        [[_c(f"INV-{i.id}"), _c(i.invoice_date.isoformat()),
+          _c(f"SO-{i.sales_order_id}" if i.sales_order_id else ""),
+          _c(i.due_date.isoformat() if i.due_date else ""),
+          _c(_money(i.total_amount), True), _c(_money(i.amount_paid), True), _c(_money(i.balance_due), True)]
+         for i in invoices],
+    )]
+    total = sum((i.total_amount for i in invoices), Decimal("0"))
+    paid = sum((i.amount_paid for i in invoices), Decimal("0"))
+    doc["totals"] = [("Total invoiced", _money(total)), ("Paid", _money(paid)), ("Balance due", _money(total - paid))]
+    if summary.notes:
+        doc["notes"].append(summary.notes)
+    doc["signatures"] = ["Authorised signatory"]
+    doc["references"] = summary.number + " · " + ", ".join(f"INV-{i.id}" for i in invoices)
+    return doc
+
+
+def vendor_bill_doc(bill):
+    doc = _base(bill.company or bill.vendor.company, "Vendor Bill", bill.bill_number or f"BILL-{bill.id}",
+                bill.get_status_display())
+    doc["meta"] = [
+        ("Supplier", bill.vendor.name), ("Supplier address", bill.vendor.address or None),
+        ("Bill date", bill.bill_date.isoformat()),
+        ("Due date", bill.due_date.isoformat() if bill.due_date else None),
+        ("Purchase order", f"PO-{bill.purchase_order_id}" if bill.purchase_order_id else None),
+    ]
+    doc["tables"] = [_table(
+        "Lines", ["Description", ("Quantity", True), ("Unit price", True), ("Amount", True)],
+        [[_c(l.description or l.item.name), _c(_n(l.quantity), True), _c(_money(l.unit_price), True),
+          _c(_money(l.amount), True)] for l in bill.lines.select_related("item")],
+    )]
+    doc["totals"] = [("Total", _money(bill.total_amount)), ("Paid", _money(bill.amount_paid)),
+                     ("Balance due", _money(bill.balance_due))]
+    doc["references"] = f"BILL-{bill.id}" + (f" · PO-{bill.purchase_order_id}" if bill.purchase_order_id else "")
+    return doc
+
+
+def _order_lines_table(order, title):
+    rows = [
+        [_c(line.item.sku or ""), _c(line.item.name), _c(line.item.unit), _c(_n(line.quantity), True),
+         _c(_money(line.unit_price), True), _c(_money(Decimal(str(line.quantity)) * line.unit_price), True)]
+        for line in order.salesorderitem_set.select_related("item").all()
+    ]
+    return _table(title, ["Item code", "Description", "Unit", ("Quantity", True), ("Unit price", True), ("Amount", True)], rows)
+
+
+def _order_totals(order):
+    totals = []
+    discounts = list(order.discounts.all())
+    if discounts or order.tax_amount:
+        totals.append(("Subtotal", _money(order.subtotal)))
+        for d in discounts:
+            totals.append((f"{d.label} ({_n(d.percent, 2)}%)", "-" + _money(order.subtotal * d.percent / Decimal("100"))))
+        if order.tax_amount:
+            totals.append((_tax_label(order), _money(order.tax_amount)))
+    totals.append(("Total", _money(order.total_amount)))
+    return totals
+
+
+def pro_forma_invoice_doc(order):
+    customer = order.customer
+    doc = _base(customer.company, "Pro Forma Invoice", f"PF-{order.id}", order.get_status_display())
+    doc["subtitle"] = "Advance invoice for payment or customs. Not a tax invoice."
+    doc["meta"] = [
+        ("Bill to", customer.name), ("Address", customer.address),
+        ("Date", timezone.localdate().isoformat()),
+        ("Payment terms", customer.payment_terms or None),
+        ("Customer order", f"SO-{order.id}"),
+        ("Customer reference", order.customer_order_reference or None),
+    ]
+    doc["tables"] = [_order_lines_table(order, "Lines")]
+    doc["totals"] = _order_totals(order)
+    doc["signatures"] = ["Authorised signatory"]
+    doc["references"] = f"PF-{order.id} · SO-{order.id}"
+    return doc
+
+
+def sales_quotation_doc(order):
+    customer = order.customer
+    doc = _base(customer.company, "Sales Quotation", f"QT-{order.id}")
+    doc["subtitle"] = "Offer of sale. Becomes a customer order on acceptance."
+    created = order.created_at.date() if order.created_at else timezone.localdate()
+    doc["meta"] = [
+        ("Customer", customer.name), ("Address", customer.address),
+        ("Contact", customer.email or customer.phone or None),
+        ("Quotation date", created.isoformat()),
+        ("Valid until", (created + timedelta(days=30)).isoformat()),
+        ("Requested delivery", str(order.required_delivery_date) if order.required_delivery_date else None),
+        ("Payment terms", customer.payment_terms or None),
+    ]
+    doc["tables"] = [_order_lines_table(order, "Quoted items")]
+    doc["totals"] = _order_totals(order)
+    doc["notes"].append("Prices are net unless a tax line is shown. Subject to stock availability at order.")
+    doc["signatures"] = ["Issued by", "Accepted by (name, date, stamp)"]
+    doc["references"] = f"QT-{order.id}"
+    return doc
+
+
+def packing_note_doc(d):
+    doc = _base(d.company, "Packing Note", d.dispatch_number, d.get_status_display())
+    meta = _dispatch_meta(d)
+    doc["meta"] = [m for m in meta if m[0] in ("Customer", "Customer order", "Ship to", "Address", "Warehouse",
+                                                "Packages", "Gross weight")]
+    rows = [[_c(l.item.name), _c(l.item.unit), _c(_n(l.sales_order_item.quantity), True),
+             _c(_n(l.quantity), True), _c(_n(max(l.sales_order_item.quantity - l.sales_order_item.shipped_quantity, 0)), True)]
+            for l in d.lines.select_related("item", "sales_order_item")]
+    doc["tables"] = [_table("Packed goods", ["Item", "Unit", ("Ordered", True), ("Packed", True), ("Remaining on order", True)], rows)]
+    doc["signatures"] = ["Packed by", "Checked by"]
+    doc["references"] = f"{d.dispatch_number} · SO-{d.sales_order_id}"
     return doc
 
 
@@ -478,13 +636,16 @@ def goods_receipt_doc(receipt):
         ("Warehouse", receipt.warehouse.name),
         ("Customer order", f"SO-{po.requisition.sales_order_id}" if po.requisition and po.requisition.sales_order_id else None),
     ]
+    received = {l.po_item_id: l.quantity for l in receipt.lines.all()}
     doc["tables"] = [_table(
         "Received materials",
-        ["Material", "Unit", ("Ordered quantity", True), "Incoming QC"],
+        ["Material", "Unit", ("Ordered quantity", True), ("Received now", True), "Incoming QC"],
         [[_c(line.item.name), _c(line.unit_of_measure.code if line.unit_of_measure_id else line.item.unit),
           _c(_n(line.quantity), True),
+          _c(_n(received.get(line.id, line.quantity)), True),
           _c(", ".join(q.get_status_display() for q in receipt.quality_checks.filter(item=line.item)) or "Not required")]
-         for line in po.items.select_related("item", "unit_of_measure")],
+         for line in po.items.select_related("item", "unit_of_measure")
+         if not received or line.id in received],
     )]
     doc["signatures"] = ["Received by (Store)", "Inspected by (Quality)", "Issued to Production"]
     doc["references"] = f"GRN-{receipt.id} · PO-{po.id}"
@@ -525,6 +686,11 @@ DOCUMENTS = {
     "dispatch_note": ("Dispatch Note", Dispatch, "company", dispatch_note_doc),
     "invoice": ("Commercial Sales Invoice", Invoice, "company", invoice_doc),
     "stock_transfer": ("Stock Transfer Voucher", StockTransfer, "company", stock_transfer_doc),
+    "pro_forma_invoice": ("Pro Forma Invoice", SalesOrder, "customer__company", pro_forma_invoice_doc),
+    "sales_quotation": ("Sales Quotation", SalesOrder, "customer__company", sales_quotation_doc),
+    "packing_note": ("Packing Note", Dispatch, "company", packing_note_doc),
+    "summary_invoice": ("Summary Invoice", SummaryInvoice, "company", summary_invoice_doc),
+    "vendor_bill": ("Vendor Bill", Bill, "company", vendor_bill_doc),
 }
 
 
@@ -537,3 +703,69 @@ def get_object(doc_type, pk, company):
     else:
         qs = qs.filter(**{lookup: company})
     return qs.first()
+
+
+
+# ---------------------------------------------------------------------------
+# Document register (AI Reports page)
+# ---------------------------------------------------------------------------
+
+def _d(value):
+    return value.isoformat()[:10] if value else None
+
+
+# type -> (section, queryset factory(company), describe(obj) -> (number, date, party, status))
+def _register_sources(company):
+    from django.db.models import Q
+    return [
+        ("Sales", "sales_quotation", SalesOrder.objects.filter(customer__company=company, status__in=("draft", "pending", "pending_approval")).select_related("customer"),
+         lambda o: (f"QT-{o.id}", _d(o.created_at), o.customer.name, o.get_status_display())),
+        ("Sales", "customer_order_confirmation", SalesOrder.objects.filter(customer__company=company).exclude(status="draft").select_related("customer"),
+         lambda o: (f"SO-{o.id}", _d(o.created_at), o.customer.name, o.get_status_display())),
+        ("Sales", "pro_forma_invoice", SalesOrder.objects.filter(customer__company=company).exclude(status__in=("draft", "cancelled")).select_related("customer"),
+         lambda o: (f"PF-{o.id}", _d(o.created_at), o.customer.name, o.get_status_display())),
+        ("Sales", "invoice", Invoice.objects.filter(company=company).select_related("customer"),
+         lambda o: (f"INV-{o.id}", _d(o.invoice_date), o.customer.name, o.get_status_display())),
+        ("Sales", "summary_invoice", SummaryInvoice.objects.filter(company=company).select_related("customer"),
+         lambda o: (o.number, _d(o.created_at), o.customer.name, "")),
+        ("Delivery", "dispatch_note", Dispatch.objects.filter(company=company).exclude(status="cancelled").select_related("sales_order__customer"),
+         lambda o: (o.dispatch_number, _d(o.dispatched_at or o.created_at), o.sales_order.customer.name, o.get_status_display())),
+        ("Delivery", "delivery_note", Dispatch.objects.filter(company=company, status__in=("dispatched", "delivered")).select_related("sales_order__customer"),
+         lambda o: (o.dispatch_number, _d(o.dispatched_at), o.sales_order.customer.name, o.get_status_display())),
+        ("Delivery", "packing_note", Dispatch.objects.filter(company=company, status__in=("packed", "staged", "prepared", "verified", "dispatched", "delivered")).select_related("sales_order__customer"),
+         lambda o: (o.dispatch_number, _d(o.packed_at), o.sales_order.customer.name, o.get_status_display())),
+        ("Delivery", "dispatch_pick_list", Dispatch.objects.filter(company=company).exclude(status="cancelled").select_related("sales_order__customer"),
+         lambda o: (o.dispatch_number, _d(o.created_at), o.sales_order.customer.name, o.get_status_display())),
+        ("Quality", "qa_inspection", QualityCheck.objects.filter(Q(production_order__recipe__product__company=company) | Q(vendor__company=company)),
+         lambda o: (f"QC-{o.id}", _d(getattr(o, "created_at", None)), "", o.get_status_display() if hasattr(o, "get_status_display") else "")),
+        ("Quality", "qa_certificate", QualityCheck.objects.filter(Q(production_order__recipe__product__company=company) | Q(vendor__company=company), status="approved"),
+         lambda o: (f"QC-{o.id}", _d(getattr(o, "created_at", None)), "", "Approved")),
+        ("Procurement", "purchase_order", PurchaseOrder.objects.filter(vendor__company=company).select_related("vendor"),
+         lambda o: (f"PO-{o.id}", _d(o.created_at), o.vendor.name, o.get_status_display())),
+        ("Procurement", "goods_receipt", GoodsReceipt.objects.filter(purchase_order__vendor__company=company).select_related("purchase_order__vendor"),
+         lambda o: (f"GRN-{o.id}", _d(o.received_at), o.purchase_order.vendor.name, "Received")),
+        ("Procurement", "vendor_bill", Bill.objects.filter(company=company).select_related("vendor"),
+         lambda o: (o.bill_number or f"BILL-{o.id}", _d(o.bill_date), o.vendor.name, o.get_status_display())),
+        ("Production", "production_plan", ProductionPlan.objects.filter(company=company).select_related("customer"),
+         lambda o: (o.plan_number, _d(o.created_at), o.customer.name if o.customer_id else "", o.get_status_display())),
+        ("Production", "production_order", ProductionOrder.objects.filter(recipe__product__company=company).select_related("recipe__product"),
+         lambda o: (o.order_number, _d(getattr(o, "created_at", None)), o.recipe.product.name, o.get_status_display())),
+        ("Inventory", "stock_transfer", StockTransfer.objects.filter(company=company),
+         lambda o: (f"STV-{o.id:05d}", _d(o.created_at), "", o.get_status_display())),
+    ]
+
+
+def document_register(company, limit=150):
+    """Every printable document the system can issue, grouped by section,
+    newest first. Cheap to build: no document is rendered here."""
+    sections = {}
+    for section, doc_type, queryset, describe in _register_sources(company):
+        label = DOCUMENTS[doc_type][0]
+        rows = []
+        for obj in queryset.order_by("-pk")[:limit]:
+            number, date, party, status = describe(obj)
+            rows.append({"type": doc_type, "label": label, "id": obj.pk, "number": number,
+                         "date": date, "party": party, "status": status})
+        sections.setdefault(section, []).extend(rows)
+    return [{"section": name, "documents": sorted(rows, key=lambda r: r["date"] or "", reverse=True)}
+            for name, rows in sections.items()]

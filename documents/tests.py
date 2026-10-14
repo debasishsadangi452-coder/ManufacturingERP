@@ -15,6 +15,9 @@ class _Lines:
     def all(self):
         return self.lines
 
+    def exclude(self, **_kwargs):
+        return self.lines
+
 
 class CustomerOrderConfirmationTests(TestCase):
     def test_float_quantity_and_decimal_price_render_line_amount(self):
@@ -41,6 +44,11 @@ class CustomerOrderConfirmationTests(TestCase):
             salesorderitem_set=_Lines([line]),
             total_amount=Decimal("10.00"),
             custom_specifications="",
+            subtotal=Decimal("10.00"),
+            tax_amount=Decimal("0"),
+            tax_label="",
+            discounts=_Lines([]),
+            dispatches=_Lines([]),
         )
 
         document = customer_order_confirmation_doc(order)

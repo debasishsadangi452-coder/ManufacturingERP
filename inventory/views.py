@@ -45,6 +45,21 @@ class UnitOfMeasureViewSet(viewsets.ModelViewSet):
         serializer.save(company=self.request.user.company)
 
     @action(detail=False, methods=["get"])
+    def convert(self, request):
+        """?qty=2&from=kg&to=lb → {"quantity": 4.409...}. Only units of the
+        same dimension convert; anything else is a 400, never a wrong number."""
+        from .uom import UomConversionError, convert_by_code
+        try:
+            qty = request.query_params["qty"]
+            result = convert_by_code(qty, request.query_params["from"], request.query_params["to"],
+                                     company=request.user.company)
+        except KeyError:
+            return Response({"error": "qty, from and to are required."}, status=400)
+        except (UomConversionError, ArithmeticError, ValueError) as exc:
+            return Response({"error": str(exc)}, status=400)
+        return Response({"quantity": float(result)})
+
+    @action(detail=False, methods=["get"])
     def needs_review(self, request):
         """Items in this company that still lack a base_unit — the backfill
         review queue. Frontend lets an admin assign units here."""
@@ -713,7 +728,20 @@ class BOMViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
             uom = None
             if unit_of_measure_id:
                 from .models import UnitOfMeasure
-                uom = UnitOfMeasure.objects.filter(id=unit_of_measure_id).first()
+                uom = UnitOfMeasure.objects.filter(
+                    Q(company=None) | Q(company=bom.finished_good.company), id=unit_of_measure_id,
+                ).first()
+                if uom is None:
+                    return Response({'error': 'Unknown unit of measure.'}, status=status.HTTP_400_BAD_REQUEST)
+                # The unit must convert to how the material is stocked (weight with
+                # weight, liquid with liquid, count with count).
+                if raw_material.base_unit and raw_material.base_unit.dimension != uom.dimension:
+                    return Response(
+                        {'error': f"{raw_material.name} is stocked in {raw_material.base_unit.code} "
+                                  f"({raw_material.base_unit.get_dimension_display().lower()}); "
+                                  f"{uom.code} is a {uom.get_dimension_display().lower()} unit."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
             line, created = BOMLine.objects.get_or_create(
                 bom=bom, raw_material=raw_material,

@@ -178,9 +178,22 @@ def post_invoice_to_ar(invoice_id, user, company):
             account=rev_account,
             line_number=2,
             debit=Decimal("0.00"),
-            credit=invoice.total_amount,
+            credit=invoice.total_amount - (invoice.tax_amount or Decimal("0.00")),
             description=f"Sales Revenue - Invoice INV-{invoice.id}",
         )
+
+        # Credit Sales Tax Payable when the invoice carries tax
+        if invoice.tax_amount and invoice.tax_amount > Decimal("0.00"):
+            from .sales_accounting import get_tax_payable_account
+            JournalEntryLine.objects.create(
+                company=company,
+                journal_entry=entry,
+                account=get_tax_payable_account(company),
+                line_number=3,
+                debit=Decimal("0.00"),
+                credit=invoice.tax_amount,
+                description=f"Sales Tax Payable - Invoice INV-{invoice.id}",
+            )
 
         # Post atomically through #8 engine
         posted_entry = post_journal_entry(entry.id, user, company=company)

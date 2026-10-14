@@ -174,9 +174,15 @@ def _post_goods_receipt(company, receipt_id, user, payload):
     _skip_if_movements_posted(company, "grn", receipt.purchase_order_id)
 
     po = receipt.purchase_order
-    amount = _money(sum(
-        (poi.unit_price or Decimal("0")) * Decimal(str(poi.quantity)) for poi in po.items.all()
-    ))
+    receipt_lines = list(receipt.lines.select_related("po_item"))
+    if receipt_lines:  # this delivery only
+        amount = _money(sum(
+            (l.po_item.unit_price or Decimal("0")) * Decimal(str(l.quantity)) for l in receipt_lines
+        ))
+    else:  # legacy receipt of the whole order
+        amount = _money(sum(
+            (poi.unit_price or Decimal("0")) * Decimal(str(poi.quantity)) for poi in po.items.all()
+        ))
     if amount <= 0:
         raise SkipPosting(f"PO-{po.id} has no priced lines; nothing to capitalise.")
 

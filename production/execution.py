@@ -352,10 +352,10 @@ def _incoming_pipeline(item):
         item=item, inspection_type="incoming", status="pending",
     ).aggregate(t=Sum("received_quantity"))["t"] or 0
     open_lines = PurchaseOrderItem.objects.filter(
-        item=item, purchase_order__status__in=("draft", "pending", "approved", "ordered"),
+        item=item, purchase_order__status__in=("draft", "pending", "approved", "ordered", "partially_received"),
     )
-    agg = open_lines.aggregate(t=Sum("quantity"), d=Min("purchase_order__expected_delivery"))
-    return float(held), float(agg["t"] or 0), agg["d"]
+    agg = open_lines.aggregate(t=Sum("quantity"), r=Sum("received_quantity"), d=Min("purchase_order__expected_delivery"))
+    return float(held), float((agg["t"] or 0) - (agg["r"] or 0)), agg["d"]
 
 
 def material_status(order):

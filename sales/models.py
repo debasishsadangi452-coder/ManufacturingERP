@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db import models
 from django.utils import timezone
 from inventory.models import Item, Warehouse
@@ -85,9 +87,53 @@ class SalesOrder(models.Model):
     priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default="normal")
     custom_specifications = models.TextField(blank=True, default="")
     delivery_requirements = models.TextField(blank=True, default="")
+    # Optional commercial adjustments. total_amount = subtotal - discount_amount + tax_amount.
+    # All default to zero so existing orders and flows are unaffected.
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    tax_label = models.CharField(max_length=60, blank=True, default="")
+
+    @property
+    def discount_percent(self):
+        """Combined percentage of every discount column on this order."""
+        return sum((d.percent for d in self.discounts.all()), Decimal("0"))
 
     def __str__(self):
         return f"SO-{self.id}"
+
+
+class DiscountType(models.Model):
+    """A named discount column (e.g. "Volume", "Early payment") that sales
+    users can add to and reuse across orders."""
+
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    name = models.CharField(max_length=80)
+    default_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(fields=["company", "name"], name="uniq_discount_type_per_company"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class SalesOrderDiscount(models.Model):
+    """One discount column applied to an order, as a percentage of the subtotal."""
+
+    sales_order = models.ForeignKey(SalesOrder, on_delete=models.CASCADE, related_name="discounts")
+    discount_type = models.ForeignKey(DiscountType, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    label = models.CharField(max_length=80)
+    percent = models.DecimalField(max_digits=5, decimal_places=2)
+
+    def __str__(self):
+        return f"{self.label} {self.percent}% on SO-{self.sales_order_id}"
 
 class SalesOrderItem(models.Model):
     sales_order = models.ForeignKey(SalesOrder, on_delete=models.CASCADE)
@@ -124,6 +170,14 @@ class Invoice(models.Model):
     due_date = models.DateField(null=True, blank=True)
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    # total_amount = subtotal - discount_amount + tax_amount. Legacy invoices
+    # keep subtotal 0 and are treated as having no adjustments.
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    summary_invoice = models.ForeignKey(
+        "sales.SummaryInvoice", null=True, blank=True, on_delete=models.SET_NULL, related_name="invoices"
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="open")
     quickbooks_id = models.CharField(max_length=100, blank=True, db_index=True)
     quickbooks_sync_token = models.CharField(max_length=100, blank=True)
@@ -144,6 +198,29 @@ class Invoice(models.Model):
 
     def __str__(self):
         return f"INV-{self.id}"
+
+
+class SummaryInvoice(models.Model):
+    """A statement combining several of one customer's invoices into a single
+    printable document. The underlying invoices stay the accounting record;
+    this only groups them for the buyer."""
+
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name="summary_invoices")
+    created_at = models.DateTimeField(auto_now_add=True)
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    @property
+    def number(self):
+        return f"SUM-{self.id:05d}"
+
+    def __str__(self):
+        return self.number
 
 
 class InvoiceLine(models.Model):

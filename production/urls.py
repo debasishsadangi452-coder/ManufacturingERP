@@ -2,6 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 from .views import (
     CapacityPlanView,
+    CostTrendView,
     ManufacturingSettingsView,
     ProductionLineViewSet,
     ProductionOperationViewSet,
@@ -36,6 +37,7 @@ router.register(r'scrap', ScrapRecordViewSet)
 
 urlpatterns = router.urls
 urlpatterns += [
+    path("cost-trend/", CostTrendView.as_view(), name="cost-trend"),
     path("projection/", ProjectionDashboardAPIView.as_view(), name="projection-dashboard"),
     path("wip/", WIPBoardView.as_view(), name="wip-board"),
     path("capacity/", CapacityPlanView.as_view(), name="capacity-plan"),

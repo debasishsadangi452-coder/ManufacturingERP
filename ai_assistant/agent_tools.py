@@ -202,7 +202,7 @@ def forecast_cash_flow(user, horizon_days=30):
     ).aggregate(t=Sum('total_amount'))['t'] or Decimal("0")
 
     open_po_outflow = PurchaseOrder.objects.filter(vendor__company=user.company,
-        status__in=['pending', 'approved', 'ordered']
+        status__in=['pending', 'approved', 'ordered', 'partially_received']
     ).aggregate(t=Sum('total_amount'))['t'] or Decimal("0")
 
     pending_expenses = ExpenseRequest.objects.filter(company=user.company,
@@ -544,7 +544,7 @@ def get_digital_twin_snapshot(user):
     avg_health = Equipment.objects.filter(line__company=user.company).aggregate(a=Avg('health'))['a']
     critical_machines = Equipment.objects.filter(health__lt=FAILURE_HEALTH_THRESHOLD + 20, line__company=user.company).count()
 
-    open_pos = PurchaseOrder.objects.filter(status__in=['pending', 'approved', 'ordered'], vendor__company=user.company)
+    open_pos = PurchaseOrder.objects.filter(status__in=['pending', 'approved', 'ordered', 'partially_received'], vendor__company=user.company)
     open_po_value = open_pos.aggregate(t=Sum('total_amount'))['t'] or 0
 
     present = AttendanceRecord.objects.filter(date=today, status='present', employee__company=user.company).count()

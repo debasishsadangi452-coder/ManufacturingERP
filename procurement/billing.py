@@ -80,7 +80,7 @@ def auto_bill_on_receipt_enabled(company):
     return bool(settings_obj and settings_obj.auto_bill_on_receipt)
 
 
-def on_goods_received(po, receipt, user):
+def on_goods_received(po, receipt, user, complete=True):
     """Ledger and billing follow-up for a goods receipt. Returns the bill it
     created, if any. Never raises."""
     from accounting.auto_posting import queue_auto_post
@@ -89,7 +89,7 @@ def on_goods_received(po, receipt, user):
     queue_auto_post("goods_receipt", company, receipt.id, user)
 
     try:
-        if not auto_bill_on_receipt_enabled(company) or existing_bill(po) or po.total_amount <= 0:
+        if not complete or not auto_bill_on_receipt_enabled(company) or existing_bill(po) or po.total_amount <= 0:
             return None
         bill = create_bill_from_po(po)
     except Exception:

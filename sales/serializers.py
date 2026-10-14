@@ -14,6 +14,18 @@ class SalesOrderItemSerializer(serializers.ModelSerializer):
         model = SalesOrderItem
         fields = ["id", "item", "item_name", "quantity", "unit_price", "shipped_quantity"]
 
+class DiscountTypeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DiscountType
+        fields = ["id", "name", "default_percent", "is_active"]
+
+
+class SalesOrderDiscountSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SalesOrderDiscount
+        fields = ["id", "discount_type", "label", "percent"]
+
+
 class SalesOrderSerializer(serializers.ModelSerializer):
     # Read-only nested items for display
     items = SalesOrderItemSerializer(source="salesorderitem_set", many=True, read_only=True)
@@ -23,6 +35,8 @@ class SalesOrderSerializer(serializers.ModelSerializer):
     production_orders = serializers.SerializerMethodField()
     purchase_requisitions = serializers.SerializerMethodField()
     fulfillment = serializers.SerializerMethodField()
+    discounts = SalesOrderDiscountSerializer(many=True, read_only=True)
+    dispatches = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesOrder
@@ -32,8 +46,9 @@ class SalesOrderSerializer(serializers.ModelSerializer):
             "priority", "custom_specifications", "delivery_requirements",
             "items", "quickbooks_id", "production_status", "production_plans",
             "production_orders", "purchase_requisitions", "fulfillment",
+            "subtotal", "discount_amount", "tax_amount", "tax_label", "discounts", "dispatches",
         ]
-        read_only_fields = ["quickbooks_id"]
+        read_only_fields = ["quickbooks_id", "subtotal", "discount_amount"]
 
     def get_production_plans(self, order):
         return [
@@ -84,6 +99,16 @@ class SalesOrderSerializer(serializers.ModelSerializer):
                 ],
             }
             for requisition in order.purchase_requisitions.prefetch_related("purchase_orders")
+        ]
+
+    def get_dispatches(self, order):
+        return [
+            {
+                "id": d.id, "dispatch_number": d.dispatch_number, "status": d.status,
+                "dispatched_at": d.dispatched_at, "invoice": d.invoice_id,
+                "quantity": d.total_quantity,
+            }
+            for d in order.dispatches.exclude(status="cancelled")
         ]
 
     def get_fulfillment(self, order):
@@ -168,10 +193,43 @@ class SalesOrderSerializer(serializers.ModelSerializer):
                     unit_price=agreed,
                 )
                 total += so_item.unit_price * Decimal(str(so_item.quantity))
-        # Price the order from item selling prices unless a total was supplied
-        if not order.total_amount and total:
-            order.total_amount = total
-            order.save(update_fields=["total_amount"])
+        # Optional discount columns (percent of subtotal) and tax amount.
+        from .pricing import order_adjustments
+        percents = []
+        for entry in request.data.get('discounts', []) if request else []:
+            try:
+                percent = Decimal(str(entry.get('percent')))
+            except Exception:
+                order.delete()
+                raise drf_serializers.ValidationError({"discounts": "Each discount needs a numeric percentage."})
+            if percent <= 0:
+                continue
+            if percent > 100:
+                order.delete()
+                raise drf_serializers.ValidationError({"discounts": "A discount cannot exceed 100%."})
+            discount_type = None
+            if entry.get('discount_type'):
+                discount_type = DiscountType.objects.filter(pk=entry['discount_type'], company=company).first()
+            label = (entry.get('label') or (discount_type.name if discount_type else "Discount")).strip()[:80]
+            SalesOrderDiscount.objects.create(
+                sales_order=order, discount_type=discount_type, label=label, percent=percent,
+            )
+            percents.append(percent)
+        if sum(percents, Decimal("0")) > 100:
+            order.delete()
+            raise drf_serializers.ValidationError({"discounts": "Discounts together cannot exceed 100%."})
+        try:
+            tax = Decimal(str(request.data.get('tax_amount') or 0)) if request else Decimal("0")
+        except Exception:
+            order.delete()
+            raise drf_serializers.ValidationError({"tax_amount": "Tax must be a number."})
+        if tax < 0:
+            order.delete()
+            raise drf_serializers.ValidationError({"tax_amount": "Tax cannot be negative."})
+        order.subtotal = total
+        order.discount_amount, order.tax_amount, order.total_amount = order_adjustments(total, percents, tax)
+        order.tax_label = (request.data.get('tax_label') or "")[:60] if request else ""
+        order.save(update_fields=["subtotal", "discount_amount", "tax_amount", "total_amount", "tax_label"])
         return order
 
 class ShipmentSerializer(serializers.ModelSerializer):
@@ -197,6 +255,7 @@ class InvoiceSerializer(serializers.ModelSerializer):
         fields = [
             "id", "sales_order", "customer", "customer_name", "invoice_date", "due_date",
             "total_amount", "amount_paid", "balance_due", "status",
+            "subtotal", "discount_amount", "tax_amount", "summary_invoice",
             "quickbooks_id", "quickbooks_last_synced_at", "created_at", "lines",
         ]
 
@@ -242,3 +301,25 @@ class InboundOrderEmailSerializer(serializers.ModelSerializer):
     def get_total_cases(self, obj):
         lines = self.get_order_lines(obj)
         return sum(float(li.get("cases") or 0) for li in lines)
+
+
+class SummaryInvoiceSerializer(serializers.ModelSerializer):
+    number = serializers.CharField(read_only=True)
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+    invoice_ids = serializers.SerializerMethodField()
+    total_amount = serializers.SerializerMethodField()
+    balance_due = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SummaryInvoice
+        fields = ["id", "number", "customer", "customer_name", "created_at", "notes",
+                  "invoice_ids", "total_amount", "balance_due"]
+
+    def get_invoice_ids(self, obj):
+        return list(obj.invoices.values_list("id", flat=True))
+
+    def get_total_amount(self, obj):
+        return sum((i.total_amount for i in obj.invoices.all()), 0)
+
+    def get_balance_due(self, obj):
+        return sum((i.balance_due for i in obj.invoices.all()), 0)

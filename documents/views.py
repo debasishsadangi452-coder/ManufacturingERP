@@ -6,7 +6,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .builders import DOCUMENTS, get_object
+from .builders import DOCUMENTS, document_register, get_object
 
 
 class DocumentTypesView(APIView):
@@ -30,5 +30,15 @@ class DocumentView(APIView):
             doc = DOCUMENTS[doc_type][3](obj)
         except (ValueError, DjangoValidationError) as e:
             return Response({"error": str(e)}, status=400)
+        if request.query_params.get("format") == "json":
+            return Response(doc)
         html = render_to_string("documents/document.html", {"doc": doc, "printed_at": timezone.localtime()})
         return HttpResponse(html, content_type="text/html; charset=utf-8")
+
+
+class DocumentRegisterView(APIView):
+    """GET /api/documents/register/ → every issued document, grouped by section."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(document_register(request.user.company))

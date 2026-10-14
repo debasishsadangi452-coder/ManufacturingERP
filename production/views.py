@@ -5,13 +5,14 @@ from datetime import timedelta
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.views import APIView
 from django.utils import timezone
 
-from accounts.permission import IsAdmin, IsProduction, IsQuality, IsSales, IsStore
+from accounts.permission import IsAdmin, IsFinance, IsProduction, IsQuality, IsSales, IsStore
 from .models import (
     ManufacturingSettings, ProductionLine, ProductionOperation, ProductionOrder, ProductionPlan, Recipe,
     RecipeIngredient, Resource, ResourceUnavailability, RoutingStep, ScrapRecord,
@@ -43,6 +44,25 @@ class ProductionLineViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     queryset = ProductionLine.objects.all()
     serializer_class = ProductionLineSerializer
     permission_classes = [IsProduction | IsAdmin]
+
+    @action(detail=False, methods=["get"])
+    def cost_summary(self, request):
+        """Running production cost per line and in total."""
+        from .costing import line_cost_summary
+        return Response(line_cost_summary(request.user.company))
+
+
+class CostTrendView(APIView):
+    """GET ?months=6 -> monthly invoiced sales vs production cost (dashboard graph)."""
+    permission_classes = [IsAdmin | IsFinance | IsSales | IsProduction]
+
+    def get(self, request):
+        from .costing import monthly_cost_vs_sales
+        try:
+            months = max(1, min(int(request.query_params.get("months", 6)), 24))
+        except ValueError:
+            months = 6
+        return Response(monthly_cost_vs_sales(request.user.company, months))
 
 
 class ProjectionDashboardAPIView(APIView):

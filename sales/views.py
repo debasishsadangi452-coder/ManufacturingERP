@@ -10,7 +10,9 @@ from django.db.models import Sum
 from django.utils import timezone
 from accounts.permission import IsSales, IsAdmin, IsStore, IsFinance, IsProduction, IsQuality
 
-from .models import Customer, CustomerPayment, Invoice, InvoiceLine, SalesOrder, SalesOrderItem, Shipment
+from .models import (
+    Customer, CustomerPayment, DiscountType, Invoice, InvoiceLine, SalesOrder, SalesOrderItem, Shipment, SummaryInvoice,
+)
 from .serializers import *
 
 from inventory.services import decrease_stock
@@ -728,6 +730,125 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         })
 
     @action(detail=True, methods=['post'])
+    def split_delivery(self, request, pk=None):
+        """Deliver part of an order from existing finished-goods stock.
+
+        Payload: {
+          "lines": [{"order_item_id": 1, "quantity": 40}, ...],
+          "invoice": "split" | "later",     # bill this delivery now, or leave for one total invoice
+          "complete": true,                  # false stops at the pick list
+          "shipment_mode", "carrier", "vehicle_number", "driver_name",
+          "expected_delivery", "ship_to_address", "delivery_notes"
+        }
+        Each call produces its own dispatch (and dispatch note), so an order can
+        leave in as many deliveries as the user wants.
+        """
+        from fulfillment import services as fs
+        from fulfillment.serializers import DispatchSerializer
+        order = self.get_object()
+        lines = [
+            {"order_item_id": int(l["order_item_id"]), "quantity": float(l["quantity"])}
+            for l in request.data.get("lines", []) if float(l.get("quantity") or 0) > 0
+        ]
+        if not lines:
+            return Response({"error": "Enter a quantity for at least one line."}, status=status.HTTP_400_BAD_REQUEST)
+        if order.status not in ("confirmed", "shipped", "pending"):
+            return Response({"error": f"SO-{order.id} is {order.status}; it cannot be delivered."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            with transaction.atomic():
+                # Reserve only what this delivery needs beyond what is already allocated.
+                to_allocate = []
+                for line in lines:
+                    order_item = order.salesorderitem_set.filter(pk=line["order_item_id"]).first()
+                    if order_item is None:
+                        raise ValidationError(f"Line {line['order_item_id']} is not on SO-{order.id}.")
+                    extra = line["quantity"] - fs.pickable(order_item)
+                    if extra > fs.EPS:
+                        to_allocate.append({"order_item_id": order_item.id, "quantity": extra})
+                if order.status == "pending":
+                    order.status = "confirmed"
+                    order.save(update_fields=["status"])
+                if to_allocate:
+                    fs.allocate(order, request.user, to_allocate)
+                dispatch = fs.create_dispatch(order, request.user, lines)
+                if request.data.get("complete", True):
+                    data = {k: request.data[k] for k in fs.LOGISTICS_FIELDS if request.data.get(k) not in (None, "")}
+                    data.setdefault("shipment_mode", "road")
+                    if data["shipment_mode"] != "customer_pickup":
+                        data.setdefault("carrier", "Own transport")
+                    fs.pick(dispatch, user=request.user)
+                    fs.pack(dispatch, data.get("packages"), data.get("gross_weight"), user=request.user)
+                    fs.stage(dispatch, user=request.user)
+                    fs.prepare_shipment(dispatch, data, user=request.user)
+                    fs.verify(dispatch, user=request.user)
+                    fs.confirm_dispatch(dispatch, user=request.user,
+                                        auto_invoice=request.data.get("invoice", "later") == "split")
+                    if request.data.get("delivery_notes"):
+                        dispatch.delivery_notes = request.data["delivery_notes"]
+                        dispatch.save(update_fields=["delivery_notes"])
+        except ValidationError as e:
+            detail = getattr(e, "detail", e)
+            if isinstance(detail, dict):
+                detail = " ".join(str(v) for value in detail.values() for v in (value if isinstance(value, list) else [value]))
+            elif isinstance(detail, list):
+                detail = " ".join(str(d) for d in detail)
+            return Response({"error": str(detail)}, status=status.HTTP_400_BAD_REQUEST)
+        dispatch.refresh_from_db()
+        log_activity(request.user, "Sales", "Split Delivery", f"{dispatch.dispatch_number} for SO-{order.id}")
+        return Response(DispatchSerializer(dispatch).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def split_production_plan(self, request, pk=None):
+        """Plan one order line as several production runs.
+
+        Payload: { "item_id": 7, "parts": [{"quantity": 3000, "target_date": "..."}, {"quantity": 2000}] }
+        The parts, together with any production already planned for the line,
+        cannot exceed the ordered quantity.
+        """
+        from production.models import ProductionPlan, ManufacturingSettings
+        order = self.get_object()
+        if order.status in ("cancelled", "delivered", "draft"):
+            return Response({"error": f"SO-{order.id} is {order.status}."}, status=status.HTTP_400_BAD_REQUEST)
+        line = order.salesorderitem_set.filter(item_id=request.data.get("item_id")).first()
+        if line is None:
+            return Response({"error": "That item is not on this order."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            parts = [(float(p["quantity"]), p.get("target_date")) for p in request.data.get("parts", [])]
+        except (KeyError, TypeError, ValueError):
+            return Response({"error": "Each part needs a numeric quantity."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(parts) < 1 or any(q <= 0 for q, _ in parts):
+            return Response({"error": "Add at least one part, each above zero."}, status=status.HTTP_400_BAD_REQUEST)
+        planned = ProductionPlan.objects.filter(sales_order=order, sales_order_item=line).exclude(
+            status="cancelled").aggregate(t=Sum("planned_quantity"))["t"] or 0
+        if planned + sum(q for q, _ in parts) > line.quantity + 1e-6:
+            return Response(
+                {"error": f"{line.item.name}: {line.quantity:g} ordered, {planned:g} already planned; "
+                          f"these parts add {sum(q for q, _ in parts):g}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        settings = ManufacturingSettings.for_company(order.customer.company)
+        if settings.business_model == "mto" and order.status != "confirmed":
+            return Response({"error": "Confirm the customer order before planning production."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        plans = [
+            ProductionPlan.objects.create(
+                company=order.customer.company, sales_order=order, sales_order_item=line,
+                customer=order.customer, item=line.item, order_quantity=line.quantity,
+                planned_quantity=quantity,
+                target_date=target or order.required_delivery_date or None,
+                status="pending_approval" if settings.production_plan_approval_required else "planned",
+                notes=f"Part {i} of {len(parts)}",
+                created_by=request.user if request.user.is_authenticated else None,
+            )
+            for i, (quantity, target) in enumerate(parts, 1)
+        ]
+        log_activity(request.user, "Sales", "Split Production Plan",
+                     f"{len(plans)} plans for {line.item.name} on SO-{order.id}")
+        return Response({"plans": [{"id": p.id, "plan_number": p.plan_number, "planned_quantity": p.planned_quantity}
+                                   for p in plans]}, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
     def generate_invoice(self, request, pk=None):
         """
         Create an Invoice from this sales order using the order line agreed price.
@@ -794,8 +915,8 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 amount=amount,
             )
             total += amount
-        invoice.total_amount = total or order.total_amount
-        invoice.save(update_fields=["total_amount"])
+        from .pricing import apply_to_invoice
+        apply_to_invoice(invoice, order, total)
 
         # Mirror to QuickBooks (Level 1 sync); failures land in sync errors.
         from quickbooks.push import get_active_connection, safe_push
@@ -866,6 +987,53 @@ class InvoiceViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
             "payment": CustomerPaymentSerializer(payment).data,
             "invoice": InvoiceSerializer(invoice).data,
         }, status=status.HTTP_201_CREATED)
+
+
+class DiscountTypeViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    company_field = "company"
+    queryset = DiscountType.objects.all()
+    serializer_class = DiscountTypeSerializer
+    permission_classes = [IsSales | IsAdmin | IsFinance]
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company)
+
+
+class SummaryInvoiceViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):
+    """Combine any number of one customer's invoices into a single statement."""
+    company_field = "company"
+    queryset = SummaryInvoice.objects.select_related("customer").prefetch_related("invoices")
+    serializer_class = SummaryInvoiceSerializer
+    permission_classes = [IsSales | IsAdmin | IsFinance]
+
+    def create(self, request):
+        ids = request.data.get("invoice_ids") or []
+        invoices = list(Invoice.objects.filter(pk__in=ids, company=request.user.company))
+        if len(invoices) != len(set(ids)) or not invoices:
+            return Response({"error": "Choose existing invoices to combine."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(invoices) < 2:
+            return Response({"error": "Choose at least two invoices to combine."}, status=status.HTTP_400_BAD_REQUEST)
+        if len({i.customer_id for i in invoices}) > 1:
+            return Response({"error": "A summary invoice covers one buyer; pick invoices of the same customer."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        bad = [f"INV-{i.id}" for i in invoices if i.status == "cancelled" or i.summary_invoice_id]
+        if bad:
+            return Response({"error": f"Already combined or cancelled: {', '.join(bad)}."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            summary = SummaryInvoice.objects.create(
+                company=request.user.company, customer=invoices[0].customer, notes=request.data.get("notes", ""),
+            )
+            Invoice.objects.filter(pk__in=[i.id for i in invoices]).update(summary_invoice=summary)
+        log_activity(request.user, "Sales", "Summary Invoice",
+                     f"{summary.number} combines {', '.join(f'INV-{i.id}' for i in invoices)}")
+        return Response(SummaryInvoiceSerializer(summary).data, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, pk=None):
+        summary = self.get_object()
+        summary.invoices.update(summary_invoice=None)
+        summary.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class CustomerPaymentViewSet(CompanyScopedMixin, viewsets.ReadOnlyModelViewSet):

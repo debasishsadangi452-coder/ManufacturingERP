@@ -95,7 +95,7 @@ def _open_purchase_quantity(item: Item, company=None) -> float:
     from django.db.models import Q
 
     rows = PurchaseOrderItem.objects.filter(
-        item=item, purchase_order__status__in=("pending", "approved", "ordered")
+        item=item, purchase_order__status__in=("pending", "approved", "ordered", "partially_received")
     )
     if company:
         rows = rows.filter(
@@ -107,11 +107,11 @@ def _open_purchase_quantity(item: Item, company=None) -> float:
         source_unit = line.unit_of_measure or item.purchase_unit
         if source_unit and item.base_unit and source_unit.id != item.base_unit_id:
             try:
-                total += float(convert(line.quantity, source_unit, item.base_unit, item=item))
+                total += float(convert(line.remaining_quantity, source_unit, item.base_unit, item=item))
             except UomConversionError as exc:
                 raise ValidationError(str(exc))
         else:
-            total += float(line.quantity)
+            total += float(line.remaining_quantity)
     return total
 
 

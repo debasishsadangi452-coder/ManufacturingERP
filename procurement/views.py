@@ -482,11 +482,36 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         po = serializer.validated_data["purchase_order"]
-        if po.status not in ["approved", "ordered"]:
+        if po.status not in ["approved", "ordered", "partially_received"]:
             raise ValidationError({
                 "error": f"Cannot receive goods for PO #{po.id}. "
-                         f"Status must be 'approved' or 'ordered', currently '{po.status}'."
+                         f"Status must be 'approved', 'ordered' or 'partially_received', currently '{po.status}'."
             })
+        # `lines` ([{po_item, quantity}]) receives part of the order; without
+        # it everything still outstanding is received, as before.
+        requested = self.request.data.get("lines")
+        po_items = list(po.items.select_related("item", "unit_of_measure").select_for_update())
+        to_receive = {}
+        if requested is None:
+            to_receive = {poi.id: poi.remaining_quantity for poi in po_items if poi.remaining_quantity > 0}
+        else:
+            by_id = {poi.id: poi for poi in po_items}
+            for row in requested:
+                try:
+                    poi, qty = by_id[int(row["po_item"])], float(row["quantity"])
+                except (KeyError, TypeError, ValueError):
+                    raise ValidationError({"lines": "Each line needs a PO line and a numeric quantity."})
+                if qty < 0:
+                    raise ValidationError({"lines": "Received quantity cannot be negative."})
+                if qty > poi.remaining_quantity + 1e-6:
+                    raise ValidationError({
+                        "lines": f"{poi.item.name}: only {poi.remaining_quantity:g} still to receive, "
+                                 f"{qty:g} entered."
+                    })
+                if qty > 0:
+                    to_receive[poi.id] = qty
+        if not to_receive:
+            raise ValidationError({"lines": "Nothing to receive: enter a quantity for at least one line."})
         receipt = serializer.save()
         items_received = []
         from inventory.lots import create_raw_lot
@@ -494,13 +519,20 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         # Track B (TB-04): with incoming QC on, received material is held as a
         # QA-pending lot and only becomes usable stock when quality accepts it.
         hold_for_qc = ManufacturingSettings.for_company(po.vendor.company).incoming_qc_required
-        for poi in po.items.all():
-            received_base_quantity = poi.quantity
+        from .models import GoodsReceiptLine
+        for poi in po_items:
+            if poi.id not in to_receive:
+                continue
+            received_quantity = to_receive[poi.id]
+            GoodsReceiptLine.objects.create(receipt=receipt, po_item=poi, quantity=received_quantity)
+            poi.received_quantity += received_quantity
+            PurchaseOrderItem.objects.filter(pk=poi.pk).update(received_quantity=poi.received_quantity)
+            received_base_quantity = received_quantity
             if poi.unit_of_measure_id and poi.item.base_unit_id:
                 from inventory.uom import UomConversionError, convert
                 try:
                     received_base_quantity = float(convert(
-                        poi.quantity, poi.unit_of_measure, poi.item.base_unit, item=poi.item
+                        received_quantity, poi.unit_of_measure, poi.item.base_unit, item=poi.item
                     ))
                 except UomConversionError as exc:
                     raise ValidationError({
@@ -529,7 +561,7 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                     test_type="Incoming Inspection",
                 )
             items_received.append(
-                f"{poi.quantity} {poi.unit_of_measure.code if poi.unit_of_measure_id else poi.item.unit} x {poi.item.name}"
+                f"{received_quantity:g} {poi.unit_of_measure.code if poi.unit_of_measure_id else poi.item.unit} x {poi.item.name}"
             )
         if hold_for_qc:
             from core.utils import send_notification
@@ -539,13 +571,16 @@ class GoodsReceiptViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                 related_id=receipt.id, related_type="GoodsReceipt",
                 company=po.vendor.company, module="quality",
             )
-        po.status = "received"
+        complete = all(poi.received_quantity + 1e-6 >= poi.quantity for poi in po_items)
+        po.status = "received" if complete else "partially_received"
         po.save()
-        from finance.services import record_procurement_cost
-        record_procurement_cost(po, user=self.request.user)
-        # Ledger posting and (per Accounting setup) the vendor bill.
+        if complete:
+            from finance.services import record_procurement_cost
+            record_procurement_cost(po, user=self.request.user)
+        # Ledger posting; the vendor bill and procurement spend follow once the
+        # order is fully received.
         from .billing import on_goods_received
-        on_goods_received(po, receipt, self.request.user)
+        on_goods_received(po, receipt, self.request.user, complete=complete)
 
         log_activity(
             self.request.user, "Procurement", "Goods Receipt",

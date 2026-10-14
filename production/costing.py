@@ -132,6 +132,12 @@ def _side(order, settings, company, *, actual):
 
     units = order.produced_quantity if actual else order.quantity
     overhead = _overhead(settings, units, material_total, machine_hours, labour_hours)
+    # Per-unit rates set on the production line (machinery, labour, overhead).
+    if order.line_id:
+        line = order.line
+        machine_cost += _d(line.machinery_cost_per_unit) * _d(units)
+        labour_cost += _d(line.labour_cost_per_unit) * _d(units)
+        overhead += _d(line.overhead_cost_per_unit) * _d(units)
     basis = "resources"
     if machine_cost + labour_cost + op_total == ZERO and settings.overhead_method == "none":
         policy = _policy(company)
@@ -218,3 +224,97 @@ def gl_cost_overrides(order):
     if labour == ZERO and overhead == ZERO:
         return None, None
     return labour, overhead
+
+
+def _in_costing(order):
+    return order.produced_quantity and order.status != "cancelled" and not order.is_rework
+
+
+def line_cost_summary(company):
+    """Running production cost per line and in total: raw material, machinery,
+    labour and overhead for everything produced so far."""
+    from .models import ProductionLine, ProductionOrder
+
+    def blank():
+        return {"orders": 0, "units": 0.0, "raw_material_cost": 0.0, "machinery_cost": 0.0,
+                "labour_cost": 0.0, "overhead_cost": 0.0, "total_cost": 0.0}
+
+    lines = {l.id: l for l in ProductionLine.objects.filter(company=company)}
+    rows = {lid: blank() for lid in lines}
+    rows[None] = blank()
+    orders = ProductionOrder.objects.filter(recipe__product__company=company, produced_quantity__gt=0) \
+        .exclude(status="cancelled").select_related("recipe__product", "line")
+    for order in orders:
+        if order.is_rework:
+            continue
+        actual = order_cost(order)["actual"]
+        row = rows.setdefault(order.line_id, blank())
+        row["orders"] += 1
+        row["units"] += actual["units"]
+        row["raw_material_cost"] += actual["raw_material_cost"]
+        row["machinery_cost"] += actual["machine_cost"] + actual["operation_cost"]
+        row["labour_cost"] += actual["labour_cost"]
+        row["overhead_cost"] += actual["overhead_cost"]
+        row["total_cost"] += actual["total_cost"]
+    result = []
+    for lid, row in rows.items():
+        if lid is None and not row["orders"]:
+            continue
+        line = lines.get(lid)
+        row = {k: round(v, 2) if isinstance(v, float) else v for k, v in row.items()}
+        row.update({
+            "line_id": lid,
+            "line_name": line.name if line else "No line assigned",
+            "unit_cost": round(row["total_cost"] / row["units"], 4) if row["units"] else 0.0,
+            "rates": {
+                "machinery_cost_per_unit": float(line.machinery_cost_per_unit),
+                "labour_cost_per_unit": float(line.labour_cost_per_unit),
+                "overhead_cost_per_unit": float(line.overhead_cost_per_unit),
+            } if line else None,
+        })
+        result.append(row)
+    totals = blank()
+    for row in result:
+        for key in totals:
+            totals[key] += row[key]
+    totals = {k: round(v, 2) if isinstance(v, float) else v for k, v in totals.items()}
+    totals["unit_cost"] = round(totals["total_cost"] / totals["units"], 4) if totals["units"] else 0.0
+    return {"lines": result, "totals": totals}
+
+
+def monthly_cost_vs_sales(company, months=6):
+    """Per calendar month: invoiced sales against production cost of the
+    output finished that month. Powers the dashboard sales graph."""
+    from datetime import date
+    from django.db.models import Sum
+    from django.db.models.functions import TruncMonth
+    from sales.models import Invoice
+    from .models import ProductionOrder
+
+    today = date.today()
+    keys = []
+    year, month = today.year, today.month
+    for _ in range(months):
+        keys.append((year, month))
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+    keys.reverse()
+    start = date(keys[0][0], keys[0][1], 1)
+    data = {k: {"sales": 0.0, "production_cost": 0.0} for k in keys}
+    for row in Invoice.objects.filter(company=company, invoice_date__gte=start).exclude(status="cancelled") \
+            .annotate(m=TruncMonth("invoice_date")).values("m").annotate(t=Sum("total_amount")):
+        data[(row["m"].year, row["m"].month)]["sales"] = float(row["t"] or 0)
+    orders = ProductionOrder.objects.filter(
+        recipe__product__company=company, produced_quantity__gt=0, end_time__date__gte=start,
+    ).exclude(status="cancelled").select_related("recipe__product", "line")
+    for order in orders:
+        if order.is_rework or not order.end_time:
+            continue
+        key = (order.end_time.year, order.end_time.month)
+        if key in data:
+            data[key]["production_cost"] += order_cost(order)["actual"]["total_cost"]
+    return [
+        {"month": f"{y}-{m:02d}", "sales": round(v["sales"], 2), "production_cost": round(v["production_cost"], 2)}
+        for (y, m), v in data.items()
+    ]

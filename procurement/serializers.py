@@ -103,7 +103,11 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
         fields = [
             "id", "purchase_order", "item", "item_name", "item_unit", "item_sku",
             "quantity", "unit_of_measure", "unit_of_measure_code", "unit_price", "total_price",
+            "received_quantity", "remaining_quantity",
         ]
+        read_only_fields = ["received_quantity", "remaining_quantity"]
+
+    remaining_quantity = serializers.FloatField(read_only=True)
 
     def get_item_unit(self, obj):
         unit = obj.unit_of_measure or obj.item.purchase_unit or obj.item.base_unit
@@ -125,6 +129,11 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
             unit = item.purchase_unit or item.base_unit
         if company and unit and unit.company_id not in (None, company.id):
             raise serializers.ValidationError({"unit_of_measure": "Pick a shared unit or one belonging to your company."})
+        if item and unit and item.base_unit_id and unit.dimension != item.base_unit.dimension:
+            raise serializers.ValidationError({
+                "unit_of_measure": f"{item.name} is stocked in {item.base_unit.code}; "
+                                   f"{unit.code} is not a compatible unit."
+            })
         if item and unit and unit.company_id not in (None, getattr(item.company, "id", None)):
             raise serializers.ValidationError({"unit_of_measure": "The unit must be shared or belong to the item's company."})
         return attrs
@@ -225,10 +234,16 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
     # True when the received goods were held for incoming QC instead of being
     # added to stock (incoming QC required).
     held_for_qc = serializers.SerializerMethodField()
+    lines = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReceipt
         fields = "__all__"
+
+    def get_lines(self, obj):
+        return [{"po_item": l.po_item_id, "item": l.po_item.item.name, "quantity": l.quantity,
+                 "unit": l.po_item.unit_of_measure.code if l.po_item.unit_of_measure_id else l.po_item.item.unit}
+                for l in obj.lines.select_related("po_item__item", "po_item__unit_of_measure")]
 
     def get_held_for_qc(self, obj):
         from quality.models import QualityCheck

@@ -134,6 +134,7 @@ class PurchaseOrder(models.Model):
         ("pending", "Pending"),
         ("approved", "Approved"),
         ("ordered", "Ordered"),
+        ("partially_received", "Partially Received"),
         ("received", "Received"),
         ("cancelled", "Cancelled"),
     ]
@@ -162,6 +163,12 @@ class PurchaseOrderItem(models.Model):
         UnitOfMeasure, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0.00"))
+    # Running total received across goods receipts, in this line's unit.
+    received_quantity = models.FloatField(default=0)
+
+    @property
+    def remaining_quantity(self):
+        return max(self.quantity - self.received_quantity, 0)
 
     @property
     def total_price(self):
@@ -256,6 +263,17 @@ class GoodsReceipt(models.Model):
     purchase_order = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE)
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE)
     received_at = models.DateTimeField(auto_now_add=True)
+
+
+class GoodsReceiptLine(models.Model):
+    """What one delivery brought in against a purchase order line. A receipt
+    without lines is a legacy whole-order receipt."""
+    receipt = models.ForeignKey(GoodsReceipt, on_delete=models.CASCADE, related_name="lines")
+    po_item = models.ForeignKey("procurement.PurchaseOrderItem", on_delete=models.CASCADE, related_name="receipt_lines")
+    quantity = models.FloatField(help_text="Received quantity, in the PO line's unit")
+
+    def __str__(self):
+        return f"{self.quantity} x {self.po_item.item.name} on GRN-{self.receipt_id}"
 
 
 class Bill(models.Model):

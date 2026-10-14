@@ -363,7 +363,7 @@ def verify(dispatch, user=None):
 
 
 @transaction.atomic
-def confirm_dispatch(dispatch, user=None):
+def confirm_dispatch(dispatch, user=None, auto_invoice=None):
     """Goods leave: stock, allocations, order line shipped quantities, lot
     genealogy, COGS posting and (per settings) the invoice."""
     from inventory.lots import ship_lots_fifo
@@ -414,7 +414,9 @@ def confirm_dispatch(dispatch, user=None):
     from accounting.auto_posting import queue_auto_post
     queue_auto_post("dispatch_shipment", company, dispatch.id, user)
 
-    if ManufacturingSettings.for_company(company).auto_invoice_on_dispatch:
+    if auto_invoice is None:
+        auto_invoice = ManufacturingSettings.for_company(company).auto_invoice_on_dispatch
+    if auto_invoice:
         try:
             with transaction.atomic():
                 invoice_dispatch(dispatch, user)
@@ -500,8 +502,8 @@ def invoice_dispatch(dispatch, user=None):
             quantity=line.quantity, unit_price=price, amount=amount,
         )
         total += amount
-    invoice.total_amount = total
-    invoice.save(update_fields=["total_amount"])
+    from sales.pricing import apply_to_invoice
+    apply_to_invoice(invoice, order, total)
     dispatch.invoice = invoice
     dispatch.invoice_error = ""
     dispatch.save(update_fields=["invoice", "invoice_error"])
@@ -535,5 +537,12 @@ def order_fulfilment(order):
             "invoiced": invoiced_quantity(oi),
             "remaining": max(oi.quantity - oi.shipped_quantity, 0),
             "free_fg": free_fg(oi.item, order.customer.company),
+            # What a new delivery could carry right now: allocated-but-unpicked
+            # plus free stock, capped by what is still owed on the line.
+            "deliverable": max(min(
+                oi.quantity - oi.shipped_quantity - _on_open_dispatches(oi),
+                pickable(oi) + free_fg(oi.item, order.customer.company),
+            ), 0),
+            "unit": oi.item.unit,
         })
     return rows
