@@ -296,6 +296,10 @@ STATIC_URL = "static/"
 
 # AI Configuration
 AI_CONFIG = {
+    # Gemini is preferred when set. GIMINI_API_KEY (sic) is accepted because
+    # that is the spelling currently used in the local .env file.
+    "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY") or os.getenv("GIMINI_API_KEY"),
+    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-flash-latest"),
     # Set GROQ_API_KEY in the environment (Railway) or in the local .env file.
     "GROQ_API_KEY": os.getenv("GROQ_API_KEY"),
     # gpt-oss-20b: same family as the 120b we tuned prompts for, but a

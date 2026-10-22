@@ -40,16 +40,14 @@ def extract_order(email_body, subject=""):
     result so the caller records the email for manual handling.
     """
     config = getattr(settings, "AI_CONFIG", {})
-    api_key = config.get("GROQ_API_KEY")
-    if not api_key:
+    if not (config.get("GEMINI_API_KEY") or config.get("GROQ_API_KEY")):
         return {"customer": "", "pickup_date": None, "lines": [], "confidence": 0.0,
                 "note": "No AI model configured; needs manual entry."}
 
     try:
-        from groq import Groq
+        from ai_assistant.llm import get_llm
 
-        client = Groq(api_key=api_key)
-        model = config.get("MODEL", "llama-3.3-70b-versatile")
+        client, model, _ = get_llm(config)
         response = client.chat.completions.create(
             model=model,
             messages=[

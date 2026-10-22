@@ -7,3 +7,13 @@ class AccountsConfig(AppConfig):
     # of accounts_user/company/companysubscription and every FK pointing at them.
     default_auto_field = "django.db.models.AutoField"
     name = "accounts"
+
+    def ready(self):
+        from django.db.models.signals import post_migrate
+        post_migrate.connect(_ensure_superadmin, sender=self)
+
+
+def _ensure_superadmin(sender, **kwargs):
+    # After `migrate`, create the super admin if SUPERADMIN_EMAIL/PASSWORD are set.
+    from .superadmin import ensure_superadmin
+    ensure_superadmin()

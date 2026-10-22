@@ -13,7 +13,18 @@ from .views import (
     CompanyDataImportView,
 )
 
+from .superadmin import (
+    SuperAdminUsersView, SuperAdminBlockView, SuperAdminUnblockView, SuperAdminUserDeleteView,
+)
+
+from .views import NdaAcceptView
+
 urlpatterns = [
+    path("nda/accept/", NdaAcceptView.as_view()),
+    path("superadmin/users/", SuperAdminUsersView.as_view()),
+    path("superadmin/users/<int:pk>/", SuperAdminUserDeleteView.as_view()),
+    path("superadmin/users/<int:pk>/block/", SuperAdminBlockView.as_view()),
+    path("superadmin/users/<int:pk>/unblock/", SuperAdminUnblockView.as_view()),
     path("register/", RegisterView.as_view()),
     path("company/register/", CompanyRegisterView.as_view()),
     path("company/import-template/", ImportTemplateView.as_view()),

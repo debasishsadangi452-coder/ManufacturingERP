@@ -11,7 +11,7 @@ from django.utils import timezone
 from accounts.permission import IsSales, IsAdmin, IsStore, IsFinance, IsProduction, IsQuality
 
 from .models import (
-    Customer, CustomerPayment, DiscountType, Invoice, InvoiceLine, SalesOrder, SalesOrderItem, Shipment, SummaryInvoice,
+    Customer, CustomerPayment, DiscountType, Invoice, InvoiceLine, Quotation, SalesOrder, SalesOrderItem, Shipment, SummaryInvoice,
 )
 from .serializers import *
 
@@ -27,6 +27,51 @@ def approved_finished_goods_available(item, company, order=None):
     acceptance) minus what is allocated to other customer orders."""
     from fulfillment.services import available_for_order
     return available_for_order(item, company, order)
+
+
+def notify_order_shortages(order):
+    # Check stock for each item and notify if production/materials needed
+    for order_item in order.salesorderitem_set.all():
+        item = order_item.item
+        requested_qty = order_item.quantity
+
+        available_qty = approved_finished_goods_available(item, order.customer.company)
+
+        if available_qty < requested_qty:
+            shortage = requested_qty - available_qty
+
+            # Verify item has a recipe (cannot produce without one)
+            recipe = Recipe.objects.filter(product=item).first()
+            if not recipe:
+                send_notification(
+                    "admin",
+                    f"CRITICAL: SO#{order.id} needs {item.name}, but NO RECIPE is defined!",
+                    related_id=order.id,
+                    related_type="sales_order",
+                    company=order.customer.company,
+                    module="sales",
+                )
+                continue
+
+            # Notify Production to start a new batch
+            send_notification(
+                "production",
+                f"FULFILLMENT REQ: Produce {shortage} {item.unit} of {item.name} for SO#{order.id}",
+                related_id=order.id,
+                related_type="sales_order",
+                company=order.customer.company,
+                module="production",
+            )
+
+            # Notify Store (Inventory) to gather raw materials for this production
+            send_notification(
+                "store",
+                f"GATHERING REQ: Prepare raw materials for production of {item.name} (SO#{order.id})",
+                related_id=order.id,
+                related_type="sales_order",
+                company=order.customer.company,
+                module="inventory",
+            )
 
 
 class CustomerViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
@@ -67,53 +112,51 @@ class SalesOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         )
         return Response(SalesOrderSerializer(order, context=self.get_serializer_context()).data)
 
+    @action(detail=False, methods=["get"], permission_classes=[IsAdmin])
+    def profit_summary(self, request):
+        """Admin: revenue, cost and profit for every sales order (newest first)."""
+        from .profit import sales_order_profit
+        orders = self.get_queryset().exclude(status__in=("cancelled", "draft"))[:200]
+        rows = [sales_order_profit(o) for o in orders]
+        total_rev = sum(r["revenue"] for r in rows)
+        total_profit = sum(r["profit"] for r in rows)
+        return Response({
+            "totals": {"revenue": round(total_rev, 2), "cost": round(sum(r["cost"] for r in rows), 2),
+                       "profit": round(total_profit, 2),
+                       "margin_percent": round(total_profit / total_rev * 100, 1) if total_rev else 0.0},
+            "orders": rows,
+        })
+
+    @action(detail=True, methods=["get"], permission_classes=[IsAdmin])
+    def profit(self, request, pk=None):
+        from .profit import sales_order_profit
+        return Response(sales_order_profit(self.get_object()))
+
+    @action(detail=True, methods=["post"])
+    def close_order(self, request, pk=None):
+        """Close a partly delivered order for good: what was delivered stands, the
+        undelivered balance is dropped and the order is marked delivered so it can
+        be invoiced for what was sent."""
+        order = self.get_object()
+        lines = order.salesorderitem_set.all()
+        delivered = any(l.shipped_quantity > 0 for l in lines)
+        owed = any(l.shipped_quantity + 1e-6 < l.quantity for l in lines)
+        if order.status not in ("pending", "confirmed", "shipped") or not delivered or not owed:
+            return Response({"error": "Only a partly delivered order can be closed short."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        order.status = "delivered"
+        note = f"Closed short on {timezone.localdate().isoformat()} by {request.user.username}."
+        order.delivery_requirements = f"{order.delivery_requirements}\n{note}".strip()
+        order.save(update_fields=["status", "delivery_requirements"])
+        log_activity(request.user, "Sales", "Close Order", f"SO-{order.id} closed with the undelivered balance dropped")
+        return Response(SalesOrderSerializer(order, context=self.get_serializer_context()).data)
+
     def perform_create(self, serializer):
         order = serializer.save()
         items_summary = ', '.join([f"{i.quantity} x {i.item.name}" for i in order.salesorderitem_set.all()])
         log_activity(self.request.user, "Sales", "Create Sales Order", f"Created SO #{order.id} for customer '{order.customer.name}': {items_summary}")
         
-        # Check stock for each item and notify if production/materials needed
-        for order_item in order.salesorderitem_set.all():
-            item = order_item.item
-            requested_qty = order_item.quantity
-            
-            available_qty = approved_finished_goods_available(item, order.customer.company)
-            
-            if available_qty < requested_qty:
-                shortage = requested_qty - available_qty
-                
-                # Verify item has a recipe (cannot produce without one)
-                recipe = Recipe.objects.filter(product=item).first()
-                if not recipe:
-                    send_notification(
-                        "admin",
-                        f"CRITICAL: SO#{order.id} needs {item.name}, but NO RECIPE is defined!",
-                        related_id=order.id,
-                        related_type="sales_order",
-                        company=order.customer.company,
-                        module="sales",
-                    )
-                    continue
-
-                # Notify Production to start a new batch
-                send_notification(
-                    "production",
-                    f"FULFILLMENT REQ: Produce {shortage} {item.unit} of {item.name} for SO#{order.id}",
-                    related_id=order.id,
-                    related_type="sales_order",
-                    company=order.customer.company,
-                    module="production",
-                )
-                
-                # Notify Store (Inventory) to gather raw materials for this production
-                send_notification(
-                    "store",
-                    f"GATHERING REQ: Prepare raw materials for production of {item.name} (SO#{order.id})",
-                    related_id=order.id,
-                    related_type="sales_order",
-                    company=order.customer.company,
-                    module="inventory",
-                )
+        notify_order_shortages(order)
 
     @action(detail=True, methods=['post'])
     def mark_ready_for_production(self, request, pk=None):
@@ -1269,3 +1312,64 @@ class PriceListViewSet(viewsets.ViewSet):
         item.save(update_fields=["base_unit", "purchase_unit", "unit"])
         log_activity(request.user, "Sales", "Set Item Unit", f"'{item.name}' is measured in {unit.code}")
         return Response(self._row(item))
+
+
+class QuotationViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
+    """Quotations: priced offers that can be converted into sales orders."""
+    company_field = "company"
+    queryset = Quotation.objects.select_related("customer", "converted_order").prefetch_related("lines__item")
+    serializer_class = QuotationSerializer
+    permission_classes = [IsSales | IsAdmin]
+
+    def create(self, request, *args, **kwargs):
+        from .quotations import save_quotation
+        quotation = save_quotation(request.user.company, request.user, request.data)
+        log_activity(request.user, "Sales", "Create Quotation", f"Created {quotation.quote_number} for '{quotation.customer.name}'")
+        return Response(QuotationSerializer(quotation).data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        from .quotations import save_quotation
+        quotation = save_quotation(request.user.company, request.user, request.data, quotation=self.get_object())
+        return Response(QuotationSerializer(quotation).data)
+
+    def partial_update(self, request, *args, **kwargs):
+        # Quotations are edited as a whole document, so a PATCH carries the full form.
+        return self.update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        if self.get_object().status == "converted":
+            raise ValidationError({"status": "A converted quotation is part of the order history and cannot be deleted."})
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"])
+    def set_status(self, request, pk=None):
+        """draft -> sent -> accepted / rejected (and back to draft to rework)."""
+        quotation = self.get_object()
+        target = request.data.get("status")
+        allowed = {
+            "draft": ("sent", "accepted", "rejected"),
+            "sent": ("draft", "accepted", "rejected"),
+            "accepted": ("draft", "rejected"),
+            "rejected": ("draft",),
+            "converted": (),
+        }
+        if target not in allowed.get(quotation.status, ()):
+            raise ValidationError({"status": f"Cannot move a {quotation.get_status_display().lower()} quotation to '{target}'."})
+        quotation.status = target
+        quotation.save(update_fields=["status", "updated_at"])
+        log_activity(request.user, "Sales", "Update Quotation", f"{quotation.quote_number} marked {target}")
+        return Response(QuotationSerializer(quotation).data)
+
+    @action(detail=True, methods=["post"])
+    def convert(self, request, pk=None):
+        """Convert into a sales order. Optional body: {"prices": {"<line id>": price}};
+        without it the quoted prices are kept."""
+        from .quotations import convert_to_order
+        quotation = self.get_object()
+        order = convert_to_order(quotation, prices=request.data.get("prices"), user=request.user)
+        log_activity(request.user, "Sales", "Convert Quotation", f"{quotation.quote_number} converted to SO #{order.id}")
+        notify_order_shortages(order)
+        return Response({
+            "quotation": QuotationSerializer(quotation).data,
+            "sales_order": SalesOrderSerializer(order, context=self.get_serializer_context()).data,
+        }, status=status.HTTP_201_CREATED)

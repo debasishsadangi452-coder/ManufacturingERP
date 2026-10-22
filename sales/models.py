@@ -356,3 +356,73 @@ class InboundOrderEmail(models.Model):
 
     def __str__(self):
         return f"Inbound order from {self.sender} ({self.status})"
+
+
+# -------------------------------------------------
+# Quotations
+# -------------------------------------------------
+
+class Quotation(models.Model):
+    """A priced offer to a customer. Becomes a SalesOrder on acceptance
+    (see sales.quotations.convert_to_order); until then it reserves no stock
+    and triggers no production."""
+
+    STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("sent", "Sent"),
+        ("accepted", "Accepted"),
+        ("rejected", "Rejected"),
+        ("converted", "Converted to order"),
+    ]
+    EDITABLE_STATUSES = ("draft", "sent")
+
+    company = models.ForeignKey(
+        "accounts.Company", null=True, blank=True, on_delete=models.CASCADE, related_name="+"
+    )
+    customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name="quotations")
+    quote_number = models.CharField(max_length=30, blank=True, default="", db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
+    valid_until = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True, default="")
+    terms = models.TextField(blank=True, default="")
+    # total = subtotal - discount_amount + tax_amount
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    tax_label = models.CharField(max_length=60, blank=True, default="")
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    converted_order = models.OneToOneField(
+        SalesOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="source_quotation"
+    )
+    created_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    @property
+    def is_expired(self):
+        return bool(
+            self.valid_until and self.valid_until < timezone.localdate()
+            and self.status in ("draft", "sent")
+        )
+
+    def __str__(self):
+        return self.quote_number or f"Quotation {self.pk}"
+
+
+class QuotationItem(models.Model):
+    quotation = models.ForeignKey(Quotation, on_delete=models.CASCADE, related_name="lines")
+    item = models.ForeignKey(Item, on_delete=models.CASCADE)
+    quantity = models.FloatField()
+    # What the customer is quoted; list_price is the catalog price when quoted,
+    # so a negotiated difference stays visible.
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    list_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    class Meta:
+        ordering = ["id"]

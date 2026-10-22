@@ -235,3 +235,13 @@ class CompanyDataImportView(APIView):
             return Response({"ok": False, "errors": result["errors"]},
                             status=status.HTTP_400_BAD_REQUEST)
         return Response({"ok": True, "summary": result["summary"]}, status=status.HTTP_200_OK)
+
+
+class NdaAcceptView(APIView):
+    """Records that the user accepted the NDA for this login (audit trail)."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from core.utils import log_activity
+        log_activity(request.user, "Security", "Accept NDA", f"{request.user.username} accepted the NDA at login")
+        return Response({"accepted": True})

@@ -27,6 +27,8 @@ class User(AbstractUser):
         ('quality', 'Quality'),
         ('sales', 'Sales'),
         ('finance', 'Finance'),
+        # Platform owner, above every company: manages users, no tenant data access.
+        ('superadmin', 'Super Admin'),
     ]
 
     role = models.CharField(max_length=20, choices=ROLE_CHOICES)

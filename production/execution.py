@@ -143,6 +143,27 @@ def build_operations(order):
 
 
 @transaction.atomic
+def auto_schedule(order):
+    """Give a new order the next free slot on finite capacity.
+
+    Orders created without a planned start are never left "not scheduled": they
+    are forward-scheduled into the earliest window every resource is free. A
+    scheduling failure (e.g. no capacity in the horizon) is not fatal — the
+    order simply stays unscheduled for a planner to place by hand.
+    """
+    if order.planned_start:
+        return False
+    from .scheduling import schedule_order
+    try:
+        schedule_order(order)
+        order.refresh_from_db(fields=["planned_start", "planned_end"])
+        return True
+    except Exception as exc:  # ValidationError or an unexpected calendar problem
+        import logging
+        logging.getLogger(__name__).warning("Auto-schedule of %s skipped: %s", order, exc)
+        return False
+
+
 def create_production_order(recipe, quantity, warehouse, *, sales_order=None, plan_ref="",
                             line=None, planned_start=None, planned_end=None, status="scheduled",
                             plan_approved=True, notes="", materials_reserved=False,
@@ -175,6 +196,7 @@ def create_production_order(recipe, quantity, warehouse, *, sales_order=None, pl
         rework_source_lot=rework_source_lot,
     )
     build_operations(order)
+    auto_schedule(order)
     return order, checks
 
 

@@ -325,3 +325,29 @@ class SummaryInvoiceSerializer(serializers.ModelSerializer):
 
     def get_balance_due(self, obj):
         return sum((i.balance_due for i in obj.invoices.all()), 0)
+
+
+class QuotationItemSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source="item.name", read_only=True)
+    unit = serializers.CharField(source="item.unit", read_only=True)
+
+    class Meta:
+        model = QuotationItem
+        fields = ["id", "item", "item_name", "unit", "quantity", "unit_price", "list_price"]
+
+
+class QuotationSerializer(serializers.ModelSerializer):
+    """Read-side only; writes go through sales.quotations.save_quotation."""
+    items = QuotationItemSerializer(source="lines", many=True, read_only=True)
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+    converted_order_id = serializers.IntegerField(read_only=True)
+    is_expired = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Quotation
+        fields = [
+            "id", "quote_number", "customer", "customer_name", "status", "is_expired", "valid_until",
+            "notes", "terms", "items", "subtotal", "discount_percent", "discount_amount",
+            "tax_amount", "tax_label", "total_amount", "converted_order_id", "created_at", "updated_at",
+        ]
+        read_only_fields = fields

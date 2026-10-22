@@ -7,6 +7,7 @@ from .views import (
     InboundOrderEmailViewSet,
     InvoiceViewSet,
     PriceListViewSet,
+    QuotationViewSet,
     SalesOrderViewSet,
     SalesOrderItemViewSet,
     ShipmentViewSet,
@@ -15,6 +16,7 @@ from .views import (
 router = DefaultRouter()
 
 router.register(r'customers', CustomerViewSet)
+router.register(r"quotations", QuotationViewSet)
 router.register(r'sales-orders', SalesOrderViewSet)
 router.register(r'sales-order-items', SalesOrderItemViewSet)
 router.register(r'shipments', ShipmentViewSet)

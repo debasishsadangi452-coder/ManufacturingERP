@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from .models import User, Company, CompanySubscription, generate_username
@@ -172,6 +173,11 @@ class EmailOrUsernameTokenObtainPairSerializer(TokenObtainPairSerializer):
                 match = same[0] if len(same) == 1 else None
             if match:
                 attrs[self.username_field] = match.username
+        # Tell a blocked user why they cannot sign in (only once the password is right,
+        # so this does not reveal which accounts exist).
+        blocked = User.objects.filter(username=attrs[self.username_field], is_active=False).first()
+        if blocked and blocked.check_password(attrs.get("password", "")):
+            raise AuthenticationFailed("This account has been blocked by the platform administrator.")
         return super().validate(attrs)
 
 

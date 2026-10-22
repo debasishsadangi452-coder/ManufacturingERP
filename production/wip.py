@@ -115,6 +115,8 @@ def wip_row(order):
         "start_time": order.start_time,
         "planned_start": order.planned_start,
         "planned_end": order.planned_end,
+        "is_scheduled": bool(order.planned_start or order.start_time),
+        "created_at": order.created_at,
         "expected_completion": expected,
         "actual_completion": order.end_time,
         "delayed": delayed,

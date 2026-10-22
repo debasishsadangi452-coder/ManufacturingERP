@@ -94,6 +94,48 @@ class ItemViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     serializer_class = ItemSerializer
     permission_classes = [IsStore | IsProduction | IsAdmin]
 
+    @action(detail=True, methods=["get"])
+    def history(self, request, pk=None):
+        """Every stock movement of this item, newest first, with the balance after each.
+
+        `received` = stock coming in (procurement receipts, production output, returns),
+        `used` = stock leaving (issued to production, shipped, written off).
+        """
+        item = self.get_object()
+        movements = list(StockMovement.objects.filter(item=item).select_related("warehouse", "created_by")
+                         .order_by("created_at", "id"))
+
+        def signed(m):
+            return -m.quantity if m.movement_type == "OUT" else m.quantity
+
+        current = sum(s.quantity for s in Stock.objects.filter(item=item))
+        balance = current - sum(signed(m) for m in movements)
+        rows = []
+        for m in movements:
+            balance += signed(m)
+            ref = (m.reference or "").lower()
+            if m.movement_type == "IN":
+                kind = "Received from procurement" if any(k in ref for k in ("po", "receipt", "purchase", "grn", "procure")) else "Stock in"
+            elif m.movement_type == "OUT":
+                kind = "Issued to production" if any(k in ref for k in ("production", "reserved", "batch", "prd")) else (
+                    "Shipped to customer" if any(k in ref for k in ("so", "ship", "dispatch", "deliver")) else "Stock out")
+            else:
+                kind = "Adjustment"
+            rows.append({
+                "id": m.id, "date": m.created_at, "kind": kind, "type": m.movement_type,
+                "quantity": signed(m), "balance_after": round(balance, 6), "warehouse": m.warehouse.name,
+                "reference": m.reference, "by": m.created_by.username if m.created_by else None,
+            })
+        received = sum(r["quantity"] for r in rows if r["quantity"] > 0)
+        used = -sum(r["quantity"] for r in rows if r["quantity"] < 0)
+        return Response({
+            "item": {"id": item.id, "name": item.name, "unit": item.unit, "category": item.category},
+            "on_hand": current,
+            "totals": {"received": received, "used": used,
+                       "issued_to_production": -sum(r["quantity"] for r in rows if r["kind"] == "Issued to production")},
+            "movements": list(reversed(rows)),
+        })
+
     def get_queryset(self):
         """Hide items classified as out-of-scope from the ERP.
 

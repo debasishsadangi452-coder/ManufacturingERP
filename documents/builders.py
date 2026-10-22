@@ -16,7 +16,7 @@ from inventory.models import Batch, StockTransfer
 from production.models import ProductionOrder, ProductionPlan
 from procurement.models import Bill, GoodsReceipt, PurchaseOrder
 from quality.models import QualityCheck
-from sales.models import Invoice, SalesOrder, SummaryInvoice
+from sales.models import Invoice, Quotation, SalesOrder, SummaryInvoice
 
 
 def _n(value, places=4):
@@ -561,6 +561,40 @@ def sales_quotation_doc(order):
     return doc
 
 
+def quotation_doc(q):
+    customer = q.customer
+    doc = _base(q.company or customer.company, "Quotation", q.quote_number, q.get_status_display())
+    doc["subtitle"] = "Price quotation. It becomes a customer order on acceptance."
+    doc["meta"] = [
+        ("Customer", customer.name), ("Address", customer.address),
+        ("Contact", customer.email or customer.phone or None),
+        ("Quotation date", q.created_at.date().isoformat() if q.created_at else None),
+        ("Valid until", q.valid_until.isoformat() if q.valid_until else None),
+        ("Payment terms", customer.payment_terms or None),
+    ]
+    rows = [[_c(l.item.name), _c(l.item.unit), _c(_n(l.quantity), True), _c(_money(l.unit_price), True),
+             _c(_money(Decimal(str(l.quantity)) * l.unit_price), True)]
+            for l in q.lines.select_related("item")]
+    doc["tables"] = [_table("Quoted items", ["Item", "Unit", ("Quantity", True), ("Unit price", True), ("Amount", True)], rows)]
+    totals = []
+    if q.discount_amount or q.tax_amount:
+        totals.append(("Subtotal", _money(q.subtotal)))
+        if q.discount_amount:
+            totals.append((f"Discount ({q.discount_percent:g}%)", "-" + _money(q.discount_amount)))
+        if q.tax_amount:
+            totals.append((q.tax_label or "Tax", _money(q.tax_amount)))
+    totals.append(("Total", _money(q.total_amount)))
+    doc["totals"] = totals
+    if q.notes:
+        doc["notes"].append(q.notes)
+    if q.terms:
+        doc["notes"].append(q.terms)
+    doc["notes"].append("Prices are valid until the date shown and are subject to stock availability at order.")
+    doc["signatures"] = ["Issued by", "Accepted by (name, date, stamp)"]
+    doc["references"] = q.quote_number
+    return doc
+
+
 def packing_note_doc(d):
     doc = _base(d.company, "Packing Note", d.dispatch_number, d.get_status_display())
     meta = _dispatch_meta(d)
@@ -687,6 +721,7 @@ DOCUMENTS = {
     "invoice": ("Commercial Sales Invoice", Invoice, "company", invoice_doc),
     "stock_transfer": ("Stock Transfer Voucher", StockTransfer, "company", stock_transfer_doc),
     "pro_forma_invoice": ("Pro Forma Invoice", SalesOrder, "customer__company", pro_forma_invoice_doc),
+    "quotation": ("Quotation", Quotation, "company", quotation_doc),
     "sales_quotation": ("Sales Quotation", SalesOrder, "customer__company", sales_quotation_doc),
     "packing_note": ("Packing Note", Dispatch, "company", packing_note_doc),
     "summary_invoice": ("Summary Invoice", SummaryInvoice, "company", summary_invoice_doc),

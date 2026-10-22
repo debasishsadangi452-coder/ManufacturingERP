@@ -2,6 +2,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from groq import Groq
+from .llm import GeminiClient, gemini_api_key, DEFAULT_GEMINI_MODEL
 import logging
 import json
 from .tools import TOOLS_DEFINITION, TOOL_MAP
@@ -114,7 +115,10 @@ def extract_po_from_image(client, image_data: str, config: dict) -> str | None:
     Call a vision-capable model to pull purchase order details out of an image.
     Returns plain text describing what was found, or None on failure.
     """
-    vision_model = config.get('VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')
+    if gemini_api_key(config):
+        vision_model = config.get('GEMINI_MODEL') or DEFAULT_GEMINI_MODEL
+    else:
+        vision_model = config.get('VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')
 
     if not image_data.startswith('data:'):
         image_data = f'data:image/jpeg;base64,{image_data}'
@@ -180,20 +184,25 @@ class ChatView(APIView):
             }, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
         config = getattr(settings, 'AI_CONFIG', {})
-        api_key = config.get('GROQ_API_KEY')
+        gemini_key = gemini_api_key(config)
+        api_key = gemini_key or config.get('GROQ_API_KEY')
         if not api_key:
             return Response({
                 "response": (
                     f"⚙️ {agent['name']} is not connected to an AI model yet. "
-                    "Add GROQ_API_KEY to the backend .env file and restart the server to enable the AI Team."
+                    "Add GEMINI_API_KEY to the backend .env file and restart the server to enable the AI Team."
                 ),
                 "refresh": False,
                 "actions": [],
                 "agent": agent_slug,
                 "agent_name": agent["name"],
             }, status=status.HTTP_200_OK)
-        client = Groq(api_key=api_key)
-        model = config.get('MODEL', "llama-3.1-8b-instant")
+        if gemini_key:
+            client = GeminiClient(gemini_key)
+            model = config.get('GEMINI_MODEL') or DEFAULT_GEMINI_MODEL
+        else:
+            client = Groq(api_key=api_key)
+            model = config.get('MODEL', "llama-3.1-8b-instant")
 
         # Count the message once we know a real AI call will be made
         consume_ai_message(subscription)
@@ -265,14 +274,14 @@ class ChatView(APIView):
                 except Exception as e:
                     error_msg = str(e)
                     if "tool call validation failed" in error_msg.lower() or "failed to call a function" in error_msg.lower():
-                        logger.warning(f"Groq tool error, asking AI to retry: {error_msg}")
+                        logger.warning(f"LLM tool error, asking AI to retry: {error_msg}")
                         messages.append({
                             "role": "user", 
                             "content": f"SYSTEM ERROR: {error_msg}. Please correct your tool arguments, avoid mixing text with tool calls, and ONLY use tools from the provided definitions."
                         })
                         continue
                     # Log the error and raise to avoid useless fallback on small TPM models
-                    logger.error(f"Groq primary model error: {e}")
+                    logger.error(f"LLM primary model error: {e}")
                     raise e
 
                 response_message = response.choices[0].message
@@ -428,7 +437,7 @@ class ChatView(APIView):
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
-            logger.exception("Groq Integration Error")
+            logger.exception("AI Integration Error")
             return Response({
                 "error": "AI Assistant error",
                 "details": str(e)

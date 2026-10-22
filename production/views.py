@@ -281,6 +281,7 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
 
         order = serializer.save()
         execution.build_operations(order)
+        execution.auto_schedule(order)
         log_activity(self.request.user, "Production", "Create Production Order", f"Created {order.order_number} for {order.quantity} x '{order.recipe.product.name}'")
 
     # ---------------------------------------------
@@ -521,6 +522,18 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
                                            commit=request.data.get("dry_run") not in (True, "true", "1")))
         except ValidationError as e:
             return _bad(e)
+
+    @action(detail=False, methods=["post"])
+    def schedule_unscheduled(self, request):
+        """Place every open order that has no planned start into its next free slot,
+        oldest first, so earlier orders keep their place in the queue."""
+        orders = self.get_queryset().filter(
+            status__in=ProductionOrder.ACTIVE_STATUSES, planned_start__isnull=True, start_time__isnull=True
+        ).order_by("created_at", "id")
+        scheduled, failed = [], []
+        for order in orders:
+            (scheduled if execution.auto_schedule(order) else failed).append(order.order_number)
+        return Response({"scheduled": scheduled, "failed": failed})
 
     @action(detail=True, methods=["post"])
     def record_scrap(self, request, pk=None):
