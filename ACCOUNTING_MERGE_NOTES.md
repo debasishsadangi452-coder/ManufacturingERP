@@ -6,7 +6,7 @@
 
 ## What was merged
 
-The accounting feature branches form a linear stack. Each one builds on the previous one. They were merged into `main`v one at a time, in order, with `--no-ff`, so every blueprint shows up as its own merge commit:
+The accounting feature branches form a linear stack. Each one builds on the previous one. They were merged into `main` one at a time, in order, with `--no-ff`, so every blueprint shows up as its own merge commit:
 
 | # | Branch | Merge commit | Adds |
 |---|--------|--------------|------|
