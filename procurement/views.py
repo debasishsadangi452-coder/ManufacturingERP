@@ -745,6 +745,58 @@ class PurchaseRequisitionViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
     filterset_fields = ["status", "production_plan", "sales_order"]
 
     @action(detail=False, methods=["post"])
+    def create_from_production_order(self, request):
+        """Raise a purchase requisition for what a work order is short of (shop floor).
+
+        Idempotent per work order: an open requisition already raised for it is
+        returned instead of a duplicate. Sub-products are made in-house, so only
+        bought-in components are requested.
+        """
+        from production.execution import material_lines
+        from production.models import ProductionOrder
+        order = ProductionOrder.objects.filter(
+            pk=request.data.get("production_order"), recipe__product__company=request.user.company
+        ).select_related("recipe__product", "production_plan", "sales_order").first()
+        if order is None:
+            return Response({"error": "Work order not found."}, status=status.HTTP_404_NOT_FOUND)
+        tag = f"[{order.order_number or 'PRD-' + str(order.id)}]"
+        existing = PurchaseRequisition.objects.filter(
+            company=request.user.company, notes__contains=tag,
+            status__in=["draft", "submitted", "approved", "converted"],
+        ).first()
+        if existing:
+            return Response({
+                "message": f"{existing.requisition_number} was already raised for {order.order_number}.",
+                "requisition": PurchaseRequisitionSerializer(existing).data, "created": False,
+            })
+        short = [l for l in material_lines(order) if l["shortage"] > 1e-6 and not l["is_sub_product"]]
+        if not short:
+            return Response({"message": f"{order.order_number} has no pending bought-in materials.",
+                             "created": False, "has_shortage": False})
+        warehouse = order.warehouse
+        with transaction.atomic():
+            req = PurchaseRequisition.objects.create(
+                company=request.user.company, warehouse=warehouse, production_plan=order.production_plan,
+                sales_order=order.sales_order, status="submitted", created_by=request.user,
+                notes=f"{tag} Raised from the shop floor: materials pending for {order.recipe.product.name}. "
+                      f"{request.data.get('notes') or ''}".strip(),
+            )
+            for line in short:
+                item = Item.objects.get(pk=line["item_id"])
+                v_price = VendorPriceList.objects.filter(item=item, is_active=True).first()
+                PurchaseRequisitionItem.objects.create(
+                    requisition=req, item=item, required_quantity=line["needed"], available_quantity=line["on_hand"],
+                    shortage_quantity=line["shortage"], uom=item.unit or "unit",
+                    estimated_unit_price=v_price.unit_price if v_price else (item.purchase_cost or Decimal("0.00")),
+                )
+            log_activity(request.user, "Procurement", "Create Purchase Requirement",
+                         f"{req.requisition_number} raised from {order.order_number}: "
+                         + ", ".join(f"{l['shortage']} {l['unit']} {l['name']}" for l in short))
+        return Response({"message": f"Purchase requisition {req.requisition_number} raised.",
+                         "requisition": PurchaseRequisitionSerializer(req).data, "created": True},
+                        status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"])
     def create_from_mrp(self, request):
         """
         Creates or retrieves a persistent PurchaseRequisition from an MRP shortage result.
