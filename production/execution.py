@@ -329,6 +329,10 @@ def material_lines(order, quantity=None):
         need = max(required * fraction - issued, 0)
         on_hand = sum(s.quantity for s in _stocks(item))
         shortage = max(need - on_hand, 0) if need > EPS else 0
+        # Unit conversion leaves float dust (needed 16,620.19 vs on hand 16,620.19 is
+        # not a real shortage): ignore gaps below one part in a million.
+        if shortage <= max(1e-4, need * 1e-6):
+            shortage = 0
         held = on_order = 0.0
         expected = None
         if shortage > EPS and not item.is_semi_finished:
@@ -342,6 +346,66 @@ def material_lines(order, quantity=None):
             "is_sub_product": item.is_semi_finished,
         })
     return rows
+
+
+def sub_work_order_for(order, item):
+    """The open work order that makes sub-product `item` for final-product `order`,
+    if one exists: started from this order, or from its production plan / customer
+    order. Used so a sub-product is never started twice."""
+    from django.db.models import Q
+    scope = Q(production_plan_ref=sub_plan_ref(order, item))
+    if order.production_plan_id:
+        scope |= Q(production_plan_id=order.production_plan_id)
+    if order.sales_order_id:
+        scope |= Q(sales_order_id=order.sales_order_id)
+    return (
+        ProductionOrder.objects.filter(scope, recipe__product=item)
+        .exclude(pk=order.pk).exclude(status__in=("completed", "closed", "cancelled")).first()
+    )
+
+
+def sub_plan_ref(order, item):
+    return f"{order.order_number} · SFG {item.name}"
+
+
+def start_sub_product(order, item, user, quantity=None):
+    """Start the work order for sub-product `item` that `order` needs and nobody
+    has started yet. Returns (sub_order, shortages)."""
+    from inventory.models import Warehouse
+    from .models import Recipe
+    if order.status in ("completed", "closed", "cancelled"):
+        raise ValidationError(f"{order.order_number} is {order.get_status_display()}.")
+    line = next((l for l in material_lines(order) if l["item_id"] == item.id and l["is_sub_product"]), None)
+    if line is None:
+        raise ValidationError(f"{item.name} is not a sub-product of {order.order_number}.")
+    existing = sub_work_order_for(order, item)
+    if existing:
+        raise ValidationError(
+            f"{item.name} already has work order {existing.order_number} ({existing.get_status_display()}) — "
+            "find it on the shop floor."
+        )
+    qty = float(quantity) if quantity not in (None, "") else line["shortage"]
+    if qty <= EPS:
+        raise ValidationError(f"{item.name} is already in stock for {order.order_number}; nothing to make.")
+    recipe = Recipe.objects.filter(product=item).first()
+    if recipe is None:
+        raise ValidationError(f"No recipe/BOM for sub-product '{item.name}'. Define it before producing.")
+    company = order.recipe.product.company
+    warehouse = (Warehouse.objects.filter(company=company, warehouse_type="production").first()
+                 or Warehouse.objects.filter(company=company).first())
+    if warehouse is None:
+        raise ValidationError("No warehouse available for production.")
+    sub, _ = create_production_order(
+        recipe, qty, warehouse, sales_order=order.sales_order, plan_ref=sub_plan_ref(order, item), status="scheduled",
+        notes=f"Sub-product for {order.order_number} ({order.recipe.product.name}), started from the shop floor.",
+    )
+    if order.production_plan_id:
+        ProductionOrder.objects.filter(pk=sub.pk).update(production_plan_id=order.production_plan_id)
+    shortages = reserve_materials(sub, user)
+    if shortages:
+        sub.status = "material_pending"
+        sub.save(update_fields=["status"])
+    return sub, shortages
 
 
 def material_shortfalls(order, quantity=None, lines=None):
@@ -364,9 +428,22 @@ def material_shortfalls(order, quantity=None, lines=None):
     return out
 
 
+def _to_stock_unit(item, quantity, unit):
+    """`quantity` given in `unit` (a PO line's purchase unit) expressed in the
+    item's stock unit; unchanged when no conversion is set up."""
+    if not quantity or unit is None or not getattr(item, "base_unit_id", None) or unit.pk == item.base_unit_id:
+        return float(quantity or 0)
+    from inventory.uom import UomConversionError, convert
+    try:
+        return float(convert(quantity, unit, item.base_unit, item=item))
+    except UomConversionError:
+        return float(quantity)
+
+
 def _incoming_pipeline(item):
     """(qty received but held at incoming QC, qty on open POs, earliest expected
-    delivery of those POs)."""
+    delivery of those POs) — all in the item's stock unit, the unit on-hand and
+    requirements use."""
     from django.db.models import Min, Sum
     from quality.models import QualityCheck
     from procurement.models import PurchaseOrderItem
@@ -375,9 +452,10 @@ def _incoming_pipeline(item):
     ).aggregate(t=Sum("received_quantity"))["t"] or 0
     open_lines = PurchaseOrderItem.objects.filter(
         item=item, purchase_order__status__in=("draft", "pending", "approved", "ordered", "partially_received"),
-    )
-    agg = open_lines.aggregate(t=Sum("quantity"), r=Sum("received_quantity"), d=Min("purchase_order__expected_delivery"))
-    return float(held), float((agg["t"] or 0) - (agg["r"] or 0)), agg["d"]
+    ).select_related("unit_of_measure")
+    on_order = sum(_to_stock_unit(item, max(l.quantity - l.received_quantity, 0), l.unit_of_measure) for l in open_lines)
+    expected = open_lines.aggregate(d=Min("purchase_order__expected_delivery"))["d"]
+    return float(held), float(on_order), expected
 
 
 def material_status(order):

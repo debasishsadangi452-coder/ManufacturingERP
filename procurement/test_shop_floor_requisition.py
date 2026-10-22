@@ -39,3 +39,33 @@ class ShopFloorRequisitionTests(TestCase):
                                          company=Company.objects.create(name="Other Co"))
         self.client.force_authenticate(other)
         self.assertEqual(self.client.post(URL, {"production_order": self.order.id}, format="json").status_code, 404)
+
+
+class MaterialLineAccuracyTests(TestCase):
+    def setUp(self):
+        from inventory.models import UnitOfMeasure
+        self.company = Company.objects.create(name="Units Co")
+        self.wh = Warehouse.objects.create(company=self.company, name="Plant", location="x", warehouse_type="production")
+        self.kg = UnitOfMeasure.objects.create(company=self.company, code="kg", name="Kilogram", dimension="mass", is_base=True)
+        self.tonne = UnitOfMeasure.objects.create(company=self.company, code="t", name="Tonne", dimension="mass",
+                                                  to_base_factor=1000)
+        self.fg = Item.objects.create(company=self.company, name="Cookie", category="finished_good", unit="each")
+        self.raw = Item.objects.create(company=self.company, name="Colour", category="raw_material", unit="kg", base_unit=self.kg)
+        recipe = Recipe.objects.create(product=self.fg, batch_size=1)
+        RecipeIngredient.objects.create(recipe=recipe, item=self.raw, quantity=1)
+        self.order, _ = create_production_order(recipe, 10, self.wh, validate=False)
+
+    def test_float_dust_is_not_a_shortage(self):
+        from inventory.models import Stock
+        from production.execution import material_lines
+        Stock.objects.create(item=self.raw, warehouse=self.wh, quantity=10 - 1e-9)
+        self.assertEqual(material_lines(self.order)[0]["shortage"], 0)
+
+    def test_on_order_is_reported_in_stock_unit(self):
+        from procurement.models import PurchaseOrder, PurchaseOrderItem, Vendor
+        from production.execution import material_lines
+        vendor = Vendor.objects.create(company=self.company, name="V")
+        po = PurchaseOrder.objects.create(vendor=vendor, status="ordered")
+        PurchaseOrderItem.objects.create(purchase_order=po, item=self.raw, quantity=0.002, unit_of_measure=self.tonne,
+                                         unit_price=1)
+        self.assertAlmostEqual(material_lines(self.order)[0]["on_order"], 2.0, places=3)  # 0.002 t = 2 kg

@@ -14,7 +14,9 @@ from datetime import timedelta
 
 from django.utils import timezone
 
-from .execution import build_operations, material_lines, material_shortfalls, material_status, order_summary, pending_output
+from inventory.models import Item
+
+from .execution import build_operations, material_lines, sub_work_order_for, material_shortfalls, material_status, order_summary, pending_output
 from .models import ProductionOrder
 
 WIP_STATUSES = ProductionOrder.ACTIVE_STATUSES + ("completed",)
@@ -55,6 +57,10 @@ def wip_row(order):
     so = order.sales_order
     is_open = order.status not in ("completed", "closed", "cancelled")
     lines = material_lines(order) if is_open else []
+    for line in lines:
+        if line["is_sub_product"] and line["shortage"] > 1e-6:
+            sub = sub_work_order_for(order, Item.objects.get(pk=line["item_id"]))
+            line["sub_work_order"] = {"id": sub.id, "order_number": sub.order_number, "status": sub.get_status_display()} if sub else None
     short_lines = [l for l in lines if l["shortage"] > 1e-6]
     # Ready = every component available; partial = some short; blocked = all short.
     readiness = "ready" if not short_lines else ("blocked" if len(short_lines) == len(lines) else "partial")

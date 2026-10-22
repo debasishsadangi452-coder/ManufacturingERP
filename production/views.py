@@ -523,6 +523,27 @@ class ProductionOrderViewSet(CompanyScopedMixin, viewsets.ModelViewSet):
         except ValidationError as e:
             return _bad(e)
 
+    @action(detail=True, methods=["post"])
+    def start_sub_product(self, request, pk=None):
+        """Shop floor: start the work order for a sub-product this order needs and
+        that was not created before. Body: {"item": <sub-product item id>, "quantity": optional}."""
+        from inventory.models import Item
+        order = self.get_object()
+        item = Item.objects.filter(pk=request.data.get("item"), company=_company(request)).first()
+        if item is None:
+            return Response({"error": "Sub-product not found."}, status=400)
+        try:
+            sub, shortages = execution.start_sub_product(order, item, request.user, request.data.get("quantity"))
+        except (DjangoValidationError, ValidationError) as e:
+            return _bad(e)
+        log_activity(request.user, "Production", "Start Sub-Product",
+                     f"Started {sub.order_number} for '{item.name}' needed by {order.order_number}")
+        return Response({
+            "message": f"Started {sub.order_number} for {item.name}.",
+            "production_order": ProductionOrderSerializer(sub).data,
+            "shortages": [{"item": it.name, "quantity": q} for it, q in shortages],
+        }, status=status.HTTP_201_CREATED)
+
     @action(detail=False, methods=["post"])
     def schedule_unscheduled(self, request):
         """Place every open order that has no planned start into its next free slot,
