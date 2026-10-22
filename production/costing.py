@@ -334,7 +334,9 @@ def monthly_cost_vs_sales(company, months=6):
     data = {k: {"sales": 0.0, "production_cost": 0.0} for k in keys}
     for row in Invoice.objects.filter(company=company, invoice_date__gte=start).exclude(status="cancelled") \
             .annotate(m=TruncMonth("invoice_date")).values("m").annotate(t=Sum("total_amount")):
-        data[(row["m"].year, row["m"].month)]["sales"] = float(row["t"] or 0)
+        key = (row["m"].year, row["m"].month)
+        if key in data:  # invoices dated in a future month are outside the graph
+            data[key]["sales"] = float(row["t"] or 0)
     orders = ProductionOrder.objects.filter(
         recipe__product__company=company, produced_quantity__gt=0, end_time__date__gte=start,
     ).exclude(status="cancelled").select_related("recipe__product", "line")

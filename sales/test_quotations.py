@@ -106,3 +106,12 @@ class QuotationTests(APITestCase):
         res = self.client.get(f"/api/documents/quotation/{q['id']}/")
         self.assertEqual(res.status_code, 200)
         self.assertIn(q["quote_number"], res.content.decode())
+
+    def test_valid_until_string_is_stored_as_a_date(self):
+        res = self._create(valid_until="2030-01-31")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.data["valid_until"], "2030-01-31")
+        self.assertFalse(res.data["is_expired"])
+        past = self._create(valid_until="2020-01-01")
+        self.assertTrue(past.data["is_expired"])
+        self.assertEqual(self._create(valid_until="31/01/2030").status_code, 400)

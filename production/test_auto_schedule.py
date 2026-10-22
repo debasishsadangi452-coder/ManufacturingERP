@@ -54,3 +54,16 @@ class AutoScheduleTests(TestCase):
 
     def test_wip_row_exposes_created_at(self):
         self.assertIn("created_at", wip_row(self._make()))
+
+
+class CostTrendTests(TestCase):
+    def test_invoice_dated_in_a_future_month_does_not_crash(self):
+        from datetime import date, timedelta
+        from decimal import Decimal
+        from production.costing import monthly_cost_vs_sales
+        from sales.models import Customer, Invoice
+        company = Company.objects.create(name="Trend Co")
+        customer = Customer.objects.create(company=company, name="C")
+        Invoice.objects.create(company=company, customer=customer, total_amount=Decimal("10"),
+                               invoice_date=date.today() + timedelta(days=45))
+        self.assertEqual(len(monthly_cost_vs_sales(company, 6)), 6)

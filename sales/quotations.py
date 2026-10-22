@@ -5,11 +5,12 @@ A quotation is a priced offer. Converting it creates a normal SalesOrder (status
 unless the caller passes an explicit price for a line — so by default the order
 is billed at exactly what was quoted.
 """
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from rest_framework.exceptions import ValidationError
 
 from inventory.models import Item
@@ -83,11 +84,17 @@ def save_quotation(company, user, data, quotation=None):
         raise ValidationError({"tax_amount": "Tax cannot be negative."})
     cleaned = _clean_lines(company, data.get("items"))
 
+    # The form sends an ISO date string; store a real date so it can be compared and serialised.
+    raw_valid = data.get("valid_until")
+    if raw_valid in (None, ""):
+        valid_until = timezone.localdate() + timedelta(days=DEFAULT_VALIDITY_DAYS) if quotation is None else None
+    else:
+        valid_until = parse_date(str(raw_valid)) if not isinstance(raw_valid, date) else raw_valid
+        if valid_until is None:
+            raise ValidationError({"valid_until": "Use a date in YYYY-MM-DD format."})
     if quotation is None:
         quotation = Quotation(company=company, created_by=user)
-        quotation.valid_until = data.get("valid_until") or (timezone.localdate() + timedelta(days=DEFAULT_VALIDITY_DAYS))
-    else:
-        quotation.valid_until = data.get("valid_until") or None
+    quotation.valid_until = valid_until
     quotation.customer = customer
     quotation.notes = data.get("notes") or ""
     quotation.terms = data.get("terms") or ""
