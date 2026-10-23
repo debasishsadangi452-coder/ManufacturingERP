@@ -31,6 +31,15 @@ def _ns(value):
     return value
 
 
+def _to_plain(value):
+    """Inverse of ``_ns``: namespaces back to JSON-serialisable dicts."""
+    if isinstance(value, SimpleNamespace):
+        return {k: _to_plain(v) for k, v in vars(value).items()}
+    if isinstance(value, list):
+        return [_to_plain(v) for v in value]
+    return value
+
+
 def _normalise(response):
     """Give every message the attributes the chat loop reads, as the SDKs do."""
     for choice in getattr(response, "choices", None) or []:
@@ -48,14 +57,18 @@ def _message_to_dict(message):
     out = {"role": getattr(message, "role", "assistant"), "content": getattr(message, "content", None)}
     tool_calls = getattr(message, "tool_calls", None)
     if tool_calls:
-        out["tool_calls"] = [
-            {
+        out["tool_calls"] = []
+        for tc in tool_calls:
+            call = {
                 "id": tc.id,
                 "type": "function",
                 "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"},
             }
-            for tc in tool_calls
-        ]
+            # Gemini 3 requires its thought_signature echoed back on each tool call.
+            extra = getattr(tc, "extra_content", None)
+            if extra is not None:
+                call["extra_content"] = _to_plain(extra)
+            out["tool_calls"].append(call)
     return out
 
 
