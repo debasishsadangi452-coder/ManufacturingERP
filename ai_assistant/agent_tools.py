@@ -667,6 +667,74 @@ def procure_item(user, item_name, quantity):
     )})
 
 
+def procure_items(user, items):
+    """Multi-item procurement: one PO per vendor (a PO has a single vendor), with
+    every item that vendor supplies cheapest on one PO. Items with no item
+    record or coupon price are reported, not blocked. Returns a fixed template."""
+    if user.role not in ('admin', 'store'):
+        return json.dumps({"template": "PROCUREMENT · You are not authorized to raise purchase orders."})
+    if not isinstance(items, list) or not items:
+        return json.dumps({"template": "PROCUREMENT · Please list the items and quantities to order."})
+
+    from procurement.models import PurchaseOrderItem
+    company = user.company
+    by_vendor = {}  # vendor_id -> (vendor, currency, [(item, qty, unit_price, lead_time)])
+    problems = []
+    for entry in items:
+        name = (entry or {}).get("item_name")
+        try:
+            qty = float((entry or {}).get("quantity"))
+        except (TypeError, ValueError):
+            qty = 0
+        if not name or qty <= 0:
+            problems.append(f"  {name or '?'}: invalid quantity")
+            continue
+        item = Item.objects.filter(name__icontains=name, company=company).first()
+        if not item:
+            problems.append(f"  {name}: item not found")
+            continue
+        price = (
+            VendorPriceList.objects.filter(item=item, is_active=True, vendor__company=company)
+            .select_related("vendor").order_by("unit_price").first()
+        )
+        if not price:
+            problems.append(f"  {item.name}: no vendor / coupon price on file")
+            continue
+        slot = by_vendor.setdefault(price.vendor_id, (price.vendor, price.currency, []))
+        slot[2].append((item, qty, Decimal(str(price.unit_price)), price.lead_time_days))
+
+    sections, grand_total = [], Decimal("0")
+    for vendor, currency, lines in by_vendor.values():
+        po = PurchaseOrder.objects.create(vendor=vendor, status="approved")
+        for item, qty, unit_price, _ in lines:
+            PurchaseOrderItem.objects.create(
+                purchase_order=po, item=item, quantity=qty, unit_price=unit_price
+            )
+        po.refresh_from_db()
+        total = sum((unit_price * Decimal(str(qty)) for _, qty, unit_price, _ in lines), Decimal("0"))
+        grand_total += total
+        body = "\n".join(
+            f"  {item.name}: {qty:g} {item.unit} @ {currency} {unit_price:g}"
+            for item, qty, unit_price, _ in lines
+        )
+        sections.append(
+            f"PURCHASE ORDER PREPARED · PO-{po.id:04d}\n"
+            f"Vendor : {vendor.name} (rating {vendor.rating or 0}/5)\n"
+            f"Lead time: {max(l[3] for l in lines)} days\n"
+            f"{body}\n"
+            f"Total  : {currency} {total:g}\n"
+            f"Status : Approved\n"
+            f'Reply "receive PO {po.id}" to book the goods into inventory.'
+        )
+
+    if not sections:
+        return json.dumps({"template": "PROCUREMENT · No purchase order created.\n" + "\n".join(problems)})
+    out = "\n\n".join(sections)
+    if problems:
+        out += "\n\nNot ordered (add the item / vendor coupon price first):\n" + "\n".join(problems)
+    return json.dumps({"template": out})
+
+
 def receive_procurement(user, po_id, warehouse_name=None):
     """Receive an approved/ordered PO: book stock in and record the cost.
     Returns a fixed template string."""
@@ -831,6 +899,7 @@ def list_scheduled_procurements(user):
 
 AGENT_TOOL_MAP = {
     "procure_item": procure_item,
+    "procure_items": procure_items,
     "schedule_procurement": schedule_procurement,
     "list_scheduled_procurements": list_scheduled_procurements,
     "receive_procurement": receive_procurement,
@@ -885,6 +954,31 @@ AGENT_TOOLS_DEFINITION = [
                     "quantity": {"type": "number", "description": "Quantity to order"},
                 },
                 "required": ["item_name", "quantity"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "procure_items",
+            "description": "Order SEVERAL items at once. Items from the same vendor go on a single purchase order (one PO per vendor). ALWAYS use this instead of repeated procure_item calls when more than one item is requested. Relay the returned 'template' text verbatim.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "Items to order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "item_name": {"type": "string"},
+                                "quantity": {"type": "number"},
+                            },
+                            "required": ["item_name", "quantity"],
+                        },
+                    },
+                },
+                "required": ["items"],
             },
         },
     },

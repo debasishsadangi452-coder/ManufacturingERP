@@ -166,7 +166,7 @@ class ChatView(APIView):
         # Which AI teammate is answering (plant-manager, procurement, finance, ...)
         agent_slug = request.data.get('agent') or DEFAULT_AGENT
         agent = get_agent(agent_slug)
-        agent_tools_definition, agent_tool_map = get_agent_tools(agent_slug)
+        agent_tools_definition, agent_tool_map = get_agent_tools(agent_slug, request.user)
 
         if not user_message and not image_data:
             return Response({"error": "Message or image is required"}, status=status.HTTP_400_BAD_REQUEST)
@@ -228,7 +228,7 @@ class ChatView(APIView):
         logger.info(f"AI Chat using model: {model}")
 
         # Persona + operating rules for the selected AI teammate
-        system_prompt = build_system_prompt(agent_slug)
+        system_prompt = build_system_prompt(agent_slug, request.user)
 
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -399,7 +399,7 @@ class ChatView(APIView):
                             except (json.JSONDecodeError, TypeError):
                                 res_data = {}
                             if isinstance(res_data, dict) and res_data.get("template"):
-                                if function_name in ("procure_item", "receive_procurement", "add_vendor_price"):
+                                if function_name in ("procure_item", "procure_items", "receive_procurement", "add_vendor_price"):
                                     data_changed = True
                                 payload = {
                                     "response": res_data["template"],

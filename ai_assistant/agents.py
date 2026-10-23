@@ -63,7 +63,7 @@ AGENTS = {
             "Order 500 kg sugar on the 1st of next month",
         ],
         "tools": [
-            "procure_item", "receive_procurement", "add_vendor_price",
+            "procure_item", "procure_items", "receive_procurement", "add_vendor_price",
             "schedule_procurement", "list_scheduled_procurements",
             "get_inventory_summary", "detect_reorder_needs", "recommend_suppliers",
             "list_vendors", "list_items", "list_warehouses",
@@ -74,7 +74,9 @@ AGENTS = {
             "is to call procure_item(item_name, quantity). NEVER ask the user for a vendor or price yourself — "
             "procure_item already knows the coupon prices on file. Only if procure_item's own template says the "
             "vendor/coupon price is missing do you then ask the user for them.\n"
-            "1. Order an item -> call procure_item(item_name, quantity).\n"
+            "1. Order an item -> call procure_item(item_name, quantity). If the user lists MORE THAN ONE item "
+            "(or says 'all items in a single PO'), call procure_items(items=[{item_name, quantity}, ...]) ONCE "
+            "with every item — never one PO per item.\n"
             "2. If (and only if) procure_item's template reports a missing vendor/coupon price, ask the user "
             "for the vendor name and coupon price, then call add_vendor_price, then call procure_item again.\n"
             "3. To receive/confirm a PO -> call receive_procurement(po_id).\n"
@@ -204,21 +206,39 @@ def get_agent(slug):
     return AGENTS.get(slug) or AGENTS[DEFAULT_AGENT]
 
 
-def get_agent_tools(slug):
-    """(tools_definition, tool_map) for one agent."""
+def _is_admin(user):
+    return getattr(user, "role", None) == "admin"
+
+
+def get_agent_tools(slug, user=None):
+    """(tools_definition, tool_map) for one agent. Admins get every tool
+    whichever agent they talk to, so no request needs a hand-off."""
     agent = get_agent(slug)
     allowed = agent["tools"]
-    if allowed is None:
+    if allowed is None or _is_admin(user):
         return FULL_TOOLS_DEFINITION, FULL_TOOL_MAP
     definition = [t for t in FULL_TOOLS_DEFINITION if t["function"]["name"] in allowed]
     tool_map = {name: fn for name, fn in FULL_TOOL_MAP.items() if name in allowed}
     return definition, tool_map
 
 
-def build_system_prompt(slug):
+ADMIN_RULES = (
+    "\n\nADMIN ACCESS\n"
+    "- The user is the company admin and you hold EVERY department's tools. Do the whole task yourself, "
+    "across departments (procurement, production, inventory, finance...). NEVER tell the user to hand off, "
+    "contact, or ask another AI teammate or department — just call the right tools, in sequence, and report the result.\n"
+    "- To order materials call procure_item / procure_items; to receive them call receive_procurement; "
+    "to start production call the production tools. Multiple items => one procure_items call."
+)
+
+
+def build_system_prompt(slug, user=None):
     from django.utils import timezone
     agent = get_agent(slug)
-    return agent["persona"] + BASE_RULES + f"\n\nToday's date is {timezone.localdate():%A, %Y-%m-%d}."
+    prompt = agent["persona"] + BASE_RULES
+    if _is_admin(user):
+        prompt += ADMIN_RULES
+    return prompt + f"\n\nToday's date is {timezone.localdate():%A, %Y-%m-%d}."
 
 
 def agents_public_list():
