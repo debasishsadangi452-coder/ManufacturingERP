@@ -74,6 +74,10 @@ def is_auto_posting_enabled(company):
 def queue_auto_post(event, company, source_id, user=None, payload=None):
     """Schedule an automatic posting for after the current transaction commits.
     Safe to call from any operational view: it never raises."""
+    # Companies on the Indian accounting system post to their own ledger instead.
+    from indian_accounting.hooks import intercept
+    if intercept(event, company, source_id, user, payload):
+        return
     try:
         if not is_auto_posting_enabled(company):
             _log_missing_chart(event, company, source_id, payload)

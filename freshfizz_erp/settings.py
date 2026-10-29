@@ -138,6 +138,7 @@ INSTALLED_APPS = [
     'workforce',
     'finance',
     'accounting',
+    'indian_accounting',
     'django_filters',
     'ai_assistant',
     'quickbooks',

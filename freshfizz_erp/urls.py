@@ -29,6 +29,7 @@ urlpatterns = [
     path('api/core/', include('core.urls')),
     path('api/finance/', include('finance.urls')),
     path('api/accounting/', include('accounting.urls')),
+    path('api/indian-accounting/', include('indian_accounting.urls')),
     path('api/ai/', include('ai_assistant.urls')),
     path('api/quickbooks/', include('quickbooks.urls')),
     path('api/fulfillment/', include('fulfillment.urls')),
