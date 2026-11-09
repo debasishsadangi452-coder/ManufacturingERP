@@ -15,6 +15,7 @@ from .views import (
 
 from .superadmin import (
     SuperAdminUsersView, SuperAdminBlockView, SuperAdminUnblockView, SuperAdminUserDeleteView,
+    SuperAdminLoginsView, SuperAdminCompaniesView,
 )
 
 from .views import NdaAcceptView
@@ -22,6 +23,8 @@ from .views import NdaAcceptView
 urlpatterns = [
     path("nda/accept/", NdaAcceptView.as_view()),
     path("superadmin/users/", SuperAdminUsersView.as_view()),
+    path("superadmin/logins/", SuperAdminLoginsView.as_view()),
+    path("superadmin/companies/", SuperAdminCompaniesView.as_view()),
     path("superadmin/users/<int:pk>/", SuperAdminUserDeleteView.as_view()),
     path("superadmin/users/<int:pk>/block/", SuperAdminBlockView.as_view()),
     path("superadmin/users/<int:pk>/unblock/", SuperAdminUnblockView.as_view()),

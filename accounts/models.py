@@ -8,6 +8,13 @@ class Company(models.Model):
     name = models.CharField(max_length=100, unique=True)
     slug = models.SlugField(max_length=100, unique=True, help_text="Used in usernames: name.role@slug")
     created_at = models.DateTimeField(auto_now_add=True)
+    # Platform super admin only shows companies flagged here; everything else is
+    # hidden from it (and untouchable through it) until the owner decides otherwise.
+    superadmin_visible = models.BooleanField(default=False)
+    # Set while/after a demo company is cloned by the super admin ("" for normal companies).
+    DEMO_STATUS_CHOICES = [("", "n/a"), ("creating", "Creating"), ("ready", "Ready"), ("failed", "Failed")]
+    demo_status = models.CharField(max_length=10, blank=True, default="", choices=DEMO_STATUS_CHOICES)
+    demo_error = models.TextField(blank=True, default="")
 
     def save(self, *args, **kwargs):
         if not self.slug:
@@ -41,6 +48,28 @@ class User(AbstractUser):
         default=0.00,
         help_text="Procurement orders below this amount will be auto-approved for this user."
     )
+
+
+class LoginEvent(models.Model):
+    """One sign-in attempt (successful or not) with the network address it came from.
+
+    `username` is what was typed, so failed attempts for unknown accounts are kept
+    too. `forwarded_for` keeps the raw X-Forwarded-For chain: `ip_address` is the
+    best guess at the client, but the chain is the evidence if it is ever disputed."""
+
+    user = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="login_events")
+    username = models.CharField(max_length=254, blank=True, default="")
+    success = models.BooleanField(default=False, db_index=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    forwarded_for = models.CharField(max_length=500, blank=True, default="")
+    user_agent = models.CharField(max_length=300, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.username or '?'} {'ok' if self.success else 'failed'} from {self.ip_address or 'unknown'}"
 
 
 def generate_username(first_name: str, role: str, company: Company) -> str:

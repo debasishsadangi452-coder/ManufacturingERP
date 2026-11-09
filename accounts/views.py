@@ -2,8 +2,10 @@ from datetime import timedelta
 
 from django.utils import timezone
 from rest_framework import generics, permissions, status
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
+from .loginlog import record_login
 from .models import User, CompanySubscription
 from .plans import PLAN_CONFIG, PLAN_ORDER
 from .serializers import (
@@ -20,8 +22,23 @@ from rest_framework.response import Response
 
 
 class EmailOrUsernameTokenObtainPairView(TokenObtainPairView):
-    """JWT login that accepts a username or an email address."""
+    """JWT login that accepts a username or an email address.
+    Every attempt (success or failure) is recorded with the caller's IP address."""
     serializer_class = EmailOrUsernameTokenObtainPairSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        typed = request.data.get("username", "") if hasattr(request.data, "get") else ""
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as exc:
+            record_login(request, typed, None, False)
+            raise InvalidToken(exc.args[0])
+        except Exception:
+            record_login(request, typed, None, False)
+            raise
+        record_login(request, typed, getattr(serializer, "user", None), True)
+        return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
 
 class CompanyRegisterView(APIView):

@@ -37,7 +37,7 @@ After this script the DB will contain:
   * Operators       : Rahul, Priya, Ankit, Neha
 """
 
-import os, sys, django, time
+import os, sys, django, time, threading
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -71,6 +71,23 @@ from fulfillment.models import FGAllocation, Dispatch, DispatchLine
 PASSWORD = "SmartiesDemo@2026"
 COMPANY_NAME = "Smarties Foods Manufacturing Pvt. Ltd."
 COMPANY_SLUG = "smartiesfoods"
+DEFAULT_SLUG = "smartiesfoods"   # the original demo company keeps its plain document numbers
+
+# seed() may be called repeatedly (and from the super admin) for other company
+# names; the module constants above are swapped for the duration of one run.
+_SEED_LOCK = threading.Lock()
+
+
+def _ref(base):
+    """Document numbers that must be unique across the whole database
+    (plan / requisition / QC check numbers). The original company keeps the plain
+    number; any other company gets its slug appended."""
+    return base if COMPANY_SLUG == DEFAULT_SLUG else f"{base}-{COMPANY_SLUG.upper()}"
+
+
+def _email(role):
+    """Login email for a role. The original company keeps its historical addresses."""
+    return f"{role}@smartiesfoods.com" if COMPANY_SLUG == DEFAULT_SLUG else f"{role}@{COMPANY_SLUG}.com"
 
 # ── Helper ─────────────────────────────────────────────────────────────────────
 def log(msg):
@@ -85,6 +102,18 @@ def get_or_create_company():
         co.name = COMPANY_NAME
         co.save(update_fields=["name"])
     return co
+
+_HASH_CACHE = {}
+
+
+def _password_hash():
+    """PBKDF2 is deliberately slow; hash the demo password once per run, not once per user."""
+    if PASSWORD not in _HASH_CACHE:
+        from django.contrib.auth.hashers import make_password
+        _HASH_CACHE.clear()
+        _HASH_CACHE[PASSWORD] = make_password(PASSWORD)
+    return _HASH_CACHE[PASSWORD]
+
 
 def get_or_create_user(username, email, first_name, last_name, company, role):
     user, created = User.objects.get_or_create(
@@ -102,7 +131,7 @@ def get_or_create_user(username, email, first_name, last_name, company, role):
     # even on users created by an earlier version of this seeder.
     if user.role != role:
         user.role = role
-    user.set_password(PASSWORD)
+    user.password = _password_hash()
     user.save()
     return user, created
 
@@ -197,7 +226,7 @@ def build_recipe(item, batch_size, line, routing_steps_data):
 # MAIN SEEDER
 # ══════════════════════════════════════════════════════════════════════════════
 @transaction.atomic
-def seed():
+def _seed_impl():
     print(f"\n{'═'*65}")
     print(f"  Seeding: {COMPANY_NAME}")
     print(f"{'═'*65}")
@@ -205,6 +234,21 @@ def seed():
     # ── 1. Company ─────────────────────────────────────────────────────────────
     co = get_or_create_company()
     log(f"Company: {co.name}  (slug={co.slug})")
+
+    # A demo company needs a subscription, or the app sends its admin to plan
+    # selection and every AI endpoint refuses it. Never overwrite an existing one.
+    from accounts.models import CompanySubscription
+    from accounts.plans import PLAN_CONFIG
+    if not CompanySubscription.objects.filter(company=co).exists():
+        cfg = PLAN_CONFIG["premium_ai"]
+        CompanySubscription.objects.create(
+            company=co, plan="premium_ai", status="active",
+            user_limit=cfg["user_limit"], warehouse_limit=cfg["warehouse_limit"],
+            production_line_limit=cfg["production_line_limit"],
+            ai_monthly_message_limit=cfg["ai_monthly_message_limit"],
+            onboarding_completed=True,
+        )
+        log("Subscription: Premium AI (active)")
 
     # ── 2. Manufacturing Settings ──────────────────────────────────────────────
     ms = ManufacturingSettings.for_company(co)
@@ -233,19 +277,19 @@ def seed():
 
     # ── 3. Users ───────────────────────────────────────────────────────────────
     admin_user, _ = get_or_create_user(
-        f"admin@{COMPANY_SLUG}", "admin@smartiesfoods.com",
+        f"admin@{COMPANY_SLUG}", _email("admin"),
         "Sunita", "Sharma", co, "admin"
     )
     prod_user, _ = get_or_create_user(
-        f"production@{COMPANY_SLUG}", "production@smartiesfoods.com",
+        f"production@{COMPANY_SLUG}", _email("production"),
         "Vijay", "Patel", co, "production"
     )
     qual_user, _ = get_or_create_user(
-        f"quality@{COMPANY_SLUG}", "quality@smartiesfoods.com",
+        f"quality@{COMPANY_SLUG}", _email("quality"),
         "Meera", "Iyer", co, "quality"
     )
     store_user, _ = get_or_create_user(
-        f"store@{COMPANY_SLUG}", "store@smartiesfoods.com",
+        f"store@{COMPANY_SLUG}", _email("store"),
         "Arjun", "Nair", co, "store"
     )
     log(f"Users: admin / production / quality / store  (password: {PASSWORD})")
@@ -442,7 +486,7 @@ def seed():
             created_by=admin_user,
         )
         plan.save()   # triggers auto plan_number
-        plan.plan_number = "PP-2026-001"
+        plan.plan_number = _ref("PP-2026-001")
         plan.save(update_fields=["plan_number"])
 
     log(f"Production Plan: {plan.plan_number} → status={plan.status}")
@@ -462,7 +506,7 @@ def seed():
             created_by=admin_user,
         )
         pr.save()
-        pr.requisition_number = "PR-2026-001"
+        pr.requisition_number = _ref("PR-2026-001")
         pr.save(update_fields=["requisition_number"])
         PurchaseRequisitionItem.objects.create(
             requisition=pr,
@@ -540,7 +584,7 @@ def seed():
             remarks="Dates 20 kg received from Premium Dry Fruits Supplier. All parameters within spec. PASS — released to Raw Material Warehouse for production (CO-2026-001).",
         )
         iqc.save()
-        iqc.check_number = f"IQC-2026-001"
+        iqc.check_number = _ref("IQC-2026-001")
         iqc.save(update_fields=["check_number"])
     log("Incoming QC: IQC-2026-001  Dates 20 kg — PASS → released to Raw Material Warehouse")
 
@@ -563,7 +607,7 @@ def seed():
             planned_end=timezone.make_aware(datetime(2026, 11, 21, 17, 0)),
             notes="MTO Production Order for CO-2026-001. Two-level BOM: Cookie SFG first, then Smarties Cookies.",
         )
-        prod.order_number = "PRD-2026-001"
+        prod.order_number = _ref("PRD-2026-001")
         prod.save(update_fields=["order_number"])
 
         # Material requirements
@@ -796,7 +840,7 @@ def seed():
     print(f"  {'─'*60}")
     print(f"  LOGIN CREDENTIALS")
     print(f"  Password    : {PASSWORD}")
-    print(f"  Admin       : admin@{COMPANY_SLUG}   (admin@smartiesfoods.com)")
+    print(f"  Admin       : admin@{COMPANY_SLUG}   ({_email('admin')})")
     print(f"  Production  : production@{COMPANY_SLUG}")
     print(f"  Quality     : quality@{COMPANY_SLUG}")
     print(f"  Store       : store@{COMPANY_SLUG}")
@@ -824,6 +868,24 @@ def seed():
     print(f"  allocated → dispatched (Delivery Note) → invoiced → part-paid.")
     print(f"  Balance 700 units still in production (demonstrates req #50).")
     print(f"{'═'*65}\n")
+    return co
+
+
+def seed(company_name=None, company_slug=None, password=None):
+    """Create (or refresh) a Smarties-style demo company and return it.
+
+    With no arguments this is the original Smarties Foods company. With a name and
+    slug it builds an independent copy of the same data set for that company."""
+    global COMPANY_NAME, COMPANY_SLUG, PASSWORD
+    with _SEED_LOCK:
+        saved = (COMPANY_NAME, COMPANY_SLUG, PASSWORD)
+        COMPANY_NAME = company_name or COMPANY_NAME
+        COMPANY_SLUG = company_slug or COMPANY_SLUG
+        PASSWORD = password or PASSWORD
+        try:
+            return _seed_impl()
+        finally:
+            COMPANY_NAME, COMPANY_SLUG, PASSWORD = saved
 
 
 if __name__ == "__main__":
