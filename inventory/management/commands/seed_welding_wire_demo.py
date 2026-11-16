@@ -14,12 +14,29 @@ firstname.role@<slug>. --brand, when given, prefixes every finished-good name.
 
 All history is created through the same business functions the app uses and
 posted to the ERP ledger by GL auto-posting, so stock, lots, bills, invoices,
-payments and reports agree. Nothing is sent to QuickBooks: the company has no
-QuickBooks connection. Connect it in Accounting > QuickBooks and click
-"Send everything to QuickBooks" to push the history.
+payments and reports agree.
+
+The company is built to be QuickBooks-ready:
+  * items are already classified and every finished good has an active BOM, so
+    the QuickBooks setup wizard has nothing to classify; it starts at customer
+    mapping (the mapping and the sales / purchasing choices are left for a
+    person to confirm);
+  * customers and vendors carry the contact details QuickBooks receives, and no
+    name is used twice (QuickBooks keeps customers and vendors in one name list);
+  * the history pushes to a QuickBooks company without a single sync error.
+Nothing is sent to QuickBooks by this command and no connection is created:
+connect in Accounting > QuickBooks, finish the wizard, then "Send everything to
+QuickBooks".
+
+It also uses the manufacturing set-up: manufacturing settings, machines and
+operators, a routing for every product, one confirmed customer order with a
+production plan and the purchase requisition MRP raised for its shortages, and
+one delivery sent through Fulfilment (pick, pack, dispatch, invoice).
 
 If a company with the slug already exists the command stops, unless --replace
-is given: --replace DELETES that company and everything in it first.
+is given: --replace DELETES that company and everything in it first. A company
+connected to QuickBooks is refused even then (deleting it would drop the link
+and leave its records behind in QuickBooks) unless --force-replace-quickbooks.
 """
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -36,11 +53,23 @@ from accounting.payables import record_and_allocate_ap_payment
 from accounting.seeds import seed_standard_chart_of_accounts, seed_standard_fiscal_year
 from accounts.models import Company, CompanySubscription, User, generate_username
 from inventory.lots import consume_lots_fifo, create_finished_lot, create_raw_lot, ship_lots_fifo
-from inventory.models import BOM, BOMLine, Batch, Item, UnitOfMeasure, Warehouse
+from fulfillment import services as fulfilment
+from inventory.models import (
+    BOM, BOMLine, Batch, Item, ProcurementQuickBooksConfig, QuickBooksOnboarding, SalesQuickBooksConfig,
+    UnitOfMeasure, Warehouse,
+)
 from inventory.services import decrease_stock, increase_stock
 from procurement.billing import create_bill_from_po
-from procurement.models import GoodsReceipt, PurchaseOrder, PurchaseOrderItem, Vendor, VendorPriceList
-from production.models import ProductionLine, ProductionOrder, Recipe, RecipeIngredient
+from procurement.models import (
+    GoodsReceipt, PurchaseOrder, PurchaseOrderItem, PurchaseRequisition, PurchaseRequisitionItem, Vendor,
+    VendorPriceList,
+)
+from production.models import (
+    ManufacturingSettings, ProductionLine, ProductionOrder, ProductionPlan, Recipe, RecipeIngredient, Resource,
+    RoutingStep,
+)
+from production.mrp import calculate_mrp_for_plan
+from quickbooks.models import QuickBooksConnection
 from quality.models import QualityCheck
 from sales.models import (
     Customer, CustomerPayment, Invoice, InvoiceLine, SalesOrder, SalesOrderItem, Shipment, ShipmentLot,
@@ -63,6 +92,8 @@ class Command(BaseCommand):
         parser.add_argument("--sku-prefix", default="WW", help="Prefix for finished-good SKUs.")
         parser.add_argument("--replace", action="store_true",
                             help="Delete an existing company with this slug (and all its data) first.")
+        parser.add_argument("--force-replace-quickbooks", action="store_true",
+                            help="Allow --replace on a company that is connected to QuickBooks.")
 
     @transaction.atomic
     def handle(self, *args, **options):
@@ -83,6 +114,12 @@ class Command(BaseCommand):
                 "Use --replace to delete it and all its data, or pick another --slug."
             )
         if existing:
+            if QuickBooksConnection.objects.filter(company=existing).exists() and not options["force_replace_quickbooks"]:
+                raise CommandError(
+                    f"'{existing.name}' is connected to QuickBooks. Replacing it deletes the connection and its sync "
+                    "history and leaves every record already sent behind in QuickBooks, so the new company would "
+                    "push duplicates. Disconnect and clean up QuickBooks first, or pass --force-replace-quickbooks."
+                )
             self._teardown(existing)
         if Company.objects.filter(name=self.company_name).exists():
             raise CommandError(f"Another company is already named '{self.company_name}'; pick a different --company.")
@@ -96,8 +133,10 @@ class Command(BaseCommand):
 
         seed_standard_chart_of_accounts(company)
         seed_standard_fiscal_year(company, self.today.year)
+        self._manufacturing_settings()
 
         self.build_history()
+        self._stage_quickbooks()
         self._report(options["password"])
 
     def build_history(self):
@@ -120,6 +159,7 @@ class Command(BaseCommand):
         for key, recipe in recipes.items():
             recipe.default_line = lines[line_for[key]]
             recipe.save(update_fields=["default_line"])
+        self._routing(recipes, lines)
         vendors = self._vendors(rm)
         customers = self._customers()
 
@@ -170,7 +210,10 @@ class Command(BaseCommand):
         self._customer_payment(inv2, D("3000.00"), 2, "CHQ-40117")
         # Open sales orders
         self._order(customers["harbor"], [(fgs["er5356_spool"], 30)], "pending", 2)
-        self._order(customers["keystone"], [(fgs["er4043_basket"], 30)], "confirmed", 1)
+        # One delivery goes out through Fulfilment: allocate, pick, pack, stage, dispatch, invoice.
+        self._dispatch_through_fulfilment(customers["keystone"], [(fgs["er4043_basket"], 30)])
+        # One large confirmed order that stock cannot cover: production plan, MRP, requisition.
+        self._make_to_order_chain(customers["atlantic"], fgs["er5356_spool"], 1500, plant)
 
         # --- ERP-only accounting (sent to QuickBooks as journal entries) --------------
         self._journal(30, "Owner capital contribution", [("1010", "250000.00", "0"), ("3010", "0", "250000.00")])
@@ -217,9 +260,10 @@ class Command(BaseCommand):
             company=self.company, name=name, category=category, unit=unit, sku=sku,
             base_unit=self._uom(uom) if uom else None, purchase_unit=self._uom(uom) if uom else None,
             purchase_cost=D(cost), selling_price=D(price), erp_classification=category,
+            classification_completed_at=timezone.now(),
         )
 
-    def _raw_materials(self):
+    def _raw_material_items(self):
         return {
             "ingot": self._item("Aluminum Ingot P1020", "raw_material", "lb", "lb", "1.30", sku="RM-AL-P1020"),
             "silicon": self._item("Silicon Metal 553", "raw_material", "lb", "lb", "1.60", sku="RM-SI-553"),
@@ -232,6 +276,23 @@ class Command(BaseCommand):
             "tube": self._item("TIG Rod Tube 10 lb", "raw_material", "each", "each", "1.80", sku="PK-TUBE-10"),
             "carton": self._item("Shipping Carton", "raw_material", "each", "each", "0.60", sku="PK-CARTON"),
         }
+
+    # (reorder point, safety stock, minimum order quantity, lead time in days) per raw material
+    PLANNING = {
+        "ingot": (8000, 3000, 5000, 7), "silicon": (300, 100, 500, 10), "magnesium": (250, 100, 400, 10),
+        "lube": (20, 10, 10, 3), "spool": (400, 150, 100, 14), "basket": (150, 50, 100, 14),
+        "drum": (8, 4, 5, 14), "reel": (10, 5, 5, 14), "tube": (300, 100, 100, 14), "carton": (800, 300, 100, 14),
+    }
+
+    def _raw_materials(self):
+        """Raw materials with the planning data MRP and the reorder alerts read."""
+        rm = self._raw_material_items()
+        for key, (reorder, safety, moq, lead) in self.PLANNING.items():
+            item = rm[key]
+            item.reorder_point, item.safety_stock = reorder, safety
+            item.minimum_order_quantity, item.lead_time_days = moq, lead
+            item.save(update_fields=["reorder_point", "safety_stock", "minimum_order_quantity", "lead_time_days"])
+        return rm
 
     def _finished_goods(self):
         brand = f"{self.brand} " if self.brand else ""
@@ -261,7 +322,7 @@ class Command(BaseCommand):
         recipes = {}
         for key, (batch_size, parts) in specs.items():
             recipe = Recipe.objects.create(product=fgs[key], batch_size=batch_size)
-            bom = BOM.objects.create(finished_good=fgs[key])
+            bom = BOM.objects.create(finished_good=fgs[key], version="1.0", status="active", is_active=True)
             for rm_key, qty in parts:
                 RecipeIngredient.objects.create(recipe=recipe, item=rm[rm_key], quantity=qty)
                 BOMLine.objects.create(
@@ -289,6 +350,16 @@ class Command(BaseCommand):
             VendorPriceList.objects.create(vendor=vendors[v_key], item=rm[rm_key],
                                            unit_price=D(price) if price else rm[rm_key].purchase_cost,
                                            min_order_qty=moq, lead_time_days=lead)
+        # Contact details travel to QuickBooks with the vendor record.
+        contacts = {
+            "ingot": ("+1-312-555-0141", "2200 Lake Shore Dr, Chicago, IL 60616", "36-7710231", 4.6),
+            "alloy": ("+1-414-555-0188", "815 W Canal St, Milwaukee, WI 53233", "39-2204417", 4.4),
+            "pack": ("+1-216-555-0123", "4400 Euclid Ave, Cleveland, OH 44103", "34-1609925", 4.3),
+            "lube": ("+1-313-555-0167", "1750 Fort St, Detroit, MI 48226", "38-5521160", 4.5),
+        }
+        for key, (phone, address, tax_id, rating) in contacts.items():
+            Vendor.objects.filter(pk=vendors[key].pk).update(phone=phone, address=address, tax_id=tax_id, rating=rating)
+            vendors[key].refresh_from_db()
         return vendors
 
     def _customers(self):
@@ -299,7 +370,15 @@ class Command(BaseCommand):
             "lakeside": ("Lakeside Welding Supply", "orders@lakesideweld.example", "Due on receipt"),
             "harbor": ("Harbor Boat Builders", "buying@harborboats.example", "Net 30"),
         }
-        return {k: Customer.objects.create(company=self.company, name=n, email=e, payment_terms=t)
+        contacts = {
+            "atlantic": ("+1-757-555-0102", "310 Harbor Way, Norfolk, VA 23510"),
+            "keystone": ("+1-717-555-0175", "88 Industrial Pkwy, Lancaster, PA 17601"),
+            "summit": ("+1-206-555-0134", "9100 Aerospace Blvd, Everett, WA 98204"),
+            "lakeside": ("+1-216-555-0190", "1420 Lakeside Ave, Cleveland, OH 44114"),
+            "harbor": ("+1-401-555-0156", "27 Wharf St, Newport, RI 02840"),
+        }
+        return {k: Customer.objects.create(company=self.company, name=n, email=e, payment_terms=t,
+                                           phone=contacts[k][0], address=contacts[k][1])
                 for k, (n, e, t) in spec.items()}
 
     def _po(self, vendor, rows, status, days_ago):
@@ -379,6 +458,126 @@ class Command(BaseCommand):
         self._post("sales_shipment", order.id, self.users["sales"], {"lines": shipped})
         return order
 
+    def _manufacturing_settings(self):
+        """Make-to-order and make-to-stock both run here: wire is stocked and sold from stock,
+        and large customer orders are planned. Raw material goes straight into stock."""
+        settings = ManufacturingSettings.for_company(self.company)
+        settings.business_model = "hybrid"
+        settings.incoming_qc_required = False
+        settings.enforce_operation_sequence = True
+        settings.allow_partial_production_and_dispatch = True
+        settings.auto_invoice_on_dispatch = True
+        settings.save()
+
+    # product -> process family
+    FAMILY = {"er4043_spool": "mig", "er5356_spool": "mig", "er4043_basket": "mig",
+              "er5356_tig": "tig", "er4043_drum": "bulk", "er5356_reel": "bulk"}
+
+    def _routing(self, recipes, lines):
+        """Machines, operators and a routing for every product (setup + run minutes per unit)."""
+        def resource(name, kind, category, line, cost, rate=0):
+            return Resource.objects.create(
+                company=self.company, name=name, resource_type=kind, category=category, line=lines[line],
+                cost_per_hour=D(cost), run_rate_per_hour=rate, status="available",
+            )
+
+        furnace = resource("Melting & Holding Furnace", "machine", "Furnace", "drawing", "140", 600)
+        caster = resource("Continuous Rod Caster", "machine", "Caster", "drawing", "95", 500)
+        drawer = resource("Wire Drawing Machine", "machine", "Drawing", "drawing", "85", 300)
+        shaver = resource("Shaving & Cleaning Line", "machine", "Surface prep", "spool", "55", 250)
+        spooler = resource("Precision Spooler", "machine", "Spooling", "spool", "60", 240)
+        cutter = resource("TIG Straighten & Cut Line", "machine", "Cutting", "tig", "50", 200)
+        winder = resource("Layer Winder", "machine", "Winding", "drawing", "45", 6)
+        furnace_op = resource("Furnace Operator", "manpower", "Furnace operator", "drawing", "38")
+        draw_op = resource("Drawing Operator", "manpower", "Drawing operator", "drawing", "34")
+        spool_op = resource("Spooling Operator", "manpower", "Spooling operator", "spool", "30")
+        qc = resource("QC Inspector", "manpower", "Quality inspector", "spool", "36")
+
+        melt = ("Melt & cast rod", caster, furnace_op, 45, 0.50)
+        draw = ("Draw to size", drawer, draw_op, 30, 0.80)
+        routings = {
+            "mig": [melt, draw, ("Shave & clean", shaver, draw_op, 15, 0.20),
+                    ("Spool", spooler, spool_op, 10, 0.35), ("Inspect & pack", None, qc, 5, 0.15)],
+            "tig": [melt, draw, ("Straighten & cut", cutter, spool_op, 15, 0.40),
+                    ("Inspect & tube pack", None, qc, 5, 0.12)],
+            "bulk": [melt, draw, ("Layer-wind", winder, draw_op, 20, 12.0), ("Inspect", None, qc, 10, 2.0)],
+        }
+        for key, recipe in recipes.items():
+            for seq, (name, machine, manpower, setup, run) in enumerate(routings[self.FAMILY[key]], start=1):
+                RoutingStep.objects.create(recipe=recipe, sequence=seq, name=name, machine=machine, manpower=manpower,
+                                           setup_minutes=setup, run_minutes_per_unit=run)
+        self.furnace = furnace  # kept for the report only
+
+    def _dispatch_through_fulfilment(self, customer, rows):
+        """A confirmed order shipped the way the Fulfilment page does it, invoice included."""
+        store, sales = self.users["store"], self.users["sales"]
+        order = self._order(customer, rows, "confirmed", 3)
+        fulfilment.allocate(order, user=sales)
+        dispatch = fulfilment.create_dispatch(order, user=store)
+        fulfilment.pick(dispatch, user=store)
+        fulfilment.pack(dispatch, packages=3, gross_weight="640 lb", user=store)
+        fulfilment.stage(dispatch, user=store)
+        fulfilment.prepare_shipment(dispatch, {
+            "shipment_mode": "road", "carrier": "Regional LTL Freight", "vehicle_number": "TRK-2217",
+            "driver_name": "D. Alvarez", "shipment_reference": "BOL-77219", "freight_amount": D("310.00"),
+            "expected_delivery": self.today + timedelta(days=3),
+        }, user=store)
+        fulfilment.verify(dispatch, user=store)
+        fulfilment.confirm_dispatch(dispatch, user=store, auto_invoice=True)
+        dispatch.refresh_from_db()
+        # Post now rather than when the command's transaction commits.
+        self._post("dispatch_shipment", dispatch.id, store)
+        self._post("sales_invoice", dispatch.invoice_id, sales)
+        self.dispatch = dispatch
+        return dispatch
+
+    def _make_to_order_chain(self, customer, product, quantity, warehouse):
+        """Confirmed customer order -> production plan -> MRP -> approved purchase requisition for the shortages."""
+        order = self._order(customer, [(product, quantity)], "confirmed", 2)
+        SalesOrder.objects.filter(pk=order.pk).update(
+            required_delivery_date=self.today + timedelta(days=28), customer_order_reference="AMF-PO-7741",
+            priority="high", source="email",
+        )
+        plan = ProductionPlan.objects.create(
+            company=self.company, sales_order=order, sales_order_item=order.salesorderitem_set.first(),
+            customer=customer, item=product, order_quantity=quantity, planned_quantity=quantity,
+            target_date=self.today + timedelta(days=21), status="planned", created_by=self.admin,
+            notes=f"Customer order AMF-PO-7741: {quantity:,} x {product.name}.",
+        )
+        shortages = [r for r in calculate_mrp_for_plan(plan)["raw_materials"] if r["shortage_quantity"] > 0]
+        requisition = None
+        if shortages:
+            requisition = PurchaseRequisition.objects.create(
+                company=self.company, production_plan=plan, sales_order=order, warehouse=warehouse,
+                status="approved", created_by=self.admin,
+                notes=f"MRP shortages for {plan.plan_number}; approved, ready to convert to purchase orders.",
+            )
+            costs = {i.id: i.purchase_cost for i in Item.objects.filter(pk__in=[r["item_id"] for r in shortages])}
+            for row in shortages:
+                PurchaseRequisitionItem.objects.create(
+                    requisition=requisition, item_id=row["item_id"], required_quantity=row["required_quantity"],
+                    available_quantity=row["available_quantity"], shortage_quantity=row["shortage_quantity"],
+                    uom=row["unit"] or "", estimated_unit_price=costs.get(row["item_id"], D("0")),
+                )
+        self.plan, self.requisition = plan, requisition
+        return plan
+
+    def _stage_quickbooks(self):
+        """Leave the QuickBooks setup wizard where it belongs for a company whose items and BOMs were
+        created in the ERP: nothing to classify, BOMs done, so it opens at customer mapping. The mapping
+        and the sales / purchasing choices stay unconfirmed; a person makes those decisions."""
+        with_bom = BOM.objects.filter(finished_good__company=self.company, is_active=True)
+        Item.objects.filter(pk__in=list(with_bom.values_list("finished_good_id", flat=True))).update(bom_completed=True)
+        QuickBooksOnboarding.objects.update_or_create(company=self.company, defaults={"status": "customer_mapping"})
+        SalesQuickBooksConfig.objects.update_or_create(company=self.company, defaults={
+            "sale_trigger": "shipment", "default_doc_type": "invoice",
+            "customers_mapped": False, "price_disclaimer_acknowledged": False,
+        })
+        ProcurementQuickBooksConfig.objects.update_or_create(company=self.company, defaults={
+            "purchase_trigger": "goods_receipt", "cost_source": "po_price",
+            "vendors_mapped": False, "payables_disclaimer_acknowledged": False,
+        })
+
     def _terms_days(self, terms):
         digits = "".join(c for c in (terms or "") if c.isdigit())
         return int(digits) if digits else 0
@@ -440,4 +639,11 @@ class Command(BaseCommand):
         out.write(f"Invoices: {Invoice.objects.filter(company=c).count()}  "
                   f"Customer payments: {CustomerPayment.objects.filter(company=c).count()}")
         out.write(f"Posted journal entries: {JournalEntry.objects.filter(company=c, status='posted').count()}")
-        out.write("QuickBooks: not connected — connect in Accounting > QuickBooks, then 'Send everything to QuickBooks'.")
+        plan, requisition, dispatch = (getattr(self, name, None) for name in ("plan", "requisition", "dispatch"))
+        out.write(f"Manufacturing: {Resource.objects.filter(company=c).count()} resources, "
+                  f"{RoutingStep.objects.filter(recipe__product__company=c).count()} routing steps"
+                  + (f"; plan {plan.plan_number}" if plan else "")
+                  + (f", requisition {requisition.requisition_number}" if requisition else "")
+                  + (f"; dispatch {dispatch.dispatch_number} invoiced" if dispatch else ""))
+        out.write("QuickBooks: not connected. Accounting > QuickBooks > Connect, finish the setup wizard "
+                  "(it opens at customer mapping), then 'Send everything to QuickBooks'.")
