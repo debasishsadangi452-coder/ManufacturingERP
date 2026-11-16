@@ -236,8 +236,22 @@ def push(request):
 @permission_classes([IsFinanceOrAdmin])
 def push_all_view(request):
     """Send every ERP record not yet in QuickBooks. Runs in the background and
-    returns 202 with the run at once; progress shows in the sync history."""
+    returns 202 with the run at once; progress shows in the sync history.
+
+    Optional payload {"entity_types": ["customer", "vendor", ...]} sends only those
+    record types (see push.PUSH_ALL_ENTITY_TYPES); without it everything is sent."""
     from .background import running_job, start_job
+    from .push import PUSH_ALL_ENTITY_TYPES
+
+    entity_types = request.data.get("entity_types")
+    if entity_types is not None and (
+        not isinstance(entity_types, list) or not entity_types
+        or any(t not in PUSH_ALL_ENTITY_TYPES for t in entity_types)
+    ):
+        return Response(
+            {"detail": f"entity_types must be a non-empty list of: {', '.join(PUSH_ALL_ENTITY_TYPES)}."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     connection = QuickBooksConnection.objects.filter(company=request.user.company, is_active=True).first()
     if not connection:
@@ -246,7 +260,7 @@ def push_all_view(request):
     if busy:
         return Response({"detail": f"A QuickBooks {busy.sync_type.replace('_', ' ')} is already running.",
                          "run": QuickBooksSyncRunSerializer(busy).data}, status=status.HTTP_409_CONFLICT)
-    run = start_job(connection, "push_all", lambda run: push_all(connection, run=run))
+    run = start_job(connection, "push_all", lambda run: push_all(connection, run=run, only=entity_types))
     return Response(QuickBooksSyncRunSerializer(run).data, status=status.HTTP_202_ACCEPTED)
 
 

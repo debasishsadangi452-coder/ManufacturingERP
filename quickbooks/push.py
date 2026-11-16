@@ -731,8 +731,18 @@ def safe_push(connection, entity_type, obj, sync_run=None):
         return False
 
 
-def push_all(connection, run=None):
+# Record types "send everything" can be limited to, in the order they are sent.
+PUSH_ALL_ENTITY_TYPES = (
+    "customer", "vendor", "item", "sales_order", "purchase_order", "invoice", "bill", "payment",
+    "bill_payment", "journal_entry",
+)
+
+
+def push_all(connection, run=None, only=None):
     """Backfill records that do not yet have a QuickBooks link.
+
+    `only` limits the run to some record types (a subset of PUSH_ALL_ENTITY_TYPES),
+    e.g. ["customer"] to send just the customers; None sends everything.
 
     Auto-push handles normal updates after a record is linked. Keeping the bulk
     path focused on unlinked records avoids rewriting every QuickBooks row.
@@ -741,7 +751,7 @@ def push_all(connection, run=None):
     """
     if run is None:
         run = _start_push_all_run(connection)
-    return _push_all_into(connection, run)
+    return _push_all_into(connection, run, only)
 
 
 def _start_push_all_run(connection):
@@ -761,7 +771,7 @@ def _start_push_all_run(connection):
     )
 
 
-def _push_all_into(connection, run):
+def _push_all_into(connection, run, only=None):
     from django.db.models import Q
     from accounting.models import JournalEntry
     from inventory.models import Item
@@ -804,6 +814,8 @@ def _push_all_into(connection, run):
             .order_by("id"),
         ),
     ]
+    if only is not None:
+        batches = [batch for batch in batches if batch[0] in only]
     created = updated = seen = 0
     failed = False
     for entity_type, queryset in batches:

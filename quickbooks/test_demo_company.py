@@ -9,6 +9,7 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 from django.core.management import CommandError, call_command
+from rest_framework.test import APIClient
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -106,6 +107,44 @@ class WeldingDemoQuickBooksTests(TestCase):
         self.assertFalse(CustomerPayment.objects.filter(company=company, quickbooks_id="").exists())
         self.assertFalse(SalesOrder.objects.filter(customer__company=company, quickbooks_id="")
                          .exclude(status="cancelled").exists())
+
+    def test_send_only_customers_then_everything_else(self):
+        """The setup wizard can send just the customers (or just the vendors) first."""
+        company = self.seed()
+        connection = self.connect(company)
+        push.push_all(connection, only=["customer"])
+        self.assertFalse(Customer.objects.filter(company=company, quickbooks_id="").exists())
+        # Nothing else was sent.
+        self.assertTrue(Vendor.objects.filter(company=company, quickbooks_id="").exists())
+        self.assertTrue(Item.objects.filter(company=company, quickbooks_id="").exists())
+        self.assertFalse(Invoice.objects.filter(company=company).exclude(quickbooks_id="").exists())
+        # A second run for everything finishes the job without re-sending the customers.
+        sent_before = len([1 for resource, _ in self.fake.requests if resource == "customer"])
+        run = push.push_all(connection)
+        self.assertEqual(run.status, "success")
+        self.assertEqual(len([1 for resource, _ in self.fake.requests if resource == "customer"]), sent_before)
+        self.assertFalse(Vendor.objects.filter(company=company, quickbooks_id="").exists())
+        self.assertFalse(Invoice.objects.filter(company=company, quickbooks_id="").exists())
+
+    @override_settings(QUICKBOOKS_BACKGROUND_JOBS=False)
+    def test_push_all_endpoint_accepts_and_validates_entity_types(self):
+        company = self.seed()
+        self.connect(company)
+        admin = company.users.get(role="admin")
+        client = APIClient()
+        client.force_authenticate(admin)
+        for bad in ([], "customer", ["customer", "bogus"]):
+            res = client.post("/api/quickbooks/push-all/", {"entity_types": bad}, format="json")
+            self.assertEqual(res.status_code, 400, bad)
+        res = client.post("/api/quickbooks/push-all/", {"entity_types": ["vendor"]}, format="json")
+        self.assertEqual(res.status_code, 202, res.data)
+        self.assertEqual(res.data["status"], "success")
+        self.assertFalse(Vendor.objects.filter(company=company, quickbooks_id="").exists())
+        self.assertFalse(Customer.objects.filter(company=company).exclude(quickbooks_id="").exists())
+        # No payload still means everything.
+        res = client.post("/api/quickbooks/push-all/", {}, format="json")
+        self.assertEqual(res.status_code, 202, res.data)
+        self.assertFalse(Customer.objects.filter(company=company, quickbooks_id="").exists())
 
     def test_items_are_already_classified_for_the_setup_wizard(self):
         company = self.seed()
